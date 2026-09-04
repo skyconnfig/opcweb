@@ -108,10 +108,13 @@ class RadarService:
             scan_keywords = remaining_keywords if full else remaining_keywords[:8]
             videos_seen = 0
             comments_seen = 0
+            comments_prefiltered = 0
+            comments_judged = 0
             leads_seen = 0
             with SessionLocal() as db:
                 checkpoint = db.get(TaskCheckpoint, task_id)
                 processed_comment_ids = set(checkpoint.processed_comment_ids or []) if checkpoint else set()
+            seen_comment_hashes: set[str] = set()
             for index, keyword in enumerate(scan_keywords):
                 await self._step(task_id, "scan_keyword", f"正在扫描：{keyword.keyword}", 0.08)
                 videos = await self.provider.search_videos(keyword.keyword, 20 if full else 2)
@@ -147,7 +150,8 @@ class RadarService:
                         comments_seen += result.items_received
                         await self.emit(task_id, project.id, "comment.discovered", f"发现 {result.items_received} 条公开评论（覆盖范围：{result.coverage_status}）", {"coverage_status": result.coverage_status, "count": result.items_received, "has_more": result.has_more})
                         for comment_dto in result.items:
-                            if not self.prefilter.should_analyze(comment_dto.content):
+                            if not self.prefilter.should_analyze(comment_dto.content, seen_comment_hashes):
+                                comments_prefiltered += 1
                                 continue
                             with SessionLocal() as db:
                                 video = db.scalar(select(Video).where(Video.project_id == project.id, Video.platform_video_id == dto.video_id))
@@ -160,6 +164,7 @@ class RadarService:
                                     db.flush()
                                 if c.id in processed_comment_ids:
                                     continue
+                                comments_judged += 1
                                 history_rows = db.scalars(select(Comment).where(Comment.project_id == project.id, Comment.platform == c.platform, Comment.platform_user_id == c.platform_user_id).order_by(Comment.id)).all() if c.platform_user_id else []
                                 history_text = "\n".join(f"{index + 1}. {row.content}" for index, row in enumerate(history_rows))
                                 project_data = {"industry": project.industry, "location": project.location, "service": project.service, "target_customer": project.target_customer, "price_range": project.price_range, "description": project.description, "keyword": keyword.keyword, "video_title": dto.title, "video_description": dto.description, "video_creator": dto.creator, "video_likes": dto.likes, "video_comments": dto.comments, "video_shares": dto.shares, "video_collects": dto.collects, "history_text": history_text}
@@ -186,13 +191,13 @@ class RadarService:
             await self._step(task_id, "rank_videos", "已完成视频机会评分与分级", 0.08)
             await self._step(task_id, "scan_comments", f"累计读取 {comments_seen} 条公开评论", 0.08)
             await self._step(task_id, "prefilter_comments", "已过滤无意义、重复和明显无关评论", 0.08)
-            await self._step(task_id, "judge_leads", f"AI 已判断 {leads_seen} 个潜客信号", 0.08)
+            await self._step(task_id, "judge_leads", f"AI 已判断 {comments_judged} 条候选评论，发现 {leads_seen} 个潜客信号", 0.08)
             await self._step(task_id, "deduplicate_leads", "已按平台用户 ID 合并重复出现", 0.08)
             await self._step(task_id, "update_dashboard", "雷达数据已更新", 0.08)
             with SessionLocal() as db:
                 task = db.get(ScanTask, task_id)
                 task.status, task.finished_at, task.current_step = "completed", now_utc(), "update_dashboard"
-                metrics = {"videos": db.scalar(select(func.count(Video.id)).where(Video.project_id == project.id)) or 0, "comments": db.scalar(select(func.count(Comment.id)).where(Comment.project_id == project.id)) or 0, "leads": db.scalar(select(func.count(Lead.id)).where(Lead.project_id == project.id)) or 0, "s_leads": db.scalar(select(func.count(Lead.id)).where(Lead.project_id == project.id, Lead.lead_level == "S")) or 0}
+                metrics = {"videos": db.scalar(select(func.count(Video.id)).where(Video.project_id == project.id)) or 0, "comments": db.scalar(select(func.count(Comment.id)).where(Comment.project_id == project.id)) or 0, "comments_received": comments_seen, "comments_prefiltered": comments_prefiltered, "comments_judged": comments_judged, "prefilter_ratio": round(comments_prefiltered / comments_seen, 4) if comments_seen else 0, "leads": db.scalar(select(func.count(Lead.id)).where(Lead.project_id == project.id)) or 0, "s_leads": db.scalar(select(func.count(Lead.id)).where(Lead.project_id == project.id, Lead.lead_level == "S")) or 0}
                 db.add(TaskReport(task_id=task_id, summary="行业扫描已完成", metrics=metrics))
                 project.status = "running"
                 db.commit()

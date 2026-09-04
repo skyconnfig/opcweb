@@ -35,6 +35,13 @@ def test_rule_prefilter_removes_noise():
     assert not rule.should_analyze("🙂🙂")
 
 
+def test_rule_prefilter_deduplicates_comment_text():
+    rule = RulePreFilter()
+    seen = set()
+    assert rule.should_analyze("长沙有没有靠谱的装修公司", seen)
+    assert not rule.should_analyze("长沙 有没有靠谱的装修公司", seen)
+
+
 def test_fingerprint_is_whitespace_stable():
     assert fingerprint("长沙 装修") == fingerprint("长沙装修")
 
