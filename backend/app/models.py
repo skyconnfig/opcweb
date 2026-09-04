@@ -27,6 +27,20 @@ class Project(Base):
     keywords: Mapped[list["Keyword"]] = relationship(back_populates="project", cascade="all, delete-orphan")
 
 
+class ScanSchedule(Base):
+    __tablename__ = "scan_schedules"
+    __table_args__ = (UniqueConstraint("project_id", name="uq_scan_schedule_project"),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    project_id: Mapped[int] = mapped_column(ForeignKey("projects.id"), index=True)
+    enabled: Mapped[bool] = mapped_column(default=False)
+    interval_minutes: Mapped[int] = mapped_column(Integer, default=180)
+    full: Mapped[bool] = mapped_column(default=False)
+    next_run_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    last_run_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now_utc)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=now_utc, onupdate=now_utc)
+
+
 class Persona(Base):
     __tablename__ = "personas"
     id: Mapped[int] = mapped_column(primary_key=True)

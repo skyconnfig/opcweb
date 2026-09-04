@@ -1,4 +1,5 @@
 import json
+from datetime import datetime, timedelta, timezone
 
 import httpx
 from cryptography.fernet import Fernet
@@ -16,6 +17,7 @@ from app.services.radar_service import fingerprint, lead_level
 from app.services.event_bus import sse_line
 from app.settings_store import decrypt_secret, encrypt_secret
 from app.tasks.checkpoint import checkpoint_snapshot
+from app.tasks.queue import advance_schedule
 
 
 def test_keyword_score_weights_and_levels():
@@ -55,6 +57,19 @@ def test_sse_and_checkpoint_contract():
         last_comment_cursor = "cursor-2"
         processed_comment_ids = [1, 2]
     assert checkpoint_snapshot(Checkpoint()) == {"last_keyword_id": 3, "last_video_id": 8, "last_comment_cursor": "cursor-2", "processed_comment_ids": [1, 2]}
+
+
+def test_scan_schedule_advances_with_a_safe_minimum_interval():
+    class Schedule:
+        interval_minutes = 5
+        last_run_at = None
+        next_run_at = None
+
+    now = datetime.now(timezone.utc)
+    schedule = Schedule()
+    advance_schedule(schedule, now)
+    assert schedule.last_run_at == now
+    assert schedule.next_run_at == now + timedelta(minutes=15)
 
 
 async def test_text_only_agent_chain_and_history_context():

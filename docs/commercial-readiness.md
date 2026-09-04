@@ -28,6 +28,13 @@ API 使用 `Authorization: Bearer <API_AUTH_TOKEN>`。前端容器在构建时�
 5. 生成 PersonaAgent 建议，人工确认后再在平台内操作。
 6. 重启 API，确认 queued/running 任务会恢复，SSE 可以从持久化事件继续读取。
 
+## 定时扫描验收
+
+- 在系统设置中按项目启用自动扫描，频率可选 15 分钟至 7 天。
+- API 会将到期计划排入持久化任务队列；已有 queued/running 任务时跳过重复入队。
+- 计划的 `next_run_at` / `last_run_at` 会写入数据库，API 重启后由 APScheduler 继续检查。
+- SQLite 本地开发由 `create_all()` 自动补表；PostgreSQL/Docker 使用 Alembic `upgrade head`，当前 head 为 `7f1a2c9d4e6b`。
+
 ## 仍需独立完成的商业规模能力
 
 真实多租户、计费订阅、团队 RBAC、独立 Redis/队列 Worker、平台授权审查、数据保留与删除策略、备份灾备、监控告警和标注集质量评估，不能用 Mock 链路替代，必须作为上线前的独立验收门槛。

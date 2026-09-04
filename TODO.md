@@ -12,5 +12,6 @@
 - [x] Phase 9：Social Harvest 外部 task report Adapter
 - [x] Phase 10：测试、UI polish、README、Docker、Windows 启动脚本
 - [x] Phase 11：可配置 Provider、持久化任务 Worker、可恢复 SSE、API Token 与 LLM Key 加密基线
+- [x] Phase 12：项目级定时扫描、到期任务入队、重复任务保护与 Alembic migration 链
 
-后续增强：Provider Router failover、定时扫描持久化、Alembic migration 版本链、真实 LLM structured output 回放评估、多租户/RBAC、计费和独立队列 Worker。
+后续增强：Provider Router failover、真实 LLM structured output 回放评估、多租户/RBAC、计费和独立队列 Worker。

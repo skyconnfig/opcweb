@@ -17,6 +17,7 @@ from app.db import SessionLocal
 from app.models import AgentRun, Comment, Keyword, Lead, LeadComment, LeadEvent, LeadSource, Project, TaskCheckpoint, TaskEvent, TaskReport, TaskStep, ScanTask, Video, now_utc
 from app.providers.base import BaseContentProvider
 from app.services.event_bus import event_bus
+from app.tasks.queue import enqueue_scan
 
 
 def fingerprint(content: str) -> str:
@@ -80,18 +81,7 @@ class RadarService:
 
     async def start_scan(self, project_id: int, full: bool = False) -> int:
         with SessionLocal() as db:
-            project = db.get(Project, project_id)
-            if not project:
-                raise ValueError("项目不存在")
-            task = ScanTask(project_id=project_id, name=f"{project.location}{project.industry}行业扫描", status="queued", full=full)
-            db.add(task)
-            db.flush()
-            for name in ["generate_keywords", "schedule_keywords", "scan_keyword", "discover_videos", "rank_videos", "scan_comments", "prefilter_comments", "judge_leads", "deduplicate_leads", "update_dashboard"]:
-                db.add(TaskStep(task_id=task.id, name=name))
-            db.add(TaskCheckpoint(task_id=task.id))
-            db.commit()
-            task_id = task.id
-        return task_id
+            return enqueue_scan(db, project_id, full).id
 
     async def run_task(self, task_id: int, full: bool = False):
         with SessionLocal() as db:

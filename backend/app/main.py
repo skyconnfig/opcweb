@@ -1,11 +1,13 @@
 import asyncio
 import json
 from contextlib import asynccontextmanager
+from datetime import datetime, timedelta, timezone
+from typing import Literal
 
 from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import desc, func, select, update
 from sqlalchemy.orm import Session
 
@@ -13,7 +15,7 @@ from app.agents.llm import OpenAICompatibleProvider, input_hash, settings_with_d
 from app.agents.persona_agent import PersonaAgent
 from app.core.config import get_settings
 from app.db import SessionLocal, get_db
-from app.models import AgentRun, Comment, Keyword, Lead, LeadComment, LeadEvent, LeadSource, Persona, Project, ProviderRecord, ScanTask, Setting, TaskCheckpoint, TaskEvent, TaskReport, TaskStep, Video, now_utc
+from app.models import AgentRun, Comment, Keyword, Lead, LeadComment, LeadEvent, LeadSource, Persona, Project, ProviderRecord, ScanSchedule, ScanTask, Setting, TaskCheckpoint, TaskEvent, TaskReport, TaskStep, Video, now_utc
 from app.providers.external.douyin_comments_crawler import DouyinCommentsCrawlerExternalProvider
 from app.providers.external.mediacrawler import MediaCrawlerExternalProvider
 from app.providers.external.social_harvest import SocialHarvestExternalProvider
@@ -23,6 +25,7 @@ from app.security import auth_middleware
 from app.settings_store import encrypt_secret, read_setting
 from app.services.event_bus import event_bus, sse_line
 from app.services.radar_service import RadarService
+from app.tasks.scheduler import create_scheduler, enqueue_due_schedules
 
 
 class ProjectCreate(BaseModel):
@@ -40,6 +43,27 @@ class ProjectOut(ProjectCreate):
     status: str
     intelligence: dict = {}
     model_config = ConfigDict(from_attributes=True)
+
+
+class ScheduleIn(BaseModel):
+    enabled: bool = False
+    interval_minutes: int = Field(default=180, ge=15, le=10080)
+    full: bool = False
+    next_run_at: datetime | None = None
+
+
+class ScheduleOut(BaseModel):
+    id: int | None
+    project_id: int
+    enabled: bool
+    interval_minutes: int
+    full: bool
+    next_run_at: str | None
+    last_run_at: str | None
+
+
+class LeadStatusUpdate(BaseModel):
+    status: Literal["NEW", "FOLLOW_UP", "CONTACTED", "QUALIFIED", "WON", "LOST", "IGNORED"]
 
 
 class PersonaIn(BaseModel):
@@ -116,11 +140,23 @@ async def lifespan(app: FastAPI):
             if not record:
                 db.add(ProviderRecord(name=provider.name, kind="mock" if provider.name == "Mock Provider" else "external", status="connected" if provider.name == "Mock Provider" else "disconnected", platform=provider.platform, capabilities=provider.capabilities, endpoint=getattr(provider, "base_url", ""), note="Demo 数据源" if provider.name == "Mock Provider" else "需用户独立启动/配置"))
         db.commit()
+    scheduler = create_scheduler()
+    scheduler.add_job(
+        enqueue_due_schedules,
+        "interval",
+        minutes=1,
+        id="scan-schedules",
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=30,
+    )
+    scheduler.start()
     worker_stop = asyncio.Event()
     worker = asyncio.create_task(_task_worker(worker_stop))
     try:
         yield
     finally:
+        scheduler.shutdown(wait=False)
         worker_stop.set()
         await worker
 
@@ -172,6 +208,54 @@ async def start_project_scan(project_id: int, full: bool = False, db: Session = 
     except ValueError as exc:
         raise HTTPException(404, str(exc)) from exc
     return {"task_id": task_id, "status": "queued", "provider": active_provider(db).name}
+
+
+def _schedule_iso(value: datetime | None) -> str | None:
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc).isoformat()
+
+
+def _schedule_payload(schedule: ScanSchedule | None, project_id: int) -> dict:
+    if schedule is None:
+        return {"id": None, "project_id": project_id, "enabled": False, "interval_minutes": 180, "full": False, "next_run_at": None, "last_run_at": None}
+    return {"id": schedule.id, "project_id": schedule.project_id, "enabled": schedule.enabled, "interval_minutes": schedule.interval_minutes, "full": schedule.full, "next_run_at": _schedule_iso(schedule.next_run_at), "last_run_at": _schedule_iso(schedule.last_run_at)}
+
+
+@app.get("/api/projects/{project_id}/schedule", response_model=ScheduleOut)
+def get_project_schedule(project_id: int, db: Session = Depends(get_db)):
+    if not db.get(Project, project_id):
+        raise HTTPException(404, "项目不存在")
+    schedule = db.scalar(select(ScanSchedule).where(ScanSchedule.project_id == project_id))
+    return _schedule_payload(schedule, project_id)
+
+
+@app.put("/api/projects/{project_id}/schedule", response_model=ScheduleOut)
+def put_project_schedule(project_id: int, payload: ScheduleIn, db: Session = Depends(get_db)):
+    if not db.get(Project, project_id):
+        raise HTTPException(404, "项目不存在")
+    schedule = db.scalar(select(ScanSchedule).where(ScanSchedule.project_id == project_id))
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    if schedule is None:
+        schedule = ScanSchedule(project_id=project_id)
+        db.add(schedule)
+    schedule.enabled = payload.enabled
+    schedule.interval_minutes = payload.interval_minutes
+    schedule.full = payload.full
+    if not payload.enabled:
+        schedule.next_run_at = None
+    elif payload.next_run_at is not None:
+        requested = payload.next_run_at
+        if requested.tzinfo is None:
+            requested = requested.replace(tzinfo=timezone.utc)
+        schedule.next_run_at = requested.astimezone(timezone.utc).replace(tzinfo=None)
+    elif not schedule.next_run_at or not schedule.enabled:
+        schedule.next_run_at = now + timedelta(minutes=payload.interval_minutes)
+    db.commit()
+    db.refresh(schedule)
+    return _schedule_payload(schedule, project_id)
 
 
 @app.get("/api/projects/{project_id}/keywords")
@@ -255,6 +339,20 @@ def get_lead(lead_id: int, db: Session = Depends(get_db)):
     if not lead:
         raise HTTPException(404, "潜客不存在")
     return lead_payload(db, lead)
+
+
+@app.patch("/api/leads/{lead_id}")
+def update_lead(lead_id: int, payload: LeadStatusUpdate, db: Session = Depends(get_db)):
+    lead = db.get(Lead, lead_id)
+    if not lead:
+        raise HTTPException(404, "潜客不存在")
+    previous = lead.status
+    lead.status = payload.status
+    if previous != payload.status:
+        db.add(LeadEvent(lead_id=lead.id, score=lead.lead_score, event_type="status_changed", note=f"{previous} -> {payload.status}"))
+    db.commit()
+    db.refresh(lead)
+    return lead
 
 
 @app.post("/api/leads/{lead_id}/persona")
