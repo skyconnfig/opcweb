@@ -20,6 +20,8 @@ from app.services.event_bus import event_bus
 from app.settings_store import decrypt_secret, encrypt_secret
 from app.tasks.checkpoint import checkpoint_snapshot
 from app.tasks.queue import advance_schedule
+from app.security import is_authorized
+from starlette.requests import Request
 
 
 def test_keyword_score_weights_and_levels():
@@ -134,6 +136,12 @@ def test_llm_api_key_is_encrypted_at_rest():
     assert stored.startswith("enc:v1:")
     assert "sk-secret" not in stored
     assert decrypt_secret(stored, settings) == "sk-secret"
+
+
+def test_readiness_probe_is_public_when_api_auth_is_enabled(monkeypatch):
+    monkeypatch.setattr("app.security.get_settings", lambda: Settings(api_auth_token="secret"))
+    request = Request({"type": "http", "method": "GET", "path": "/ready", "headers": [], "query_string": b""})
+    assert is_authorized(request)
 
 
 async def test_social_harvest_report_normalizes_comment_pages(tmp_path):
