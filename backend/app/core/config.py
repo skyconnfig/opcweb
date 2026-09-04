@@ -11,6 +11,10 @@ class Settings(BaseSettings):
     llm_model: str = "deepseek-chat"
     llm_temperature: float = 0.2
     llm_timeout: float = 45.0
+    content_provider: str = "mock"
+    api_auth_token: str = ""
+    settings_encryption_key: str = ""
+    cors_origins: str = "http://localhost:5173,http://127.0.0.1:5173"
     douyin_comments_crawler_url: str = "http://127.0.0.1:8000"
     mediacrawler_path: str = ""
     social_harvest_path: str = ""

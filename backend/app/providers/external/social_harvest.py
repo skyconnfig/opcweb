@@ -1,7 +1,7 @@
 import json
 from pathlib import Path
 
-from app.providers.base import BaseContentProvider, CommentScanResult, ProviderHealth, VideoDTO
+from app.providers.base import BaseContentProvider, CommentDTO, CommentScanResult, ProviderHealth, VideoDTO
 
 
 class SocialHarvestExternalProvider(BaseContentProvider):
@@ -23,9 +23,29 @@ class SocialHarvestExternalProvider(BaseContentProvider):
         return VideoDTO("douyin", video_id, str(item.get("title", "")), str(item.get("description", "")), str(item.get("creator", "")), str(item.get("url", "")), str(item.get("cover", "")), None, int(item.get("likes", 0)), int(item.get("comments", 0)), int(item.get("shares", 0)), int(item.get("collects", 0)), "") if item else None
 
     async def get_comments(self, video_id: str, cursor: str | None = None) -> CommentScanResult:
-        return CommentScanResult([], "unknown", 0, None, False)
+        report = self._read()
+        raw = report.get("comments", [])
+        if isinstance(raw, dict):
+            raw = raw.get(video_id, [])
+        if isinstance(raw, list):
+            raw = [item for item in raw if not item.get("video_id") or str(item.get("video_id")) == video_id]
+        offset = int(cursor or 0) if str(cursor or "0").isdigit() else 0
+        page = raw[offset:offset + 100]
+        items = [CommentDTO("douyin", str(item.get("comment_id", item.get("cid", index + offset))), str(item.get("user_id", item.get("uid", ""))), str(item.get("nickname", item.get("author", ""))), str(item.get("profile_url", "")), str(item.get("content", item.get("comment", ""))), _parse_dt(item.get("create_time", item.get("created_at"))), str(item.get("parent_comment_id", item.get("reply_to", "")))) for index, item in enumerate(page)]
+        has_more = offset + len(page) < len(raw)
+        return CommentScanResult(items, str(report.get("coverage_status", "partial" if raw else "unknown")), len(items), str(offset + len(page)) if has_more else None, has_more)
 
     def _read(self):
         if not self.report_path or not self.report_path.exists():
             return {}
         return json.loads(self.report_path.read_text(encoding="utf-8"))
+
+
+def _parse_dt(value):
+    from datetime import datetime
+    try:
+        if isinstance(value, (int, float)):
+            return datetime.fromtimestamp(value)
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00")) if value else None
+    except (TypeError, ValueError, OSError):
+        return None

@@ -62,7 +62,12 @@ class RadarService:
                 raise
             self._record_agent_run(db, project.id, "KeywordAgent", self.keyword_agent.prompt_version, {"context": context, "intelligence": intelligence}, {"keywords": keywords})
             for row in keywords:
-                db.add(Keyword(project_id=project.id, **row))
+                existing = db.scalar(select(Keyword).where(Keyword.project_id == project.id, Keyword.keyword == row["keyword"]))
+                if existing:
+                    for key, value in row.items():
+                        setattr(existing, key, value)
+                else:
+                    db.add(Keyword(project_id=project.id, **row))
             project.status = "ready"
             db.commit()
             return {"intelligence": intelligence, "keyword_count": len(keywords), "categories": _category_counts(keywords)}
@@ -78,7 +83,7 @@ class RadarService:
             project = db.get(Project, project_id)
             if not project:
                 raise ValueError("项目不存在")
-            task = ScanTask(project_id=project_id, name=f"{project.location}{project.industry}行业扫描", status="queued")
+            task = ScanTask(project_id=project_id, name=f"{project.location}{project.industry}行业扫描", status="queued", full=full)
             db.add(task)
             db.flush()
             for name in ["generate_keywords", "schedule_keywords", "scan_keyword", "discover_videos", "rank_videos", "scan_comments", "prefilter_comments", "judge_leads", "deduplicate_leads", "update_dashboard"]:
@@ -86,7 +91,6 @@ class RadarService:
             db.add(TaskCheckpoint(task_id=task.id))
             db.commit()
             task_id = task.id
-        asyncio.create_task(self.run_task(task_id, full=full))
         return task_id
 
     async def run_task(self, task_id: int, full: bool = False):
@@ -107,10 +111,17 @@ class RadarService:
                 with SessionLocal() as db:
                     keywords = db.scalars(select(Keyword).where(Keyword.project_id == project.id).order_by(Keyword.opportunity_score.desc())).all()
             await self._step(task_id, "schedule_keywords", f"已按机会分排序 {len(keywords)} 个关键词", 0.12)
-            scan_keywords = keywords if full else keywords[:8]
+            with SessionLocal() as db:
+                checkpoint = db.get(TaskCheckpoint, task_id)
+                last_keyword_id = checkpoint.last_keyword_id if checkpoint else 0
+            remaining_keywords = [keyword for keyword in keywords if keyword.id > last_keyword_id]
+            scan_keywords = remaining_keywords if full else remaining_keywords[:8]
             videos_seen = 0
             comments_seen = 0
             leads_seen = 0
+            with SessionLocal() as db:
+                checkpoint = db.get(TaskCheckpoint, task_id)
+                processed_comment_ids = set(checkpoint.processed_comment_ids or []) if checkpoint else set()
             for index, keyword in enumerate(scan_keywords):
                 await self._step(task_id, "scan_keyword", f"正在扫描：{keyword.keyword}", 0.08)
                 videos = await self.provider.search_videos(keyword.keyword, 20 if full else 2)
@@ -133,38 +144,53 @@ class RadarService:
                     db.commit()
                 videos_seen += len(videos)
                 await self.emit(task_id, project.id, "video.discovered", f"发现 {len(videos)} 个相关视频", {"keyword": keyword.keyword, "count": len(videos)})
+                with SessionLocal() as db:
+                    checkpoint = db.get(TaskCheckpoint, task_id)
+                    resume_video_id = checkpoint.last_video_id if checkpoint and checkpoint.last_keyword_id < keyword.id else 0
+                    resume_cursor = checkpoint.last_comment_cursor if resume_video_id else None
                 for dto in videos:
-                    result = await self.provider.get_comments(dto.video_id)
-                    comments_seen += result.items_received
-                    await self.emit(task_id, project.id, "comment.discovered", f"发现 {result.items_received} 条公开评论（覆盖范围：{result.coverage_status}）", {"coverage_status": result.coverage_status, "count": result.items_received})
-                    for comment_dto in result.items:
-                        if not self.prefilter.should_analyze(comment_dto.content):
-                            continue
-                        with SessionLocal() as db:
-                            video = db.scalar(select(Video).where(Video.project_id == project.id, Video.platform_video_id == dto.video_id))
-                            if not video:
+                    with SessionLocal() as db:
+                        video_row = db.scalar(select(Video).where(Video.project_id == project.id, Video.platform_video_id == dto.video_id))
+                        cursor = resume_cursor if video_row and video_row.id == resume_video_id else None
+                    while True:
+                        result = await self.provider.get_comments(dto.video_id, cursor)
+                        comments_seen += result.items_received
+                        await self.emit(task_id, project.id, "comment.discovered", f"发现 {result.items_received} 条公开评论（覆盖范围：{result.coverage_status}）", {"coverage_status": result.coverage_status, "count": result.items_received, "has_more": result.has_more})
+                        for comment_dto in result.items:
+                            if not self.prefilter.should_analyze(comment_dto.content):
                                 continue
-                            c = db.scalar(select(Comment).where(Comment.project_id == project.id, Comment.platform == comment_dto.platform, Comment.platform_comment_id == comment_dto.comment_id))
-                            if not c:
-                                c = Comment(project_id=project.id, video_id=video.id, platform=comment_dto.platform, platform_comment_id=comment_dto.comment_id, platform_user_id=comment_dto.user_id, nickname=comment_dto.nickname, profile_url=comment_dto.profile_url, content=comment_dto.content, content_hash=fingerprint(comment_dto.content), parent_comment_id=comment_dto.parent_comment_id, created_at_platform=comment_dto.created_at, coverage_status=result.coverage_status)
-                                db.add(c)
-                                db.flush()
-                            history_rows = db.scalars(select(Comment).where(Comment.project_id == project.id, Comment.platform == c.platform, Comment.platform_user_id == c.platform_user_id).order_by(Comment.id)).all() if c.platform_user_id else []
-                            history_text = "\n".join(f"{index + 1}. {row.content}" for index, row in enumerate(history_rows))
-                            project_data = {"industry": project.industry, "location": project.location, "service": project.service, "target_customer": project.target_customer, "price_range": project.price_range, "description": project.description, "keyword": keyword.keyword, "video_title": dto.title, "video_description": dto.description, "video_creator": dto.creator, "video_likes": dto.likes, "video_comments": dto.comments, "video_shares": dto.shares, "video_collects": dto.collects, "history_text": history_text}
-                            comment_data = {"content": c.content, "nickname": c.nickname, "history_text": history_text, "parent_comment_id": c.parent_comment_id}
-                            self.llm.clear_last_call()
-                            try:
-                                judgment = await self.judge_agent.run(project_data, comment_data)
-                            except Exception as exc:
-                                self._record_agent_run(db, project.id, "LeadJudgeAgent", self.judge_agent.prompt_version, {"project": project_data, "comment": comment_data}, {})
+                            with SessionLocal() as db:
+                                video = db.scalar(select(Video).where(Video.project_id == project.id, Video.platform_video_id == dto.video_id))
+                                if not video:
+                                    continue
+                                c = db.scalar(select(Comment).where(Comment.project_id == project.id, Comment.platform == comment_dto.platform, Comment.platform_comment_id == comment_dto.comment_id))
+                                if not c:
+                                    c = Comment(project_id=project.id, video_id=video.id, platform=comment_dto.platform, platform_comment_id=comment_dto.comment_id, platform_user_id=comment_dto.user_id, nickname=comment_dto.nickname, profile_url=comment_dto.profile_url, content=comment_dto.content, content_hash=fingerprint(comment_dto.content), parent_comment_id=comment_dto.parent_comment_id, created_at_platform=comment_dto.created_at, coverage_status=result.coverage_status)
+                                    db.add(c)
+                                    db.flush()
+                                if c.id in processed_comment_ids:
+                                    continue
+                                history_rows = db.scalars(select(Comment).where(Comment.project_id == project.id, Comment.platform == c.platform, Comment.platform_user_id == c.platform_user_id).order_by(Comment.id)).all() if c.platform_user_id else []
+                                history_text = "\n".join(f"{index + 1}. {row.content}" for index, row in enumerate(history_rows))
+                                project_data = {"industry": project.industry, "location": project.location, "service": project.service, "target_customer": project.target_customer, "price_range": project.price_range, "description": project.description, "keyword": keyword.keyword, "video_title": dto.title, "video_description": dto.description, "video_creator": dto.creator, "video_likes": dto.likes, "video_comments": dto.comments, "video_shares": dto.shares, "video_collects": dto.collects, "history_text": history_text}
+                                comment_data = {"content": c.content, "nickname": c.nickname, "history_text": history_text, "parent_comment_id": c.parent_comment_id}
+                                self.llm.clear_last_call()
+                                try:
+                                    judgment = await self.judge_agent.run(project_data, comment_data)
+                                except Exception as exc:
+                                    self._record_agent_run(db, project.id, "LeadJudgeAgent", self.judge_agent.prompt_version, {"project": project_data, "comment": comment_data}, {})
+                                    db.commit()
+                                    raise exc
+                                self._record_agent_run(db, project.id, "LeadJudgeAgent", self.judge_agent.prompt_version, {"project": project_data, "comment": comment_data}, judgment)
+                                if judgment["is_lead"]:
+                                    _upsert_lead(db, project.id, c, judgment, video.id)
+                                    leads_seen += 1
                                 db.commit()
-                                raise exc
-                            self._record_agent_run(db, project.id, "LeadJudgeAgent", self.judge_agent.prompt_version, {"project": project_data, "comment": comment_data}, judgment)
-                            if judgment["is_lead"]:
-                                lead = _upsert_lead(db, project.id, c, judgment, video.id)
-                                leads_seen += 1
-                            db.commit()
+                                processed_comment_ids.add(c.id)
+                                await self._checkpoint(task_id, None, video.id, result.next_cursor, c.id)
+                        if not result.has_more or not result.next_cursor:
+                            break
+                        cursor = result.next_cursor
                 await self._checkpoint(task_id, keyword.id, 0, "")
             await self._step(task_id, "discover_videos", f"累计发现 {videos_seen} 个视频", 0.08)
             await self._step(task_id, "rank_videos", "已完成视频机会评分与分级", 0.08)
@@ -176,7 +202,7 @@ class RadarService:
             with SessionLocal() as db:
                 task = db.get(ScanTask, task_id)
                 task.status, task.finished_at, task.current_step = "completed", now_utc(), "update_dashboard"
-                metrics = {"videos": videos_seen, "comments": comments_seen, "leads": db.scalar(select(func.count(Lead.id)).where(Lead.project_id == project.id)) or 0, "s_leads": db.scalar(select(func.count(Lead.id)).where(Lead.project_id == project.id, Lead.lead_level == "S")) or 0}
+                metrics = {"videos": db.scalar(select(func.count(Video.id)).where(Video.project_id == project.id)) or 0, "comments": db.scalar(select(func.count(Comment.id)).where(Comment.project_id == project.id)) or 0, "leads": db.scalar(select(func.count(Lead.id)).where(Lead.project_id == project.id)) or 0, "s_leads": db.scalar(select(func.count(Lead.id)).where(Lead.project_id == project.id, Lead.lead_level == "S")) or 0}
                 db.add(TaskReport(task_id=task_id, summary="行业扫描已完成", metrics=metrics))
                 project.status = "running"
                 db.commit()
@@ -196,6 +222,8 @@ class RadarService:
         with SessionLocal() as db:
             step = db.scalar(select(TaskStep).where(TaskStep.task_id == task_id, TaskStep.name == name))
             task = db.get(ScanTask, task_id)
+            if step and step.status == "completed":
+                return
             if step:
                 step.status, step.started_at, step.detail = "running", now_utc(), message
                 task.current_step = name
@@ -211,12 +239,18 @@ class RadarService:
                 db.commit()
         await self.emit(task_id, task.project_id, f"step.{name}.completed", message)
 
-    async def _checkpoint(self, task_id, keyword_id, video_id, cursor):
+    async def _checkpoint(self, task_id, keyword_id, video_id, cursor, processed_comment_id=None):
         with SessionLocal() as db:
             checkpoint = db.get(TaskCheckpoint, task_id)
-            checkpoint.last_keyword_id = keyword_id
+            if keyword_id is not None:
+                checkpoint.last_keyword_id = keyword_id
             checkpoint.last_video_id = video_id
             checkpoint.last_comment_cursor = cursor or ""
+            if processed_comment_id is not None:
+                processed = list(checkpoint.processed_comment_ids or [])
+                if processed_comment_id not in processed:
+                    processed.append(processed_comment_id)
+                checkpoint.processed_comment_ids = processed[-5000:]
             db.commit()
 
     async def emit(self, task_id, project_id, event_type, message, payload=None):

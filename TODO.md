@@ -11,6 +11,6 @@
 - [x] Phase 8：MediaCrawler 外部 subprocess Adapter
 - [x] Phase 9：Social Harvest 外部 task report Adapter
 - [x] Phase 10：测试、UI polish、README、Docker、Windows 启动脚本
+- [x] Phase 11：可配置 Provider、持久化任务 Worker、可恢复 SSE、API Token 与 LLM Key 加密基线
 
-后续增强：接入真正的 Provider Router failover、把定时扫描接入 APScheduler、增加 Alembic migration 版本、真实 LLM structured output 的回放评估，以及更多平台 Adapter。
-
+后续增强：Provider Router failover、定时扫描持久化、Alembic migration 版本链、真实 LLM structured output 回放评估、多租户/RBAC、计费和独立队列 Worker。

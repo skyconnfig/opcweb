@@ -27,18 +27,21 @@ class DouyinCommentsCrawlerExternalProvider(BaseContentProvider):
             response = await client.post(f"{self.base_url}/api/keyword/comments", json={"keyword": keyword, "max_videos": limit, "per_video_limit": 1})
             response.raise_for_status()
             payload = response.json()
-        return [VideoDTO("douyin", f"external-{index}", f"{keyword} 相关视频", "", "未知作者", "", "", None, 0, 0, 0, 0, keyword) for index in range(int(payload.get("video_count", 0)))]
+        rows = payload.get("videos") or payload.get("items") or []
+        if not rows:
+            rows = [{"video_id": f"external-{index}", "title": f"{keyword} 相关视频"} for index in range(int(payload.get("video_count", 0)))]
+        return [_video(item, keyword) for item in rows[:limit]]
 
     async def get_video(self, video_id: str) -> VideoDTO | None:
         return None
 
     async def get_comments(self, video_id: str, cursor: str | None = None) -> CommentScanResult:
         async with httpx.AsyncClient(timeout=self.timeout) as client:
-            response = await client.post(f"{self.base_url}/api/video/comments", json={"video_url": video_id, "limit": 50})
+            response = await client.post(f"{self.base_url}/api/video/comments", json={"video_url": video_id, "limit": 50, "cursor": cursor})
             response.raise_for_status()
             payload = response.json()
         items = [CommentDTO("douyin", str(item.get("comment_id", index)), str(item.get("user_id", "")), str(item.get("nickname", "")), str(item.get("profile_url", "")), str(item.get("comment", item.get("content", ""))), _parse_dt(item.get("create_time")), str(item.get("parent_comment_id", ""))) for index, item in enumerate(payload.get("comments", []))]
-        return CommentScanResult(items, "unknown", len(items), None, False)
+        return CommentScanResult(items, str(payload.get("coverage_status", "partial" if items else "unknown")), len(items), payload.get("next_cursor"), bool(payload.get("has_more", False)))
 
 
 def _parse_dt(value):
@@ -46,3 +49,7 @@ def _parse_dt(value):
         return datetime.fromtimestamp(float(value)) if value else None
     except (TypeError, ValueError, OSError):
         return None
+
+
+def _video(item: dict, keyword: str) -> VideoDTO:
+    return VideoDTO("douyin", str(item.get("video_id", item.get("aweme_id", item.get("id", item.get("url", ""))))), str(item.get("title", item.get("desc", ""))), str(item.get("description", item.get("desc", ""))), str(item.get("nickname", item.get("creator", "未知作者"))), str(item.get("url", item.get("video_url", ""))), str(item.get("cover", item.get("cover_url", ""))), None, int(item.get("likes", item.get("digg_count", 0)) or 0), int(item.get("comments", item.get("comment_count", 0)) or 0), int(item.get("shares", item.get("share_count", 0)) or 0), int(item.get("collects", item.get("collect_count", 0)) or 0), keyword)

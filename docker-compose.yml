@@ -4,13 +4,29 @@ services:
       context: .
       dockerfile: backend/Dockerfile
     environment:
-      DATABASE_URL: postgresql+psycopg://radar:radar@postgres:5432/radar
-    ports: ["8688:8688"]
-    depends_on: [postgres]
+      DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg://radar:radar@postgres:5432/radar}
+      API_AUTH_TOKEN: ${API_AUTH_TOKEN:?set API_AUTH_TOKEN in .env}
+      SETTINGS_ENCRYPTION_KEY: ${SETTINGS_ENCRYPTION_KEY:?set SETTINGS_ENCRYPTION_KEY in .env}
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:5173}
+    ports: ["8689:8689"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8689/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    depends_on:
+      postgres:
+        condition: service_healthy
   web:
-    build: ./web
-    ports: ["5173:80"]
-    depends_on: [api]
+    build:
+      context: ./web
+      args:
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:8689}
+        NEXT_PUBLIC_API_TOKEN: ${API_AUTH_TOKEN:?set API_AUTH_TOKEN in .env}
+    ports: ["5173:3000"]
+    depends_on:
+      api:
+        condition: service_healthy
   postgres:
     image: postgres:16-alpine
     environment:
@@ -18,5 +34,10 @@ services:
       POSTGRES_PASSWORD: radar
       POSTGRES_DB: radar
     volumes: ["radar_pgdata:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U radar -d radar"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
 volumes:
   radar_pgdata:

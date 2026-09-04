@@ -164,6 +164,7 @@ class ScanTask(Base):
     project_id: Mapped[int] = mapped_column(ForeignKey("projects.id"), index=True)
     name: Mapped[str] = mapped_column(String(180))
     status: Mapped[str] = mapped_column(String(30), default="queued", index=True)
+    full: Mapped[bool] = mapped_column(default=False)
     current_step: Mapped[str] = mapped_column(String(80), default="")
     error: Mapped[str] = mapped_column(Text, default="")
     started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)

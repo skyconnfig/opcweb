@@ -1,2 +1,1 @@
-Migration entrypoint is configured for future production revisions. The local MVP creates its SQLite tables on startup so a fresh Windows checkout is immediately runnable.
-
+Alembic now contains the initial production schema revision. Docker runs `alembic upgrade head` before starting the API. Local Windows development still creates SQLite tables on startup so a fresh checkout remains immediately runnable; for an existing database, use `alembic stamp head` only after verifying that its schema already matches the revision.

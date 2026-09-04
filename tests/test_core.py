@@ -1,6 +1,7 @@
 import json
 
 import httpx
+from cryptography.fernet import Fernet
 
 from app.agents.keyword_agent import keyword_opportunity_score
 from app.agents.industry_agent import IndustryAgent
@@ -10,8 +11,10 @@ from app.agents.llm import OpenAICompatibleProvider
 from app.agents.radar_agent import RadarAgent
 from app.core.config import Settings
 from app.providers.mock.mock_provider import MockProvider
+from app.providers.external.social_harvest import SocialHarvestExternalProvider
 from app.services.radar_service import fingerprint, lead_level
 from app.services.event_bus import sse_line
+from app.settings_store import decrypt_secret, encrypt_secret
 from app.tasks.checkpoint import checkpoint_snapshot
 
 
@@ -89,3 +92,22 @@ async def test_openai_compatible_provider_sends_text_only_json():
     assert captured["body"]["model"] == "text-model"
     assert all(isinstance(message["content"], str) for message in captured["body"]["messages"])
     assert provider.last_call and provider.last_call.tokens == 7 and provider.last_call.success is True
+
+
+def test_llm_api_key_is_encrypted_at_rest():
+    key = Fernet.generate_key().decode()
+    settings = Settings(settings_encryption_key=key)
+    stored = encrypt_secret("sk-secret", settings)
+    assert stored.startswith("enc:v1:")
+    assert "sk-secret" not in stored
+    assert decrypt_secret(stored, settings) == "sk-secret"
+
+
+async def test_social_harvest_report_normalizes_comment_pages(tmp_path):
+    report = tmp_path / "task-report.json"
+    report.write_text(json.dumps({"coverage_status": "complete", "videos": [], "comments": {"video-1": [{"comment_id": "c1", "user_id": "u1", "nickname": "客户", "content": "长沙多少钱？"}, {"comment_id": "c2", "user_id": "u1", "nickname": "客户", "content": "年底准备"}]}}, ensure_ascii=False), encoding="utf-8")
+    provider = SocialHarvestExternalProvider(str(report))
+    page = await provider.get_comments("video-1", "0")
+    assert page.coverage_status == "complete"
+    assert page.items_received == 2
+    assert page.items[0].content == "长沙多少钱？"

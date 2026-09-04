@@ -4,14 +4,17 @@ from sqlalchemy import inspect, select
 
 from app.agents.keyword_agent import KeywordAgent
 from app.db import Base, SessionLocal, engine
-from app.models import Comment, Keyword, Lead, LeadComment, LeadEvent, LeadSource, Persona, Project, Video
+from app.core.config import get_settings
+from app.models import Comment, Keyword, Lead, LeadComment, LeadEvent, LeadSource, Persona, Project, Setting, Video
 from app.providers.mock.mock_provider import HIGH_COMMENTS, MockProvider, ORDINARY_COMMENTS
 from app.services.radar_service import fingerprint, lead_level
+from app.settings_store import PREFIX, encrypt_secret
 
 
 def init_database():
     Base.metadata.create_all(bind=engine)
     _ensure_schema()
+    _migrate_secrets()
     with SessionLocal() as db:
         if db.scalar(select(Project.id).limit(1)):
             return
@@ -63,6 +66,7 @@ def _ensure_schema():
             "input_text": "TEXT DEFAULT ''",
             "error": "TEXT DEFAULT ''",
         },
+        "scan_tasks": {"full": "BOOLEAN DEFAULT FALSE"},
     }
     with engine.begin() as connection:
         inspector = inspect(connection)
@@ -71,3 +75,14 @@ def _ensure_schema():
             for column, definition in columns.items():
                 if column not in existing:
                     connection.exec_driver_sql(f'ALTER TABLE "{table}" ADD COLUMN "{column}" {definition}')
+
+
+def _migrate_secrets():
+    settings = get_settings()
+    if not settings.settings_encryption_key:
+        return
+    with SessionLocal() as db:
+        item = db.get(Setting, "llm_api_key")
+        if item and item.value and not item.value.startswith(PREFIX):
+            item.value = encrypt_secret(item.value, settings)
+            db.commit()

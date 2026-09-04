@@ -6,7 +6,7 @@ from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict
-from sqlalchemy import desc, func, select
+from sqlalchemy import desc, func, select, update
 from sqlalchemy.orm import Session
 
 from app.agents.llm import OpenAICompatibleProvider, input_hash, settings_with_db
@@ -19,6 +19,8 @@ from app.providers.external.mediacrawler import MediaCrawlerExternalProvider
 from app.providers.external.social_harvest import SocialHarvestExternalProvider
 from app.providers.mock.mock_provider import MockProvider
 from app.seed import init_database
+from app.security import auth_middleware
+from app.settings_store import encrypt_secret, read_setting
 from app.services.event_bus import event_bus, sse_line
 from app.services.radar_service import RadarService
 
@@ -51,8 +53,8 @@ class PersonaIn(BaseModel):
     sample_reply: str = ""
 
 
-def provider_registry():
-    settings = get_settings()
+def provider_registry(settings=None):
+    settings = settings or get_settings()
     return [
         MockProvider(),
         DouyinCommentsCrawlerExternalProvider(settings.douyin_comments_crawler_url),
@@ -61,34 +63,77 @@ def provider_registry():
     ]
 
 
-def active_provider():
-    return MockProvider()
+def active_provider(db: Session | None = None):
+    settings = get_settings()
+    selected = settings.content_provider
+    if db:
+        stored = db.get(Setting, "content_provider")
+        selected = stored.value if stored else selected
+    aliases = {
+        "mock": "Mock Provider",
+        "douyin-comments-crawler": "Douyin Comments Crawler",
+        "mediacrawler": "MediaCrawler (external)",
+        "social-harvest": "Social Harvest (external)",
+    }
+    selected_name = aliases.get(selected, selected)
+    return next((provider for provider in provider_registry(settings) if provider.name == selected_name), MockProvider())
 
 
 def active_llm(db: Session) -> OpenAICompatibleProvider:
-    values = {item.key: item.value for item in db.scalars(select(Setting)).all()}
-    return OpenAICompatibleProvider(settings_with_db(get_settings(), values))
+    settings = get_settings()
+    values = {item.key: read_setting(item.key, item.value, settings) for item in db.scalars(select(Setting)).all()}
+    return OpenAICompatibleProvider(settings_with_db(settings, values))
+
+
+async def _task_worker(stop: asyncio.Event):
+    while not stop.is_set():
+        task_id = None
+        full = False
+        with SessionLocal() as db:
+            task = db.scalar(select(ScanTask).where(ScanTask.status == "queued").order_by(ScanTask.created_at).limit(1))
+            if task:
+                task.status = "running"
+                db.commit()
+                task_id, full = task.id, task.full
+                provider = active_provider(db)
+                llm = active_llm(db)
+        if task_id is not None:
+            await RadarService(provider, llm).run_task(task_id, full=full)
+            continue
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=1)
+        except asyncio.TimeoutError:
+            pass
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_database()
     with SessionLocal() as db:
+        db.execute(update(ScanTask).where(ScanTask.status == "running").values(status="queued", error=""))
         for provider in provider_registry():
             record = db.scalar(select(ProviderRecord).where(ProviderRecord.name == provider.name))
             if not record:
                 db.add(ProviderRecord(name=provider.name, kind="mock" if provider.name == "Mock Provider" else "external", status="connected" if provider.name == "Mock Provider" else "disconnected", platform=provider.platform, capabilities=provider.capabilities, endpoint=getattr(provider, "base_url", ""), note="Demo 数据源" if provider.name == "Mock Provider" else "需用户独立启动/配置"))
         db.commit()
-    yield
+    worker_stop = asyncio.Event()
+    worker = asyncio.create_task(_task_worker(worker_stop))
+    try:
+        yield
+    finally:
+        worker_stop.set()
+        await worker
 
 
 app = FastAPI(title="AI 截流雷达", version="0.1.0", lifespan=lifespan)
-app.add_middleware(CORSMiddleware, allow_origins=["http://127.0.0.1:5173", "http://localhost:5173"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+app.middleware("http")(auth_middleware)
+app.add_middleware(CORSMiddleware, allow_origins=[origin.strip() for origin in get_settings().cors_origins.split(",") if origin.strip()], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 
 @app.get("/health")
-def health():
-    return {"status": "running", "service": "AI 截流雷达", "version": "0.1.0", "mode": "mock-demo-fallback"}
+def health(db: Session = Depends(get_db)):
+    provider = active_provider(db)
+    return {"status": "running", "service": "AI 截流雷达", "version": "0.1.0", "mode": "mock-demo-fallback" if provider.name == "Mock Provider" else "text-production", "provider": provider.name}
 
 
 @app.get("/api/projects", response_model=list[ProjectOut])
@@ -117,16 +162,16 @@ def get_project(project_id: int, db: Session = Depends(get_db)):
 async def smart_mode(project_id: int, db: Session = Depends(get_db)):
     if not db.get(Project, project_id):
         raise HTTPException(404, "项目不存在")
-    return await RadarService(active_provider(), active_llm(db)).analyze_project(project_id)
+    return await RadarService(active_provider(db), active_llm(db)).analyze_project(project_id)
 
 
 @app.post("/api/projects/{project_id}/scan")
 async def start_project_scan(project_id: int, full: bool = False, db: Session = Depends(get_db)):
     try:
-        task_id = await RadarService(active_provider(), active_llm(db)).start_scan(project_id, full)
+        task_id = await RadarService(active_provider(db), active_llm(db)).start_scan(project_id, full)
     except ValueError as exc:
         raise HTTPException(404, str(exc)) from exc
-    return {"task_id": task_id, "status": "queued", "provider": active_provider().name}
+    return {"task_id": task_id, "status": "queued", "provider": active_provider(db).name}
 
 
 @app.get("/api/projects/{project_id}/keywords")
@@ -173,7 +218,7 @@ async def scan_video(video_id: int, db: Session = Depends(get_db)):
     video = db.get(Video, video_id)
     if not video:
         raise HTTPException(404, "视频不存在")
-    task_id = await RadarService(active_provider(), active_llm(db)).start_scan(video.project_id)
+    task_id = await RadarService(active_provider(db), active_llm(db)).start_scan(video.project_id)
     return {"task_id": task_id}
 
 
@@ -301,7 +346,6 @@ def pause_task(task_id: int, db: Session = Depends(get_db)):
 @app.post("/api/tasks/{task_id}/resume")
 async def resume_task(task_id: int, db: Session = Depends(get_db)):
     task = mutate_task(task_id, "queued", db)
-    asyncio.create_task(RadarService(active_provider(), active_llm(db)).run_task(task_id))
     return task
 
 
@@ -309,8 +353,15 @@ async def resume_task(task_id: int, db: Session = Depends(get_db)):
 async def retry_task(task_id: int, db: Session = Depends(get_db)):
     task = mutate_task(task_id, "queued", db)
     task.error = ""
+    checkpoint = db.get(TaskCheckpoint, task_id)
+    if checkpoint:
+        checkpoint.last_keyword_id = 0
+        checkpoint.last_video_id = 0
+        checkpoint.last_comment_cursor = ""
+        checkpoint.processed_comment_ids = []
+    for step in db.scalars(select(TaskStep).where(TaskStep.task_id == task_id)).all():
+        step.status, step.detail, step.started_at, step.finished_at = "queued", "", None, None
     db.commit()
-    asyncio.create_task(RadarService(active_provider(), active_llm(db)).run_task(task_id))
     return task
 
 
@@ -329,6 +380,20 @@ async def provider_health(provider_id: int, db: Session = Depends(get_db)):
     record.status, record.note, record.checked_at = result.status, result.message, now_utc()
     db.commit()
     return record
+
+
+@app.post("/api/providers/{provider_id}/activate")
+def activate_provider(provider_id: int, db: Session = Depends(get_db)):
+    record = db.get(ProviderRecord, provider_id)
+    if not record:
+        raise HTTPException(404, "Provider 不存在")
+    setting = db.get(Setting, "content_provider")
+    if setting:
+        setting.value = record.name
+    else:
+        db.add(Setting(key="content_provider", value=record.name))
+    db.commit()
+    return {"active": record.name, "provider": record}
 
 
 @app.get("/api/dashboard")
@@ -353,9 +418,10 @@ def analytics(project_id: int | None = None, db: Session = Depends(get_db)):
 
 @app.get("/api/settings")
 def get_settings_api(db: Session = Depends(get_db)):
-    stored = {item.key: item.value for item in db.scalars(select(Setting)).all()}
-    resolved = settings_with_db(get_settings(), stored)
-    return {"llm_base_url": resolved.llm_base_url, "llm_api_key": "", "llm_api_key_configured": bool(resolved.llm_api_key), "llm_model": resolved.llm_model, "llm_temperature": resolved.llm_temperature, "llm_timeout": resolved.llm_timeout, "policy": "text-only"}
+    settings = get_settings()
+    stored = {item.key: read_setting(item.key, item.value, settings) for item in db.scalars(select(Setting)).all()}
+    resolved = settings_with_db(settings, stored)
+    return {"llm_base_url": resolved.llm_base_url, "llm_api_key": "", "llm_api_key_configured": bool(resolved.llm_api_key), "llm_model": resolved.llm_model, "llm_temperature": resolved.llm_temperature, "llm_timeout": resolved.llm_timeout, "content_provider": stored.get("content_provider", settings.content_provider), "policy": "text-only"}
 
 
 @app.put("/api/settings")
@@ -366,6 +432,11 @@ def update_settings(values: dict[str, str], db: Session = Depends(get_db)):
             continue
         if key == "llm_api_key" and not value:
             continue
+        if key == "llm_api_key":
+            try:
+                value = encrypt_secret(value, get_settings())
+            except ValueError as exc:
+                raise HTTPException(503, str(exc)) from exc
         if key in {"llm_temperature", "llm_timeout"}:
             try:
                 numeric = float(value)
@@ -387,7 +458,8 @@ def update_settings(values: dict[str, str], db: Session = Depends(get_db)):
 
 @app.post("/api/settings/test-llm")
 async def test_llm(values: dict[str, str] | None = None, db: Session = Depends(get_db)):
-    stored = {item.key: item.value for item in db.scalars(select(Setting)).all()}
+    settings = get_settings()
+    stored = {item.key: read_setting(item.key, item.value, settings) for item in db.scalars(select(Setting)).all()}
     for key, value in (values or {}).items():
         if key in {"llm_base_url", "llm_api_key", "llm_model", "llm_temperature", "llm_timeout"} and value:
             stored[key] = value
@@ -403,12 +475,18 @@ def list_agent_runs(project_id: int | None = None, limit: int = Query(100, le=50
 
 
 @app.get("/api/events/stream")
-async def events_stream():
+async def events_stream(last_event_id: int = 0, project_id: int | None = None):
     queue = event_bus.subscribe()
 
     async def generator():
         try:
             yield ": connected\n\n"
+            with SessionLocal() as db:
+                query = select(TaskEvent).where(TaskEvent.id > last_event_id).order_by(TaskEvent.id)
+                if project_id:
+                    query = query.where(TaskEvent.project_id == project_id)
+                for event in db.scalars(query).all():
+                    yield sse_line({"id": event.id, "event_type": event.event_type, "message": event.message, "payload": event.payload, "created_at": event.created_at.isoformat()})
             while True:
                 try:
                     yield sse_line(await asyncio.wait_for(queue.get(), timeout=15))
