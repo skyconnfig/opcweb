@@ -6,6 +6,7 @@
 
 - 本地开发默认 `CONTENT_PROVIDER=mock`，用于验证产品流程。
 - 真实试用必须选择已完成合规配置的外部 Provider，并在数据源页面执行健康检查。
+- Douyin Comments Crawler 若只返回关键词级评论集合，适配器会按“关键词评论集合”保存并继续分析，不会伪造视频 URL；若返回视频 URL，则按视频逐条抓取评论。
 - LLM 只需要 OpenAI Compatible 文本接口：`LLM_BASE_URL`、`LLM_API_KEY`、`LLM_MODEL`。
 - 生产部署必须设置 `API_AUTH_TOKEN` 和 `SETTINGS_ENCRYPTION_KEY`。后者使用 Fernet 密钥，不能使用普通字符串。
 

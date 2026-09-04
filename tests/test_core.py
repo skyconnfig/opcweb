@@ -12,6 +12,7 @@ from app.agents.llm import OpenAICompatibleProvider
 from app.agents.radar_agent import RadarAgent
 from app.core.config import Settings
 from app.providers.mock.mock_provider import MockProvider
+from app.providers.external.douyin_comments_crawler import DouyinCommentsCrawlerExternalProvider
 from app.providers.external.social_harvest import SocialHarvestExternalProvider
 from app.services.radar_service import fingerprint, lead_level
 from app.services.event_bus import sse_line
@@ -126,3 +127,36 @@ async def test_social_harvest_report_normalizes_comment_pages(tmp_path):
     assert page.coverage_status == "complete"
     assert page.items_received == 2
     assert page.items[0].content == "长沙多少钱？"
+
+
+async def test_douyin_crawler_keyword_comment_response_is_consumable():
+    calls = []
+
+    def handler(request: httpx.Request):
+        calls.append(request)
+        return httpx.Response(200, json={"success": True, "video_count": 1, "comment_count": 2, "comments": [{"comment": "长沙多少钱？"}, {"comment": "年底准备装"}]})
+
+    provider = DouyinCommentsCrawlerExternalProvider("https://crawler.example", transport=httpx.MockTransport(handler))
+    videos = await provider.search_videos("长沙装修", 5)
+    page = await provider.get_comments(videos[0].video_id)
+    assert len(videos) == 1
+    assert videos[0].video_id.startswith("keyword-comments-")
+    assert page.items_received == 2
+    assert page.items[0].content == "长沙多少钱？"
+    assert len(calls) == 1
+
+
+async def test_douyin_crawler_uses_returned_video_url_for_comment_scan():
+    calls = []
+
+    def handler(request: httpx.Request):
+        calls.append(request)
+        if request.url.path.endswith("/api/keyword/comments"):
+            return httpx.Response(200, json={"videos": [{"video_id": "v1", "video_url": "https://www.douyin.com/video/v1", "title": "长沙装修预算"}]})
+        return httpx.Response(200, json={"comments": [{"comment_id": "c1", "content": "长沙多少钱？"}]})
+
+    provider = DouyinCommentsCrawlerExternalProvider("https://crawler.example", transport=httpx.MockTransport(handler))
+    videos = await provider.search_videos("长沙装修", 1)
+    await provider.get_comments(videos[0].video_id)
+    assert len(calls) == 2
+    assert json.loads(calls[1].content)["video_url"] == "https://www.douyin.com/video/v1"
