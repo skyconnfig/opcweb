@@ -81,6 +81,9 @@ class Video(Base):
     collects: Mapped[int] = mapped_column(Integer, default=0)
     keyword: Mapped[str] = mapped_column(String(200), index=True)
     opportunity_score: Mapped[float] = mapped_column(Float, default=0)
+    industry_relevance_score: Mapped[float] = mapped_column(Float, default=0)
+    commercial_relevance_score: Mapped[float] = mapped_column(Float, default=0)
+    lead_opportunity_score: Mapped[float] = mapped_column(Float, default=0)
     level: Mapped[str] = mapped_column(String(2), default="C")
     lead_density: Mapped[float] = mapped_column(Float, default=0)
     discovered_at: Mapped[datetime] = mapped_column(DateTime, default=now_utc)
@@ -99,6 +102,7 @@ class Comment(Base):
     profile_url: Mapped[str] = mapped_column(String(500), default="")
     content: Mapped[str] = mapped_column(Text)
     content_hash: Mapped[str] = mapped_column(String(64), index=True)
+    parent_comment_id: Mapped[str] = mapped_column(String(120), default="")
     created_at_platform: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     coverage_status: Mapped[str] = mapped_column(String(20), default="unknown")
 
@@ -213,12 +217,15 @@ class AgentRun(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     project_id: Mapped[int] = mapped_column(ForeignKey("projects.id"), index=True)
     agent: Mapped[str] = mapped_column(String(80))
+    model: Mapped[str] = mapped_column(String(120), default="deterministic-mock")
     prompt_version: Mapped[str] = mapped_column(String(40))
     input_hash: Mapped[str] = mapped_column(String(64), index=True)
+    input_text: Mapped[str] = mapped_column(Text, default="")
     output: Mapped[dict] = mapped_column(JSON, default=dict)
     latency_ms: Mapped[int] = mapped_column(Integer, default=0)
     token_usage: Mapped[int] = mapped_column(Integer, default=0)
     success: Mapped[bool] = mapped_column(default=True)
+    error: Mapped[str] = mapped_column(Text, default="")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=now_utc)
 
 

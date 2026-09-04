@@ -1,6 +1,6 @@
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import select
+from sqlalchemy import inspect, select
 
 from app.agents.keyword_agent import KeywordAgent
 from app.db import Base, SessionLocal, engine
@@ -11,6 +11,7 @@ from app.services.radar_service import fingerprint, lead_level
 
 def init_database():
     Base.metadata.create_all(bind=engine)
+    _ensure_schema()
     with SessionLocal() as db:
         if db.scalar(select(Project.id).limit(1)):
             return
@@ -46,3 +47,27 @@ def init_database():
                     db.add(LeadSource(lead_id=lead.id, video_id=video.id))
                     db.add(LeadEvent(lead_id=lead.id, score=score, event_type="detected", note=content))
         db.commit()
+
+
+def _ensure_schema():
+    """Add fields introduced after the first SQLite demo database was created."""
+    additions = {
+        "videos": {
+            "industry_relevance_score": "FLOAT DEFAULT 0",
+            "commercial_relevance_score": "FLOAT DEFAULT 0",
+            "lead_opportunity_score": "FLOAT DEFAULT 0",
+        },
+        "comments": {"parent_comment_id": "VARCHAR(120) DEFAULT ''"},
+        "agent_runs": {
+            "model": "VARCHAR(120) DEFAULT 'deterministic-mock'",
+            "input_text": "TEXT DEFAULT ''",
+            "error": "TEXT DEFAULT ''",
+        },
+    }
+    with engine.begin() as connection:
+        inspector = inspect(connection)
+        for table, columns in additions.items():
+            existing = {column["name"] for column in inspector.get_columns(table)}
+            for column, definition in columns.items():
+                if column not in existing:
+                    connection.exec_driver_sql(f'ALTER TABLE "{table}" ADD COLUMN "{column}" {definition}')

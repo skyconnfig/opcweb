@@ -1,5 +1,6 @@
 import asyncio
 import hashlib
+import json
 import re
 from datetime import datetime, timezone
 
@@ -8,7 +9,10 @@ from sqlalchemy import func, select
 from app.agents.industry_agent import IndustryAgent
 from app.agents.keyword_agent import KeywordAgent, keyword_opportunity_score
 from app.agents.lead_judge_agent import LeadJudgeAgent, RulePreFilter
+from app.agents.llm import BaseLLMProvider, OpenAICompatibleProvider
 from app.agents.persona_agent import PersonaAgent
+from app.agents.radar_agent import RadarAgent
+from app.core.config import get_settings
 from app.db import SessionLocal
 from app.models import AgentRun, Comment, Keyword, Lead, LeadComment, LeadEvent, LeadSource, Project, TaskCheckpoint, TaskEvent, TaskReport, TaskStep, ScanTask, Video, now_utc
 from app.providers.base import BaseContentProvider
@@ -24,12 +28,14 @@ def lead_level(score: float) -> str:
 
 
 class RadarService:
-    def __init__(self, provider: BaseContentProvider):
+    def __init__(self, provider: BaseContentProvider, llm: BaseLLMProvider | None = None):
         self.provider = provider
-        self.industry_agent = IndustryAgent()
-        self.keyword_agent = KeywordAgent()
-        self.judge_agent = LeadJudgeAgent()
-        self.persona_agent = PersonaAgent()
+        self.llm = llm or OpenAICompatibleProvider(get_settings())
+        self.industry_agent = IndustryAgent(self.llm)
+        self.keyword_agent = KeywordAgent(self.llm)
+        self.judge_agent = LeadJudgeAgent(self.llm)
+        self.persona_agent = PersonaAgent(self.llm)
+        self.radar_agent = RadarAgent()
         self.prefilter = RulePreFilter()
 
     async def analyze_project(self, project_id: int) -> dict:
@@ -38,15 +44,34 @@ class RadarService:
             if not project:
                 raise ValueError("项目不存在")
             context = {"industry": project.industry, "location": project.location, "service": project.service, "target_customer": project.target_customer, "price_range": project.price_range, "description": project.description}
-            intelligence = await self.industry_agent.run(context)
+            self.llm.clear_last_call()
+            try:
+                intelligence = await self.industry_agent.run(context)
+            except Exception:
+                self._record_agent_run(db, project.id, "IndustryAgent", self.industry_agent.prompt_version, context, {})
+                db.commit()
+                raise
             project.intelligence = intelligence
-            db.add(AgentRun(project_id=project.id, agent="IndustryAgent", prompt_version=self.industry_agent.prompt_version, input_hash=fingerprint(str(context)), output=intelligence))
-            keywords = await self.keyword_agent.run(context, intelligence)
+            self._record_agent_run(db, project.id, "IndustryAgent", self.industry_agent.prompt_version, context, intelligence)
+            self.llm.clear_last_call()
+            try:
+                keywords = await self.keyword_agent.run(context, intelligence)
+            except Exception:
+                self._record_agent_run(db, project.id, "KeywordAgent", self.keyword_agent.prompt_version, {"context": context, "intelligence": intelligence}, {})
+                db.commit()
+                raise
+            self._record_agent_run(db, project.id, "KeywordAgent", self.keyword_agent.prompt_version, {"context": context, "intelligence": intelligence}, {"keywords": keywords})
             for row in keywords:
                 db.add(Keyword(project_id=project.id, **row))
             project.status = "ready"
             db.commit()
             return {"intelligence": intelligence, "keyword_count": len(keywords), "categories": _category_counts(keywords)}
+
+    def _record_agent_run(self, db, project_id: int, agent: str, prompt_version: str, input_payload: dict, output: dict):
+        call = self.llm.last_call
+        input_text = call.input_text if call else json.dumps(input_payload, ensure_ascii=False)
+        model = call.model if call else (self.llm.model if self.llm.configured else "deterministic-mock")
+        db.add(AgentRun(project_id=project_id, agent=agent, model=model, prompt_version=prompt_version, input_hash=fingerprint(input_text), input_text=input_text, output=output, latency_ms=call.latency_ms if call else 0, token_usage=call.tokens if call else 0, success=call.success if call else True, error=call.error if call else ""))
 
     async def start_scan(self, project_id: int, full: bool = False) -> int:
         with SessionLocal() as db:
@@ -91,11 +116,17 @@ class RadarService:
                 videos = await self.provider.search_videos(keyword.keyword, 20 if full else 2)
                 with SessionLocal() as db:
                     for dto in videos:
+                        radar = self.radar_agent.score({"title": dto.title, "description": dto.description, "creator": dto.creator, "publish_time": dto.publish_time, "likes": dto.likes, "comments": dto.comments, "shares": dto.shares, "collects": dto.collects}, keyword.keyword)
                         existing = db.scalar(select(Video).where(Video.project_id == project.id, Video.platform == dto.platform, Video.platform_video_id == dto.video_id))
                         if existing:
                             video = existing
+                            video.industry_relevance_score = radar["industry_relevance_score"]
+                            video.commercial_relevance_score = radar["commercial_relevance_score"]
+                            video.lead_opportunity_score = radar["lead_opportunity_score"]
+                            video.opportunity_score = radar["video_opportunity_score"]
+                            video.level = radar["level"]
                         else:
-                            video = Video(project_id=project.id, platform=dto.platform, platform_video_id=dto.video_id, title=dto.title, description=dto.description, creator=dto.creator, url=dto.url, cover=dto.cover, publish_time=dto.publish_time, likes=dto.likes, comments=dto.comments, shares=dto.shares, collects=dto.collects, keyword=dto.keyword, opportunity_score=_video_score(dto.likes, dto.comments, index), level=lead_level(_video_score(dto.likes, dto.comments, index)))
+                            video = Video(project_id=project.id, platform=dto.platform, platform_video_id=dto.video_id, title=dto.title, description=dto.description, creator=dto.creator, url=dto.url, cover=dto.cover, publish_time=dto.publish_time, likes=dto.likes, comments=dto.comments, shares=dto.shares, collects=dto.collects, keyword=dto.keyword, opportunity_score=radar["video_opportunity_score"], industry_relevance_score=radar["industry_relevance_score"], commercial_relevance_score=radar["commercial_relevance_score"], lead_opportunity_score=radar["lead_opportunity_score"], level=radar["level"])
                             db.add(video)
                         keyword.video_count += 1
                         keyword.last_scanned_at = now_utc()
@@ -115,11 +146,21 @@ class RadarService:
                                 continue
                             c = db.scalar(select(Comment).where(Comment.project_id == project.id, Comment.platform == comment_dto.platform, Comment.platform_comment_id == comment_dto.comment_id))
                             if not c:
-                                c = Comment(project_id=project.id, video_id=video.id, platform=comment_dto.platform, platform_comment_id=comment_dto.comment_id, platform_user_id=comment_dto.user_id, nickname=comment_dto.nickname, profile_url=comment_dto.profile_url, content=comment_dto.content, content_hash=fingerprint(comment_dto.content), created_at_platform=comment_dto.created_at, coverage_status=result.coverage_status)
+                                c = Comment(project_id=project.id, video_id=video.id, platform=comment_dto.platform, platform_comment_id=comment_dto.comment_id, platform_user_id=comment_dto.user_id, nickname=comment_dto.nickname, profile_url=comment_dto.profile_url, content=comment_dto.content, content_hash=fingerprint(comment_dto.content), parent_comment_id=comment_dto.parent_comment_id, created_at_platform=comment_dto.created_at, coverage_status=result.coverage_status)
                                 db.add(c)
                                 db.flush()
-                            project_data = {"industry": project.industry, "location": project.location, "service": project.service}
-                            judgment = await self.judge_agent.run(project_data, {"content": c.content, "nickname": c.nickname})
+                            history_rows = db.scalars(select(Comment).where(Comment.project_id == project.id, Comment.platform == c.platform, Comment.platform_user_id == c.platform_user_id).order_by(Comment.id)).all() if c.platform_user_id else []
+                            history_text = "\n".join(f"{index + 1}. {row.content}" for index, row in enumerate(history_rows))
+                            project_data = {"industry": project.industry, "location": project.location, "service": project.service, "target_customer": project.target_customer, "price_range": project.price_range, "description": project.description, "keyword": keyword.keyword, "video_title": dto.title, "video_description": dto.description, "video_creator": dto.creator, "video_likes": dto.likes, "video_comments": dto.comments, "video_shares": dto.shares, "video_collects": dto.collects, "history_text": history_text}
+                            comment_data = {"content": c.content, "nickname": c.nickname, "history_text": history_text, "parent_comment_id": c.parent_comment_id}
+                            self.llm.clear_last_call()
+                            try:
+                                judgment = await self.judge_agent.run(project_data, comment_data)
+                            except Exception as exc:
+                                self._record_agent_run(db, project.id, "LeadJudgeAgent", self.judge_agent.prompt_version, {"project": project_data, "comment": comment_data}, {})
+                                db.commit()
+                                raise exc
+                            self._record_agent_run(db, project.id, "LeadJudgeAgent", self.judge_agent.prompt_version, {"project": project_data, "comment": comment_data}, judgment)
                             if judgment["is_lead"]:
                                 lead = _upsert_lead(db, project.id, c, judgment, video.id)
                                 leads_seen += 1

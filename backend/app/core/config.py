@@ -9,6 +9,8 @@ class Settings(BaseSettings):
     llm_base_url: str = ""
     llm_api_key: str = ""
     llm_model: str = "deepseek-chat"
+    llm_temperature: float = 0.2
+    llm_timeout: float = 45.0
     douyin_comments_crawler_url: str = "http://127.0.0.1:8000"
     mediacrawler_path: str = ""
     social_harvest_path: str = ""
@@ -18,4 +20,3 @@ class Settings(BaseSettings):
 @lru_cache
 def get_settings() -> Settings:
     return Settings()
-

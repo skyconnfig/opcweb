@@ -1,6 +1,8 @@
 # AI 截流雷达 / AI Lead Radar
 
-一个 Windows 优先、Provider 可替换的行业获客雷达 MVP。输入行业、地区、业务与目标客户后，系统会生成行业关键词，扫描公开 Mock 内容，识别购买信号，汇总潜客并生成仅供人工参考的跟进建议。
+一个 Windows 优先、Provider 可替换的行业获客雷达 MVP。输入行业、地区、业务与目标客户后，系统会通过文本模型生成行业关键词，依据公开视频元数据与公开评论识别购买信号，汇总潜客并生成仅供人工参考的跟进建议。
+
+第一版明确只使用文本模型，不接收图片或视频画面输入。Agent 只处理文字、结构化字段、公开视频元数据、公开评论、用户历史评论、人设和知识库文本。架构细则见 [`docs/text-only-architecture.md`](docs/text-only-architecture.md)。
 
 ## 快速启动
 
@@ -28,7 +30,7 @@ npm run dev
 ## 目录
 
 - `backend/app`：FastAPI、SQLAlchemy、Agent、Provider、任务引擎
-- `web`：React + TypeScript + Vite 单页应用
+- `web`：React + TypeScript + Next.js App Router + Tailwind CSS 4
 - `docs/open-source-research.md`：四个参考项目的取证与边界
 - `tests`：Provider、规则预筛、评分、去重、checkpoint、SSE 等测试
 - `start.ps1` / `start.bat`：Windows 开发启动脚本
@@ -38,4 +40,3 @@ npm run dev
 主系统只处理公开内容、机会判断、潜客 CRM 和人工跟进辅助。不实现验证码破解、绕过风控、批量注册、设备指纹伪造、批量骚扰私信、自动加微信或自动营销发送。外部爬虫必须由用户独立运行并自行确认平台规则与许可证。
 
 更多配置见 `.env.example` 与 `THIRD_PARTY.md`。
-

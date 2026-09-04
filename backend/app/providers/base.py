@@ -35,6 +35,7 @@ class CommentDTO:
     profile_url: str
     content: str
     created_at: datetime | None = None
+    parent_comment_id: str = ""
 
 
 @dataclass
@@ -65,4 +66,3 @@ class BaseContentProvider(ABC):
 
     async def get_creator(self, creator_id: str) -> dict:
         return {"creator_id": creator_id, "supported": self.capabilities.get("creator", False)}
-

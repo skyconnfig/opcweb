@@ -1,4 +1,5 @@
 import asyncio
+import json
 from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, HTTPException, Query
@@ -8,6 +9,7 @@ from pydantic import BaseModel, ConfigDict
 from sqlalchemy import desc, func, select
 from sqlalchemy.orm import Session
 
+from app.agents.llm import OpenAICompatibleProvider, input_hash, settings_with_db
 from app.agents.persona_agent import PersonaAgent
 from app.core.config import get_settings
 from app.db import SessionLocal, get_db
@@ -63,6 +65,11 @@ def active_provider():
     return MockProvider()
 
 
+def active_llm(db: Session) -> OpenAICompatibleProvider:
+    values = {item.key: item.value for item in db.scalars(select(Setting)).all()}
+    return OpenAICompatibleProvider(settings_with_db(get_settings(), values))
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_database()
@@ -110,13 +117,13 @@ def get_project(project_id: int, db: Session = Depends(get_db)):
 async def smart_mode(project_id: int, db: Session = Depends(get_db)):
     if not db.get(Project, project_id):
         raise HTTPException(404, "项目不存在")
-    return await RadarService(active_provider()).analyze_project(project_id)
+    return await RadarService(active_provider(), active_llm(db)).analyze_project(project_id)
 
 
 @app.post("/api/projects/{project_id}/scan")
 async def start_project_scan(project_id: int, full: bool = False, db: Session = Depends(get_db)):
     try:
-        task_id = await RadarService(active_provider()).start_scan(project_id, full)
+        task_id = await RadarService(active_provider(), active_llm(db)).start_scan(project_id, full)
     except ValueError as exc:
         raise HTTPException(404, str(exc)) from exc
     return {"task_id": task_id, "status": "queued", "provider": active_provider().name}
@@ -166,7 +173,7 @@ async def scan_video(video_id: int, db: Session = Depends(get_db)):
     video = db.get(Video, video_id)
     if not video:
         raise HTTPException(404, "视频不存在")
-    task_id = await RadarService(active_provider()).start_scan(video.project_id)
+    task_id = await RadarService(active_provider(), active_llm(db)).start_scan(video.project_id)
     return {"task_id": task_id}
 
 
@@ -216,7 +223,32 @@ async def lead_persona(lead_id: int, db: Session = Depends(get_db)):
         persona = Persona(project_id=project.id, name="行业顾问", identity="本地行业顾问")
         db.add(persona)
         db.commit()
-    advice = await PersonaAgent().run({"industry": project.industry, "location": project.location, "service": project.service}, {"need": lead.need, "budget": lead.budget, "summary": lead.summary}, {"name": persona.name})
+    comments = db.scalars(select(Comment).join(LeadComment, LeadComment.comment_id == Comment.id).where(LeadComment.lead_id == lead.id).order_by(Comment.id)).all()
+    project_data = {"industry": project.industry, "location": project.location, "service": project.service, "target_customer": project.target_customer, "price_range": project.price_range, "description": project.description}
+    lead_data = {"need": lead.need, "budget": lead.budget, "summary": lead.summary, "location": lead.location, "purchase_stage": lead.purchase_stage}
+    persona_data = {"name": persona.name, "identity": persona.identity, "experience": persona.experience, "location": persona.location, "tone": persona.tone, "strengths": persona.strengths, "forbidden_words": persona.forbidden_words, "sample_reply": persona.sample_reply}
+    llm = active_llm(db)
+    agent = PersonaAgent(llm)
+    persona_input = {"project": project_data, "lead": lead_data, "persona": persona_data, "comments": [comment.content for comment in comments]}
+    input_text = json.dumps(persona_input, ensure_ascii=False)
+    llm.clear_last_call()
+    try:
+        advice = await agent.run(project_data, lead_data, persona_data, persona_input["comments"])
+    except Exception as exc:
+        call = llm.last_call
+        failed_input_text = call.input_text if call and call.input_text else input_text
+        failed_model = call.model if call else (llm.model if llm.configured else "deterministic-mock")
+        failed_run = AgentRun(project_id=project.id, agent="PersonaAgent", model=failed_model, prompt_version=agent.prompt_version, input_hash=input_hash(persona_input), input_text=failed_input_text, output={}, latency_ms=call.latency_ms if call else 0, token_usage=call.tokens if call else 0, success=False, error=str(exc))
+        db.add(failed_run)
+        db.commit()
+        raise HTTPException(502, "文本模型调用失败") from exc
+    call = llm.last_call
+    model = call.model if call else (llm.model if llm.configured else "deterministic-mock")
+    if call and call.input_text:
+        input_text = call.input_text
+    agent_run = AgentRun(project_id=project.id, agent="PersonaAgent", model=model, prompt_version=agent.prompt_version, input_hash=input_hash(persona_input), input_text=input_text, output=advice, latency_ms=call.latency_ms if call else 0, token_usage=call.tokens if call else 0, success=call.success if call else True, error=call.error if call else "")
+    agent_run.input_text = input_text
+    db.add(agent_run)
     lead.persona_advice = advice
     db.commit()
     return advice
@@ -269,7 +301,7 @@ def pause_task(task_id: int, db: Session = Depends(get_db)):
 @app.post("/api/tasks/{task_id}/resume")
 async def resume_task(task_id: int, db: Session = Depends(get_db)):
     task = mutate_task(task_id, "queued", db)
-    asyncio.create_task(RadarService(active_provider()).run_task(task_id))
+    asyncio.create_task(RadarService(active_provider(), active_llm(db)).run_task(task_id))
     return task
 
 
@@ -278,7 +310,7 @@ async def retry_task(task_id: int, db: Session = Depends(get_db)):
     task = mutate_task(task_id, "queued", db)
     task.error = ""
     db.commit()
-    asyncio.create_task(RadarService(active_provider()).run_task(task_id))
+    asyncio.create_task(RadarService(active_provider(), active_llm(db)).run_task(task_id))
     return task
 
 
@@ -321,19 +353,53 @@ def analytics(project_id: int | None = None, db: Session = Depends(get_db)):
 
 @app.get("/api/settings")
 def get_settings_api(db: Session = Depends(get_db)):
-    return {item.key: item.value for item in db.scalars(select(Setting)).all()}
+    stored = {item.key: item.value for item in db.scalars(select(Setting)).all()}
+    resolved = settings_with_db(get_settings(), stored)
+    return {"llm_base_url": resolved.llm_base_url, "llm_api_key": "", "llm_api_key_configured": bool(resolved.llm_api_key), "llm_model": resolved.llm_model, "llm_temperature": resolved.llm_temperature, "llm_timeout": resolved.llm_timeout, "policy": "text-only"}
 
 
 @app.put("/api/settings")
 def update_settings(values: dict[str, str], db: Session = Depends(get_db)):
+    allowed = {"llm_base_url", "llm_api_key", "llm_model", "llm_temperature", "llm_timeout"}
     for key, value in values.items():
+        if key not in allowed:
+            continue
+        if key == "llm_api_key" and not value:
+            continue
+        if key in {"llm_temperature", "llm_timeout"}:
+            try:
+                numeric = float(value)
+            except (TypeError, ValueError) as exc:
+                raise HTTPException(422, f"{key} 必须是数字") from exc
+            if key == "llm_temperature" and not 0 <= numeric <= 2:
+                raise HTTPException(422, "llm_temperature 必须在 0 到 2 之间")
+            if key == "llm_timeout" and not 1 <= numeric <= 180:
+                raise HTTPException(422, "llm_timeout 必须在 1 到 180 秒之间")
+            value = str(numeric)
         setting = db.get(Setting, key)
         if setting:
             setting.value = value
         else:
             db.add(Setting(key=key, value=value))
     db.commit()
-    return {item.key: item.value for item in db.scalars(select(Setting)).all()}
+    return get_settings_api(db)
+
+
+@app.post("/api/settings/test-llm")
+async def test_llm(values: dict[str, str] | None = None, db: Session = Depends(get_db)):
+    stored = {item.key: item.value for item in db.scalars(select(Setting)).all()}
+    for key, value in (values or {}).items():
+        if key in {"llm_base_url", "llm_api_key", "llm_model", "llm_temperature", "llm_timeout"} and value:
+            stored[key] = value
+    return await OpenAICompatibleProvider(settings_with_db(get_settings(), stored)).test_connection()
+
+
+@app.get("/api/agent-runs")
+def list_agent_runs(project_id: int | None = None, limit: int = Query(100, le=500), db: Session = Depends(get_db)):
+    query = select(AgentRun).order_by(desc(AgentRun.id)).limit(limit)
+    if project_id:
+        query = query.where(AgentRun.project_id == project_id)
+    return db.scalars(query).all()
 
 
 @app.get("/api/events/stream")

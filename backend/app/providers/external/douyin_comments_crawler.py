@@ -37,7 +37,7 @@ class DouyinCommentsCrawlerExternalProvider(BaseContentProvider):
             response = await client.post(f"{self.base_url}/api/video/comments", json={"video_url": video_id, "limit": 50})
             response.raise_for_status()
             payload = response.json()
-        items = [CommentDTO("douyin", str(item.get("comment_id", index)), str(item.get("user_id", "")), str(item.get("nickname", "")), str(item.get("profile_url", "")), str(item.get("comment", item.get("content", ""))), _parse_dt(item.get("create_time"))) for index, item in enumerate(payload.get("comments", []))]
+        items = [CommentDTO("douyin", str(item.get("comment_id", index)), str(item.get("user_id", "")), str(item.get("nickname", "")), str(item.get("profile_url", "")), str(item.get("comment", item.get("content", ""))), _parse_dt(item.get("create_time")), str(item.get("parent_comment_id", ""))) for index, item in enumerate(payload.get("comments", []))]
         return CommentScanResult(items, "unknown", len(items), None, False)
 
 
@@ -46,4 +46,3 @@ def _parse_dt(value):
         return datetime.fromtimestamp(float(value)) if value else None
     except (TypeError, ValueError, OSError):
         return None
-
