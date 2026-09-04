@@ -16,6 +16,7 @@ from app.providers.external.douyin_comments_crawler import DouyinCommentsCrawler
 from app.providers.external.social_harvest import SocialHarvestExternalProvider
 from app.services.radar_service import fingerprint, lead_level
 from app.services.event_bus import sse_line
+from app.services.event_bus import event_bus
 from app.settings_store import decrypt_secret, encrypt_secret
 from app.tasks.checkpoint import checkpoint_snapshot
 from app.tasks.queue import advance_schedule
@@ -65,6 +66,15 @@ def test_sse_and_checkpoint_contract():
         last_comment_cursor = "cursor-2"
         processed_comment_ids = [1, 2]
     assert checkpoint_snapshot(Checkpoint()) == {"last_keyword_id": 3, "last_video_id": 8, "last_comment_cursor": "cursor-2", "processed_comment_ids": [1, 2]}
+
+
+async def test_event_bus_preserves_project_scope():
+    queue = event_bus.subscribe()
+    try:
+        await event_bus.publish({"id": 8, "project_id": 3, "event_type": "video.discovered", "message": "发现视频"})
+        assert (await queue.get())["project_id"] == 3
+    finally:
+        event_bus.unsubscribe(queue)
 
 
 def test_scan_schedule_advances_with_a_safe_minimum_interval():

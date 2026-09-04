@@ -253,7 +253,7 @@ class RadarService:
             event = TaskEvent(task_id=task_id, project_id=project_id, event_type=event_type, message=message, payload=payload or {})
             db.add(event)
             db.commit()
-            event_data = {"id": event.id, "event_type": event.event_type, "message": event.message, "payload": event.payload, "created_at": event.created_at.isoformat()}
+            event_data = {"id": event.id, "project_id": event.project_id, "event_type": event.event_type, "message": event.message, "payload": event.payload, "created_at": event.created_at.isoformat()}
         await event_bus.publish(event_data)
 
     def _is_paused(self, task_id: int) -> bool:

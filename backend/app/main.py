@@ -584,10 +584,13 @@ async def events_stream(last_event_id: int = 0, project_id: int | None = None):
                 if project_id:
                     query = query.where(TaskEvent.project_id == project_id)
                 for event in db.scalars(query).all():
-                    yield sse_line({"id": event.id, "event_type": event.event_type, "message": event.message, "payload": event.payload, "created_at": event.created_at.isoformat()})
+                    yield sse_line({"id": event.id, "project_id": event.project_id, "event_type": event.event_type, "message": event.message, "payload": event.payload, "created_at": event.created_at.isoformat()})
             while True:
                 try:
-                    yield sse_line(await asyncio.wait_for(queue.get(), timeout=15))
+                    event = await asyncio.wait_for(queue.get(), timeout=15)
+                    if project_id and event.get("project_id") != project_id:
+                        continue
+                    yield sse_line(event)
                 except asyncio.TimeoutError:
                     yield ": heartbeat\n\n"
         finally:

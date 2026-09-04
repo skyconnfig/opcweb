@@ -16,7 +16,7 @@ class EventBus:
         self.subscribers.discard(queue)
 
     async def publish(self, event: dict):
-        event = {"id": event.get("id"), "event_type": event.get("event_type", "radar.update"), "message": event.get("message", ""), "payload": event.get("payload", {}), "created_at": event.get("created_at", datetime.now(timezone.utc).isoformat())}
+        event = {"id": event.get("id"), "project_id": event.get("project_id"), "event_type": event.get("event_type", "radar.update"), "message": event.get("message", ""), "payload": event.get("payload", {}), "created_at": event.get("created_at", datetime.now(timezone.utc).isoformat())}
         for queue in list(self.subscribers):
             try:
                 queue.put_nowait(event)
