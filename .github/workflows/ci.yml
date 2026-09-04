@@ -34,3 +34,27 @@ jobs:
       - name: Build web
         run: npm run build
         working-directory: web
+      - name: Smoke test Docker Compose deployment
+        run: |
+          cat > .env <<'EOF'
+          DATABASE_URL=postgresql+psycopg://radar:ci-password@postgres:5432/radar
+          POSTGRES_PASSWORD=ci-password
+          API_AUTH_TOKEN=ci-token
+          SETTINGS_ENCRYPTION_KEY=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+          LLM_BASE_URL=
+          LLM_API_KEY=
+          LLM_MODEL=deepseek-chat
+          CONTENT_PROVIDER=mock
+          CORS_ORIGINS=http://localhost:5173
+          EOF
+          docker compose config --quiet
+          docker compose up --build -d
+          for attempt in $(seq 1 45); do
+            if curl --fail --silent http://127.0.0.1:8689/health > /tmp/radar-health.json; then break; fi
+            sleep 2
+          done
+          curl --fail --silent http://127.0.0.1:8689/health
+          curl --fail --silent http://127.0.0.1:5173/ > /dev/null
+      - name: Tear down Docker Compose deployment
+        if: always()
+        run: docker compose down -v
