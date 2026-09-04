@@ -18,6 +18,8 @@
 4. 执行 `docker compose up --build -d`。
 5. 验证 `http://127.0.0.1:8689/health`、`http://127.0.0.1:8689/docs` 和 `http://127.0.0.1:5173`。
 
+Web 容器使用 Next.js 服务端 API 代理。`API_AUTH_TOKEN` 仅作为 Web/API 容器运行时环境变量存在，不应配置为 `NEXT_PUBLIC_API_TOKEN`，也不应出现在客户端代码或构建参数中。API 的 `/ready` 探针会验证数据库连接，Compose healthcheck 和 CI smoke 均使用该探针。
+
 API 使用 `Authorization: Bearer <API_AUTH_TOKEN>`。前端容器在构建时读取同一个 Token；更换 Token 后需要重新构建 web 服务。
 
 ## 自用验收顺序

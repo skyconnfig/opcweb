@@ -49,12 +49,18 @@ jobs:
           EOF
           docker compose config --quiet
           docker compose up --build -d
-          for attempt in $(seq 1 45); do
-            if curl --fail --silent http://127.0.0.1:8689/health > /tmp/radar-health.json; then break; fi
+          for attempt in $(seq 1 60); do
+            if curl --fail --silent http://127.0.0.1:8689/ready > /tmp/radar-ready.json; then break; fi
             sleep 2
           done
           curl --fail --silent http://127.0.0.1:8689/health
+          curl --fail --silent http://127.0.0.1:8689/ready
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent http://127.0.0.1:5173/ > /dev/null; then break; fi
+            sleep 2
+          done
           curl --fail --silent http://127.0.0.1:5173/ > /dev/null
+          docker compose ps
       - name: Tear down Docker Compose deployment
         if: always()
         run: docker compose down -v

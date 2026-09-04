@@ -8,7 +8,7 @@ from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
-from sqlalchemy import desc, func, select, update
+from sqlalchemy import desc, func, select, text, update
 from sqlalchemy.orm import Session
 
 from app.agents.llm import OpenAICompatibleProvider, input_hash, settings_with_db
@@ -170,6 +170,13 @@ app.add_middleware(CORSMiddleware, allow_origins=[origin.strip() for origin in g
 def health(db: Session = Depends(get_db)):
     provider = active_provider(db)
     return {"status": "running", "service": "AI 截流雷达", "version": "0.1.0", "mode": "mock-demo-fallback" if provider.name == "Mock Provider" else "text-production", "provider": provider.name}
+
+
+@app.get("/ready")
+def ready(db: Session = Depends(get_db)):
+    """Deployment readiness probe: verify the API can reach its database."""
+    db.execute(text("SELECT 1"))
+    return {"status": "ready", "database": "connected"}
 
 
 @app.get("/api/projects", response_model=list[ProjectOut])
@@ -501,7 +508,11 @@ def dashboard(project_id: int | None = None, db: Session = Depends(get_db)):
         return {"project": None, "stats": {}, "events": []}
     stats = {"keywords": db.scalar(select(func.count(Keyword.id)).where(Keyword.project_id == project.id)) or 0, "videos": db.scalar(select(func.count(Video.id)).where(Video.project_id == project.id)) or 0, "comments": db.scalar(select(func.count(Comment.id)).where(Comment.project_id == project.id)) or 0, "leads": db.scalar(select(func.count(Lead.id)).where(Lead.project_id == project.id)) or 0, "s_leads": db.scalar(select(func.count(Lead.id)).where(Lead.project_id == project.id, Lead.lead_level == "S")) or 0, "new_leads": db.scalar(select(func.count(Lead.id)).where(Lead.project_id == project.id, Lead.status == "NEW")) or 0}
     events = db.scalars(select(TaskEvent).where(TaskEvent.project_id == project.id).order_by(desc(TaskEvent.id)).limit(20)).all()
-    return {"project": project, "stats": stats, "events": list(reversed(events)), "mode": "Demo 数据模式"}
+    top_keywords = db.scalars(select(Keyword).where(Keyword.project_id == project.id).order_by(desc(Keyword.opportunity_score)).limit(8)).all()
+    done = sum([bool(project.intelligence), stats["keywords"] > 0, stats["videos"] > 0, stats["leads"] > 0])
+    provider = active_provider(db)
+    mode = "Demo 数据模式" if provider.name == "Mock Provider" else "文本生产模式"
+    return {"project": project, "stats": stats, "events": list(reversed(events)), "top_keywords": top_keywords, "mode": mode, "checklist": {"done": done, "total": 6}}
 
 
 @app.get("/api/analytics")

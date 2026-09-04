@@ -19,7 +19,7 @@ services:
       SOCIAL_HARVEST_PATH: ${SOCIAL_HARVEST_PATH:-}
     ports: ["8689:8689"]
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8689/health')"]
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8689/ready')"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -29,9 +29,9 @@ services:
   web:
     build:
       context: ./web
-      args:
-        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:8689}
-        NEXT_PUBLIC_API_TOKEN: ${API_AUTH_TOKEN:?set API_AUTH_TOKEN in .env}
+    environment:
+      API_URL: http://api:8689
+      API_AUTH_TOKEN: ${API_AUTH_TOKEN:?set API_AUTH_TOKEN in .env}
     ports: ["5173:3000"]
     depends_on:
       api:

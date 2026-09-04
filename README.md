@@ -25,9 +25,13 @@ npm run dev
 
 打开 http://127.0.0.1:5173。API 文档在 http://127.0.0.1:8689/docs。
 
+前端通过 Next.js 服务端代理访问 API；`API_AUTH_TOKEN` 只在服务端环境中使用，不会作为 `NEXT_PUBLIC_*` 变量打进浏览器 bundle。生产 Compose 中 Web 容器通过 `API_URL=http://api:8689` 访问 API。
+
 生产部署前请在 `.env` 中设置 `API_AUTH_TOKEN` 和 `SETTINGS_ENCRYPTION_KEY`。可用 `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"` 生成加密密钥。
 
 默认 Demo：长沙装修，包含 50 个关键词、20 个视频、300 条评论和一批可跟进潜客。未配置 LLM 时使用确定性的 Mock AI；未连接外部 Provider 时不会偷偷伪装成真实数据，界面会明确显示 Demo 数据模式。
+
+部署探针：`/health` 用于存活检查，`/ready` 会额外验证数据库连接。生产环境应以 `/ready` 作为容器编排的就绪条件。
 
 ## 目录
 
