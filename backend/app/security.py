@@ -6,7 +6,7 @@ from fastapi.responses import JSONResponse
 from app.core.config import get_settings
 
 
-PUBLIC_PATHS = {"/health", "/docs", "/redoc", "/openapi.json"}
+PUBLIC_PATHS = {"/health", "/ready", "/docs", "/redoc", "/openapi.json"}
 
 
 def is_authorized(request: Request) -> bool:
