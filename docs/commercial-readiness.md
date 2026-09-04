@@ -13,7 +13,7 @@
 ## Docker 验收
 
 1. 复制 `.env.example` 为 `.env`。
-2. 设置 `API_AUTH_TOKEN`、`SETTINGS_ENCRYPTION_KEY`、LLM 配置和 Provider 配置。
+2. 将 `DATABASE_URL` 中的数据库密码与 `POSTGRES_PASSWORD` 都替换为强密码，并设置 `API_AUTH_TOKEN`、`SETTINGS_ENCRYPTION_KEY`、LLM 配置和 Provider 配置。
 3. 执行 `docker compose config`，确认变量已解析且没有明文 Key。
 4. 执行 `docker compose up --build -d`。
 5. 验证 `http://127.0.0.1:8689/health`、`http://127.0.0.1:8689/docs` 和 `http://127.0.0.1:5173`。
