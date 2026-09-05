@@ -1,6 +1,7 @@
 import json
 
 from app.agents.llm import BaseLLMProvider
+from app.errors import LLMInvalidResponseError, LLMNotConfiguredError
 
 
 CATEGORIES = ["核心词", "需求词", "购买意向", "痛点词", "问题词", "价格词", "对比词", "避坑词", "竞品词", "地域词", "场景词", "人群词", "长尾词"]
@@ -13,39 +14,32 @@ class KeywordAgent:
         self.llm = llm
 
     async def run(self, context: dict, intelligence: dict) -> list[dict]:
-        if self.llm and self.llm.configured:
-            result = await self.llm.structured_output(
-                "你是关键词 Agent。只根据行业文字、客户语言和结构化字段生成 100 到 300 个关键词，不读取或推断任何画面。返回 JSON：{keywords:[...]}。",
-                json.dumps({"project": self._text_context(context), "intelligence": intelligence}, ensure_ascii=False),
-                {"type": "object"},
-            )
-            rows = result.get("keywords", []) if isinstance(result, dict) else []
-            normalized = self._normalize(rows, context)
-            if normalized:
+        if self.llm is None:
+            raise LLMNotConfiguredError("KeywordAgent 需要已配置的文本模型")
+        system = """你是关键词 Agent，只能根据行业文字、客户语言、评论文字和结构化字段生成关键词，绝不读取或推断任何图片、视频画面或 OCR。
+只输出一个 JSON 对象，格式必须是 {"keywords":[{"keyword":"词","category":"核心词"}]}。
+keywords 必须恰好包含 100 个去重对象（100 个即可，不要生成 200 或 300 个）；每项只保留 keyword 和 category，category 只能使用：核心词、需求词、购买意向、痛点词、问题词、价格词、对比词、避坑词、竞品词、地域词、场景词、人群词、长尾词。不要输出 analysis、recommendations 或其他顶层字段。""",
+        payload = json.dumps({"project": self._text_context(context), "intelligence": intelligence}, ensure_ascii=False)
+        last_error = None
+        for attempt in range(3):
+            try:
+                request_payload = payload
+                result = await self.llm.structured_output(
+                    system if attempt == 0 else f"{system}\n这是第 {attempt + 1} 次尝试。上一次输出数量或字段不合格，请从头生成恰好 100 个去重关键词对象，并只返回 keywords。",
+                    request_payload,
+                    {"type": "object"},
+                )
+                rows = result.get("keywords", []) if isinstance(result, dict) else []
+                normalized = self._normalize(rows, context)
+                if not normalized:
+                    raise LLMInvalidResponseError("KeywordAgent 必须返回 100 到 300 个有效关键词")
                 return normalized
-        return self.generate(context, intelligence)
-
-    def generate(self, context: dict, intelligence: dict) -> list[dict]:
-        industry = context.get("industry", "服务")
-        location = context.get("location", "本地")
-        service = context.get("service", "专业服务")
-        target = context.get("target_customer", "有明确需求的客户")
-        bases = [industry, f"{location}{industry}", f"{location}{industry}公司", f"{location}{industry}推荐", f"{location}{industry}哪家好", f"{location}{industry}多少钱", f"{service}怎么选", f"{industry}预算", f"{industry}避坑", f"{industry}报价", f"{industry}踩坑", f"有没有靠谱的{industry}", f"准备做{service}", f"{location}本地{service}", target]
-        suffixes = ["多少钱", "哪家靠谱", "怎么收费", "有推荐吗", "怎么选", "预算多少", "能做吗", "会不会有增项", "需要注意什么", "有没有联系方式", "适合什么人", "价格对比"]
-        rows = []
-        seen: set[str] = set()
-        for index in range(120):
-            base = bases[index % len(bases)]
-            keyword = base if index < len(bases) else f"{base}{suffixes[index % len(suffixes)]}"
-            if keyword in seen:
-                keyword = f"{keyword} {index + 1}"
-            seen.add(keyword)
-            category = CATEGORIES[index % len(CATEGORIES)]
-            intent = min(98, 58 + (index * 7) % 40)
-            commercial = min(98, 55 + (index * 11) % 43)
-            opportunity = keyword_opportunity_score(intent, commercial, 74, 90, 82, 0)
-            rows.append({"keyword": keyword, "category": category, "intent_score": intent, "commercial_score": commercial, "opportunity_score": opportunity, "enabled": True, "source": "text-ai" if self.llm and self.llm.configured else "deterministic-mock", "reason": f"含有{location}与{industry}语境，适合发现明确需求。"})
-        return rows
+            except LLMInvalidResponseError as exc:
+                last_error = exc
+                if self.llm.last_call is not None:
+                    self.llm.last_call.success = False
+                    self.llm.last_call.error = str(exc)
+        raise last_error
 
     def _normalize(self, rows: list, context: dict) -> list[dict]:
         normalized = []

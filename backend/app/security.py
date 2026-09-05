@@ -22,5 +22,8 @@ def is_authorized(request: Request) -> bool:
 
 async def auth_middleware(request: Request, call_next):
     if not is_authorized(request):
-        return JSONResponse({"detail": "需要有效的 API Bearer Token"}, status_code=401)
+        return JSONResponse(
+            {"code": "AUTH_REQUIRED", "message": "需要有效的 API Bearer Token", "detail": {}},
+            status_code=401,
+        )
     return await call_next(request)

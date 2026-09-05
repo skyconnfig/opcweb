@@ -2,6 +2,7 @@ FROM python:3.13-slim
 WORKDIR /app
 COPY pyproject.toml requirements.txt ./
 RUN pip install --no-cache-dir -e ".[test]"
+RUN playwright install --with-deps chromium
 COPY alembic.ini ./
 COPY backend/alembic ./backend/alembic
 COPY backend/app ./app

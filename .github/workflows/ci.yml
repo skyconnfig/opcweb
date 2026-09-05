@@ -44,7 +44,7 @@ jobs:
           LLM_BASE_URL=
           LLM_API_KEY=
           LLM_MODEL=deepseek-chat
-          CONTENT_PROVIDER=mock
+          CONTENT_PROVIDER=douyin-playwright
           CORS_ORIGINS=http://localhost:5173
           EOF
           docker compose config --quiet

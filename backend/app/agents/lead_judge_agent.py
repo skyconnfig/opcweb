@@ -1,11 +1,39 @@
 import json
 import re
+from typing import Literal
+
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from app.agents.llm import BaseLLMProvider
+from app.errors import LLMInvalidResponseError, LLMNotConfiguredError
 
 
 BUYING_TERMS = ["多少钱", "预算", "推荐", "靠谱", "联系", "怎么选", "准备", "需要", "能做吗", "报价", "增项", "翻新", "装修", "买", "哪里有"]
 NOISE_TERMS = ["哈哈", "666", "好看", "主播好帅", "路过", "支持", "收藏了", "讲得很好", "学到了"]
+
+
+class LeadJudgement(BaseModel):
+    """Strict text-only contract for the LeadJudge output."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    is_lead: bool
+    confidence: float = Field(ge=0, le=1)
+    lead_score: float = Field(ge=0, le=100)
+    lead_level: Literal["S", "A", "B", "C"] | None = None
+    intent: str = ""
+    intent_level: str
+    need: str
+    location: str | None = None
+    budget: str | None = None
+    time_requirement: str | None = None
+    purchase_stage: str
+    pain_point: str
+    buying_signals: list[str]
+    summary: str
+    reason: str
+    recommended_action: str
+    should_reply: bool
 
 
 class RulePreFilter:
@@ -31,38 +59,110 @@ class LeadJudgeAgent:
         self.llm = llm
 
     async def run(self, project: dict, comment: dict) -> dict:
-        if self.llm and self.llm.configured:
-            result = await self.llm.structured_output(
-                "你是潜客判断 Agent。只分析文字评论、评论上下文、来源视频文字字段和公开互动数据，不使用任何画面。严格返回 JSON，并保留 is_lead、lead_score、intent_level、need、location、budget、time_requirement、purchase_stage、pain_point、buying_signals、summary、reason、recommended_action。",
-                json.dumps({"project": self._text_context(project), "comment": comment}, ensure_ascii=False),
-                {"type": "object"},
-            )
-            if result:
+        if self.llm is None:
+            raise LLMNotConfiguredError("LeadJudgeAgent 需要已配置的文本模型")
+        prompt = "你是潜客判断 Agent。只分析文字评论、评论上下文、来源视频文字字段和公开互动数据，不使用任何画面。严格返回 JSON，并保留 is_lead、confidence、lead_score、lead_level、intent_level、need、location、budget、time_requirement、purchase_stage、pain_point、buying_signals、summary、reason、recommended_action、should_reply。"
+        payload = json.dumps({"project": self._text_context(project), "comment": comment}, ensure_ascii=False)
+        last_error = None
+        for _ in range(2):
+            try:
+                result = await self.llm.structured_output(prompt, payload, {"type": "object"})
                 return self._normalize(result, project, comment)
-        return self._fallback(project, comment)
+            except Exception as exc:
+                last_error = exc
+        raise last_error
 
     def _normalize(self, result: dict, project: dict, comment: dict) -> dict:
-        fallback = self._fallback(project, comment)
-        result = {**fallback, **result}
-        result["lead_score"] = max(0, min(100, float(result.get("lead_score", 0))))
-        result["lead_level"] = "S" if result["lead_score"] >= 90 else "A" if result["lead_score"] >= 75 else "B" if result["lead_score"] >= 60 else "C"
-        result["is_lead"] = bool(result.get("is_lead"))
-        return result
+        required = ("is_lead", "confidence", "lead_score", "intent_level", "need", "location", "budget", "time_requirement", "purchase_stage", "pain_point", "buying_signals", "summary", "reason", "recommended_action", "should_reply")
+        missing = [key for key in required if key not in result]
+        if missing:
+            raise LLMInvalidResponseError(f"LeadJudgeAgent 缺少字段: {', '.join(missing)}")
+        normalized = dict(result)
+        for key in ("is_lead", "should_reply"):
+            normalized[key] = _parse_bool(normalized[key], key)
+        normalized["intent_level"] = _normalize_intent_level(normalized.get("intent_level"))
+        for key in ("need", "purchase_stage", "pain_point", "summary", "reason", "recommended_action"):
+            normalized[key] = _text_value(normalized.get(key))
+        for key in ("location", "budget", "time_requirement"):
+            if normalized.get(key) is not None:
+                normalized[key] = _text_value(normalized[key])
+        normalized["buying_signals"] = _normalize_signals(normalized.get("buying_signals"))
+        if normalized.get("intent") is not None:
+            normalized["intent"] = _text_value(normalized["intent"])
+        # The score is the source of truth for the persisted lead level.  Text
+        # models sometimes return localized labels such as "低" or "高" even
+        # when the JSON contract asks for S/A/B/C; normalize those labels
+        # before validation so one localized enum cannot abort a scan task.
+        normalized["lead_level"] = _normalize_lead_level(normalized.get("lead_level"))
+        try:
+            validated = LeadJudgement.model_validate(normalized)
+        except (ValidationError, TypeError, ValueError) as exc:
+            raise LLMInvalidResponseError(f"LeadJudgeAgent 输出校验失败: {exc}") from exc
+        output = validated.model_dump()
+        output["lead_score"] = max(0, min(100, float(output["lead_score"])))
+        output["lead_level"] = "S" if output["lead_score"] >= 90 else "A" if output["lead_score"] >= 75 else "B" if output["lead_score"] >= 60 else "C"
+        output["intent"] = output.get("intent") or output.get("intent_level", "")
+        return output
 
     @staticmethod
     def _text_context(project: dict) -> dict:
         return {key: str(project.get(key, "")) for key in ("industry", "location", "service", "target_customer", "price_range", "description", "keyword", "video_title", "video_description", "video_creator", "video_likes", "video_comments", "video_shares", "video_collects", "history_text")}
 
-    @staticmethod
-    def _fallback(project: dict, comment: dict) -> dict:
-        content = str(comment.get("content", ""))
-        history = str(comment.get("history_text", ""))
-        combined = f"{content}\n{history}"
-        signals = [term for term in BUYING_TERMS if term in combined]
-        score = min(99, 45 + len(set(signals)) * 9 + (12 if project.get("location") and project["location"] in combined else 0) + (12 if re.search(r"\d+", combined) else 0))
-        if not signals:
-            score = 26
-        level = "S" if score >= 90 else "A" if score >= 75 else "B" if score >= 60 else "C"
-        is_lead = score >= 60
-        budget_match = re.search(r"(?:预算|(?:能|要))[^，。！？]{0,8}(\d+[万千]?)(?:元)?", combined)
-        return {"is_lead": is_lead, "confidence": round(min(.99, .65 + len(set(signals)) * .06), 2), "lead_score": score, "lead_level": level, "intent_level": "high" if score >= 75 else "medium" if score >= 60 else "low", "need": project.get("service", project.get("industry", "")), "location": project.get("location", ""), "budget": budget_match.group(1) if budget_match else "", "time_requirement": "近期" if any(word in combined for word in ("准备", "最近", "年底")) else None, "purchase_stage": "comparison" if any(word in combined for word in ("推荐", "怎么选", "对比")) else "research", "pain_point": "担心增项与踩坑" if any(word in combined for word in ("坑", "增项")) else "", "buying_signals": signals, "summary": f"{comment.get('nickname', '该用户')}正在表达真实的{project.get('industry', '服务')}需求。" if is_lead else "当前评论更像泛互动。", "reason": "出现明确询价、地域、预算或联系方式信号，且已合并用户历史评论上下文。" if is_lead else "缺少明确的购买问题或需求上下文。", "recommended_action": "priority_follow_up" if level == "S" else "follow_up" if is_lead else "observe"}
+
+def _parse_bool(value: object, field: str) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int) and value in {0, 1}:
+        return bool(value)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"true", "1", "yes", "是", "有"}:
+            return True
+        if normalized in {"false", "0", "no", "否", "无"}:
+            return False
+    raise LLMInvalidResponseError(f"LeadJudgeAgent 字段 {field} 必须是布尔值")
+
+
+def _text_value(value: object) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, ensure_ascii=False)
+    return str(value).strip()
+
+
+def _normalize_intent_level(value: object) -> str:
+    if isinstance(value, bool):
+        return "high" if value else "low"
+    if isinstance(value, (int, float)):
+        return {0: "low", 1: "medium", 2: "high"}.get(int(value), str(value))
+    return _text_value(value).lower()
+
+
+def _normalize_signals(value: object) -> list[str]:
+    if isinstance(value, str):
+        return [item.strip() for item in re.split(r"[,，、;；\n]+", value) if item.strip()]
+    if isinstance(value, (list, tuple, set)):
+        return [_text_value(item) for item in value if _text_value(item)]
+    return []
+
+
+def _normalize_lead_level(value: object) -> str | None:
+    if value is None or value == "":
+        return None
+    normalized = str(value).strip().upper()
+    aliases = {
+        "S级": "S",
+        "A级": "A",
+        "B级": "B",
+        "C级": "C",
+        "高": "S",
+        "较高": "A",
+        "中": "B",
+        "中等": "B",
+        "低": "C",
+        "HIGH": "S",
+        "MEDIUM": "B",
+        "LOW": "C",
+    }
+    return aliases.get(normalized, normalized if normalized in {"S", "A", "B", "C"} else None)

@@ -32,4 +32,6 @@ event_bus = EventBus()
 
 
 def sse_line(event: dict) -> str:
-    return f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+    event_id = event.get("id")
+    id_line = f"id: {event_id}\n" if event_id is not None else ""
+    return f"{id_line}data: {json.dumps(event, ensure_ascii=False)}\n\n"

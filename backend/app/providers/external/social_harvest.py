@@ -31,7 +31,12 @@ class SocialHarvestExternalProvider(BaseContentProvider):
             raw = [item for item in raw if not item.get("video_id") or str(item.get("video_id")) == video_id]
         offset = int(cursor or 0) if str(cursor or "0").isdigit() else 0
         page = raw[offset:offset + 100]
-        items = [CommentDTO("douyin", str(item.get("comment_id", item.get("cid", index + offset))), str(item.get("user_id", item.get("uid", ""))), str(item.get("nickname", item.get("author", ""))), str(item.get("profile_url", "")), str(item.get("content", item.get("comment", ""))), _parse_dt(item.get("create_time", item.get("created_at"))), str(item.get("parent_comment_id", item.get("reply_to", "")))) for index, item in enumerate(page)]
+        items = []
+        for item in page:
+            comment_id = str(item.get("comment_id", item.get("cid", ""))).strip()
+            if not comment_id:
+                continue
+            items.append(CommentDTO("douyin", comment_id, str(item.get("user_id", item.get("uid", ""))), str(item.get("nickname", item.get("author", ""))), str(item.get("profile_url", "")), str(item.get("content", item.get("comment", ""))), _parse_dt(item.get("create_time", item.get("created_at"))), str(item.get("parent_comment_id", item.get("reply_to", ""))), id_source="platform_field"))
         has_more = offset + len(page) < len(raw)
         return CommentScanResult(items, str(report.get("coverage_status", "partial" if raw else "unknown")), len(items), str(offset + len(page)) if has_more else None, has_more)
 

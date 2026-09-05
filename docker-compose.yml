@@ -8,15 +8,20 @@ services:
       API_AUTH_TOKEN: ${API_AUTH_TOKEN:?set API_AUTH_TOKEN in .env}
       SETTINGS_ENCRYPTION_KEY: ${SETTINGS_ENCRYPTION_KEY:?set SETTINGS_ENCRYPTION_KEY in .env}
       CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:5173}
-      LLM_BASE_URL: ${LLM_BASE_URL:-}
+      LLM_BASE_URL: ${LLM_BASE_URL:-https://api.deepseek.com}
       LLM_API_KEY: ${LLM_API_KEY:-}
       LLM_MODEL: ${LLM_MODEL:-deepseek-chat}
       LLM_TEMPERATURE: ${LLM_TEMPERATURE:-0.2}
       LLM_TIMEOUT: ${LLM_TIMEOUT:-45}
-      CONTENT_PROVIDER: ${CONTENT_PROVIDER:-mock}
+      CONTENT_PROVIDER: ${CONTENT_PROVIDER:-douyin-playwright}
       DOUYIN_COMMENTS_CRAWLER_URL: ${DOUYIN_COMMENTS_CRAWLER_URL:-http://host.docker.internal:8000}
+      DOUYIN_PROFILE_DIR: ${DOUYIN_PROFILE_DIR:-/app/data/browser/douyin}
+      DOUYIN_HEADLESS: ${DOUYIN_HEADLESS:-true}
+      DOUYIN_BROWSER_CHANNEL: ${DOUYIN_BROWSER_CHANNEL:-chromium}
       MEDIACRAWLER_PATH: ${MEDIACRAWLER_PATH:-}
       SOCIAL_HARVEST_PATH: ${SOCIAL_HARVEST_PATH:-}
+    volumes:
+      - ./data:/app/data
     ports: ["8689:8689"]
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8689/ready')"]

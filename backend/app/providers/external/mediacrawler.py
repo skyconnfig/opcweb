@@ -31,7 +31,12 @@ class MediaCrawlerExternalProvider(BaseContentProvider):
         if cursor:
             args.extend(["--cursor", cursor])
         payload = self._run_external(args)
-        items = [CommentDTO("douyin", str(item.get("comment_id", i)), str(item.get("user_id", "")), str(item.get("nickname", "")), str(item.get("profile_url", "")), str(item.get("content", item.get("comment", "")))) for i, item in enumerate(payload.get("comments", []))]
+        items = []
+        for item in payload.get("comments", []):
+            comment_id = str(item.get("comment_id", item.get("cid", ""))).strip()
+            if not comment_id:
+                continue
+            items.append(CommentDTO("douyin", comment_id, str(item.get("user_id", item.get("uid", ""))), str(item.get("nickname", "")), str(item.get("profile_url", "")), str(item.get("content", item.get("comment", ""))), id_source="platform_field"))
         return CommentScanResult(items, str(payload.get("coverage_status", "partial" if items else "unknown")), len(items), payload.get("next_cursor"), bool(payload.get("has_more", False)))
 
     def _run_external(self, args: list[str]) -> dict:

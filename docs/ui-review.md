@@ -15,7 +15,7 @@
 - 交互：导航切换写入 hash；主题切换支持 light/dark；按钮具备 hover、press、focus-visible、disabled/loading；数据请求具备 loading skeleton、empty state 和 error banner。
 - 响应式：1150px 收紧边距与网格，820px 切换移动导航和单列内容，520px 进一步压缩表单、指标与抽屉。
 - 可观测性：总览接入 `/api/dashboard` 与 `/api/events/stream`；智能截流接入创建项目、smart-mode、scan；潜客抽屉接入 PersonaAgent 建议接口。
-- 内容边界：页面明确显示 Mock Provider、评论覆盖范围未知、外部采集器由用户独立运行，以及 PersonaAgent 只生成建议、不自动发送。
+- 内容边界：页面明确显示 Douyin Playwright 真实 Provider、评论覆盖范围以 DOM 返回为准，以及 PersonaAgent 只生成建议、不自动发送。
 - 字体：标题优先使用 Iowan Old Style / Baskerville / Palatino / Georgia，正文使用 Avenir Next、Segoe UI、苹方和微软雅黑回退，避免全站无脑使用 Inter。
 
 ## Fixes
@@ -40,10 +40,9 @@
 - `.venv\\Scripts\\python.exe -m pytest -q`：5 passed
 - `npm run lint`：通过
 - `npm run build`：通过
-- `http://127.0.0.1:8688/health`：HTTP 200，Mock Demo 模式
-- `http://localhost:5173/`：HTTP 200，首页可读取真实 Demo 指标
-- `POST /api/projects/1/smart-mode`：返回 50 个关键词
-- `POST /api/projects/1/scan`：返回 queued task
+- `http://127.0.0.1:8689/health`：应返回 `provider=Douyin Playwright`，并明确反映 LLM/登录状态
+- `http://localhost:5173/`：HTTP 200，空数据库显示真实空状态
+- 项目、智能模式和扫描接口：仅在用户已配置文本模型并登录真实抖音后执行
 - `GET /api/events/stream`：SSE 返回 `connected`
 
 开发期面板曾显示一条 hydration 提示，差异来自 Chrome 扩展注入的 `crxlauncher`、Youdao 等 `<html>` 属性；应用自身浏览器 error/warn 日志为空，生产构建不受影响。

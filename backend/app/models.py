@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
 
-from sqlalchemy import DateTime, Float, ForeignKey, Index, Integer, JSON, String, Text, UniqueConstraint
+from sqlalchemy import DateTime, Float, ForeignKey, Index, Integer, JSON, String, Text, UniqueConstraint, text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db import Base
@@ -25,6 +25,9 @@ class Project(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=now_utc)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=now_utc, onupdate=now_utc)
     keywords: Mapped[list["Keyword"]] = relationship(back_populates="project", cascade="all, delete-orphan")
+    knowledge_entries: Mapped[list["KnowledgeEntry"]] = relationship(back_populates="project", cascade="all, delete-orphan")
+    comment_replies: Mapped[list["CommentReply"]] = relationship(back_populates="project", cascade="all, delete-orphan")
+    reply_policy: Mapped["ReplyPolicy | None"] = relationship(back_populates="project", uselist=False, cascade="all, delete-orphan")
 
 
 class ScanSchedule(Base):
@@ -33,7 +36,7 @@ class ScanSchedule(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     project_id: Mapped[int] = mapped_column(ForeignKey("projects.id"), index=True)
     enabled: Mapped[bool] = mapped_column(default=False)
-    interval_minutes: Mapped[int] = mapped_column(Integer, default=180)
+    interval_minutes: Mapped[int] = mapped_column(Integer, default=30)
     full: Mapped[bool] = mapped_column(default=False)
     next_run_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     last_run_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
@@ -81,6 +84,10 @@ class Video(Base):
     __table_args__ = (UniqueConstraint("project_id", "platform", "platform_video_id", name="uq_video_project_platform_id"),)
     id: Mapped[int] = mapped_column(primary_key=True)
     project_id: Mapped[int] = mapped_column(ForeignKey("projects.id"), index=True)
+    # Nullable keeps rows created before task provenance was introduced
+    # readable.  TaskArtifact preserves the complete many-task history when
+    # the same platform video is observed again later.
+    task_id: Mapped[int | None] = mapped_column(ForeignKey("scan_tasks.id"), index=True, nullable=True)
     platform: Mapped[str] = mapped_column(String(40), default="douyin")
     platform_video_id: Mapped[str] = mapped_column(String(120), index=True)
     title: Mapped[str] = mapped_column(String(300))
@@ -101,6 +108,7 @@ class Video(Base):
     level: Mapped[str] = mapped_column(String(2), default="C")
     lead_density: Mapped[float] = mapped_column(Float, default=0)
     discovered_at: Mapped[datetime] = mapped_column(DateTime, default=now_utc)
+    task: Mapped["ScanTask | None"] = relationship(foreign_keys=[task_id], back_populates="videos")
 
 
 class Comment(Base):
@@ -109,16 +117,150 @@ class Comment(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     project_id: Mapped[int] = mapped_column(ForeignKey("projects.id"), index=True)
     video_id: Mapped[int] = mapped_column(ForeignKey("videos.id"), index=True)
+    task_id: Mapped[int | None] = mapped_column(ForeignKey("scan_tasks.id"), index=True, nullable=True)
     platform: Mapped[str] = mapped_column(String(40), default="douyin")
     platform_comment_id: Mapped[str] = mapped_column(String(120), index=True)
     platform_user_id: Mapped[str] = mapped_column(String(120), default="", index=True)
+    id_source: Mapped[str] = mapped_column(String(30), default="dom_attribute")
     nickname: Mapped[str] = mapped_column(String(120), default="")
     profile_url: Mapped[str] = mapped_column(String(500), default="")
+    comment_url: Mapped[str] = mapped_column(String(500), default="")
     content: Mapped[str] = mapped_column(Text)
     content_hash: Mapped[str] = mapped_column(String(64), index=True)
     parent_comment_id: Mapped[str] = mapped_column(String(120), default="")
+    is_reply: Mapped[bool] = mapped_column(default=False)
+    like_count: Mapped[int] = mapped_column(Integer, default=0)
     created_at_platform: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     coverage_status: Mapped[str] = mapped_column(String(20), default="unknown")
+    replies: Mapped[list["CommentReply"]] = relationship(back_populates="comment", cascade="all, delete-orphan")
+    task: Mapped["ScanTask | None"] = relationship(foreign_keys=[task_id], back_populates="comments")
+
+
+class KnowledgeEntry(Base):
+    __tablename__ = "knowledge_entries"
+    __table_args__ = (Index("ix_knowledge_entries_project_enabled", "project_id", "enabled"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    project_id: Mapped[int] = mapped_column(ForeignKey("projects.id"), index=True)
+    title: Mapped[str] = mapped_column(String(200))
+    content: Mapped[str] = mapped_column(Text)
+    tags: Mapped[list[str]] = mapped_column(JSON, default=list)
+    enabled: Mapped[bool] = mapped_column(default=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now_utc)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=now_utc, onupdate=now_utc)
+
+    project: Mapped[Project] = relationship(back_populates="knowledge_entries")
+
+
+class CommentReply(Base):
+    __tablename__ = "comment_replies"
+    __table_args__ = (
+        Index("ix_comment_replies_project_status", "project_id", "status"),
+        Index("ix_comment_replies_comment_status", "comment_id", "status"),
+        # A reply may have many terminal/history rows, but only one row may
+        # hold the send lease for a comment at a time.  The partial index is
+        # supported by both SQLite and PostgreSQL and is the database-level
+        # backstop for multi-worker sends.
+        Index(
+            "uq_comment_replies_comment_sending",
+            "comment_id",
+            unique=True,
+            sqlite_where=text("status = 'SENDING'"),
+            postgresql_where=text("status = 'SENDING'"),
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    project_id: Mapped[int] = mapped_column(ForeignKey("projects.id"), index=True)
+    comment_id: Mapped[int] = mapped_column(ForeignKey("comments.id"), index=True)
+    platform: Mapped[str] = mapped_column(String(40), default="douyin")
+    reply_text: Mapped[str] = mapped_column(Text)
+    reply_source: Mapped[str] = mapped_column(String(20), default="AI")
+    status: Mapped[str] = mapped_column(String(30), default="DRAFT", index=True)
+    error_code: Mapped[str] = mapped_column(String(80), default="")
+    error_message: Mapped[str] = mapped_column(Text, default="")
+    attempt_count: Mapped[int] = mapped_column(Integer, default=0)
+    generated_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    approved_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    sent_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    verified_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # ``updated_at`` remains the backwards-compatible fallback for old
+    # SENDING rows.  New callers can use an explicit lease so recovery does
+    # not depend on unrelated edits to the reply record.
+    sending_started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    send_lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # SENT_UNVERIFIED is intentionally durable: a later DOM verification can
+    # record its evidence without creating another send row.
+    platform_reply_id: Mapped[str] = mapped_column(String(120), default="")
+    verification_attempt_count: Mapped[int] = mapped_column(Integer, default=0)
+    last_verification_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    verification_due_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    verification_error_code: Mapped[str] = mapped_column(String(80), default="")
+    verification_error_message: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now_utc)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=now_utc, onupdate=now_utc)
+
+    project: Mapped[Project] = relationship(back_populates="comment_replies")
+    comment: Mapped[Comment] = relationship(back_populates="replies")
+
+
+class ReplyPolicy(Base):
+    __tablename__ = "reply_policies"
+    __table_args__ = (UniqueConstraint("project_id", name="uq_reply_policy_project"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    project_id: Mapped[int] = mapped_column(ForeignKey("projects.id"), index=True)
+    enabled: Mapped[bool] = mapped_column(default=True)
+    auto_reply_enabled: Mapped[bool] = mapped_column(default=False)
+    minimum_confidence: Mapped[float] = mapped_column(Float, default=0.8)
+    minimum_lead_score: Mapped[float] = mapped_column(Float, default=70)
+    allowed_intents: Mapped[list[str]] = mapped_column(JSON, default=list)
+    blocked_intents: Mapped[list[str]] = mapped_column(JSON, default=list)
+    max_replies_per_hour: Mapped[int] = mapped_column(Integer, default=10)
+    max_replies_per_day: Mapped[int] = mapped_column(Integer, default=50)
+    minimum_interval_seconds: Mapped[int] = mapped_column(Integer, default=30)
+    auto_reply_own_content_only: Mapped[bool] = mapped_column(default=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now_utc)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=now_utc, onupdate=now_utc)
+
+    project: Mapped[Project] = relationship(back_populates="reply_policy")
+
+
+class DouyinAccount(Base):
+    __tablename__ = "douyin_accounts"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(120), unique=True)
+    profile_dir: Mapped[str] = mapped_column(String(500), default="")
+    status: Mapped[str] = mapped_column(String(30), default="LOGGED_OUT", index=True)
+    nickname: Mapped[str] = mapped_column(String(120), default="")
+    douyin_user_id: Mapped[str] = mapped_column(String(120), default="", index=True)
+    last_login_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    last_checked_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now_utc)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=now_utc, onupdate=now_utc)
+    browser_profiles: Mapped[list["BrowserProfile"]] = relationship(back_populates="account", cascade="all, delete-orphan")
+
+
+class BrowserProfile(Base):
+    __tablename__ = "browser_profiles"
+    __table_args__ = (
+        UniqueConstraint("account_id", "profile_dir", name="uq_browser_profile_account_dir"),
+        Index("ix_browser_profiles_account_status", "account_id", "status"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    account_id: Mapped[int] = mapped_column(ForeignKey("douyin_accounts.id"), index=True)
+    name: Mapped[str] = mapped_column(String(120))
+    profile_dir: Mapped[str] = mapped_column(String(500))
+    browser_channel: Mapped[str] = mapped_column(String(40), default="")
+    headless: Mapped[bool] = mapped_column(default=False)
+    status: Mapped[str] = mapped_column(String(30), default="INACTIVE", index=True)
+    last_used_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now_utc)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=now_utc, onupdate=now_utc)
+
+    account: Mapped[DouyinAccount] = relationship(back_populates="browser_profiles")
 
 
 class Lead(Base):
@@ -130,12 +272,14 @@ class Lead(Base):
     platform_user_id: Mapped[str] = mapped_column(String(120), default="", index=True)
     nickname: Mapped[str] = mapped_column(String(120), default="")
     profile_url: Mapped[str] = mapped_column(String(500), default="")
+    confidence: Mapped[float] = mapped_column(Float, default=0)
     lead_score: Mapped[float] = mapped_column(Float, default=0, index=True)
     lead_level: Mapped[str] = mapped_column(String(2), default="C", index=True)
     intent_level: Mapped[str] = mapped_column(String(20), default="low")
     need: Mapped[str] = mapped_column(String(300), default="")
     location: Mapped[str] = mapped_column(String(120), default="")
     budget: Mapped[str] = mapped_column(String(120), default="")
+    time_requirement: Mapped[str] = mapped_column(String(120), default="")
     purchase_stage: Mapped[str] = mapped_column(String(60), default="unknown")
     pain_point: Mapped[str] = mapped_column(Text, default="")
     buying_signals: Mapped[list] = mapped_column(JSON, default=list)
@@ -184,6 +328,10 @@ class ScanTask(Base):
     started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=now_utc)
+    videos: Mapped[list["Video"]] = relationship(foreign_keys="Video.task_id", back_populates="task")
+    comments: Mapped[list["Comment"]] = relationship(foreign_keys="Comment.task_id", back_populates="task")
+    agent_runs: Mapped[list["AgentRun"]] = relationship(back_populates="task")
+    artifacts: Mapped[list["TaskArtifact"]] = relationship(back_populates="task", cascade="all, delete-orphan")
 
 
 class TaskStep(Base):
@@ -227,12 +375,37 @@ class TaskReport(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=now_utc)
 
 
+class TaskArtifact(Base):
+    """Durable per-task provenance for mutable project records.
+
+    ``Video.task_id`` and ``Comment.task_id`` identify the latest scan that
+    touched a row.  This table intentionally keeps every scan association so
+    a repeated scheduled scan does not erase the historical source trail.
+    """
+
+    __tablename__ = "task_artifacts"
+    __table_args__ = (
+        UniqueConstraint("task_id", "entity_type", "entity_id", name="uq_task_artifact_entity"),
+        Index("ix_task_artifacts_task_entity", "task_id", "entity_type"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    task_id: Mapped[int] = mapped_column(ForeignKey("scan_tasks.id"), index=True)
+    entity_type: Mapped[str] = mapped_column(String(30))
+    entity_id: Mapped[int] = mapped_column(Integer)
+    change_type: Mapped[str] = mapped_column(String(20))
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now_utc)
+
+    task: Mapped[ScanTask] = relationship(back_populates="artifacts")
+
+
 class AgentRun(Base):
     __tablename__ = "agent_runs"
     id: Mapped[int] = mapped_column(primary_key=True)
     project_id: Mapped[int] = mapped_column(ForeignKey("projects.id"), index=True)
+    task_id: Mapped[int | None] = mapped_column(ForeignKey("scan_tasks.id"), index=True, nullable=True)
     agent: Mapped[str] = mapped_column(String(80))
-    model: Mapped[str] = mapped_column(String(120), default="deterministic-mock")
+    model: Mapped[str] = mapped_column(String(120), default="")
     prompt_version: Mapped[str] = mapped_column(String(40))
     input_hash: Mapped[str] = mapped_column(String(64), index=True)
     input_text: Mapped[str] = mapped_column(Text, default="")
@@ -242,6 +415,7 @@ class AgentRun(Base):
     success: Mapped[bool] = mapped_column(default=True)
     error: Mapped[str] = mapped_column(Text, default="")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=now_utc)
+    task: Mapped["ScanTask | None"] = relationship(back_populates="agent_runs")
 
 
 class ProviderRecord(Base):

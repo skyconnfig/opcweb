@@ -36,6 +36,11 @@ class CommentDTO:
     content: str
     created_at: datetime | None = None
     parent_comment_id: str = ""
+    is_reply: bool = False
+    like_count: int = 0
+    # Provenance is important for real-platform writes: a comment without a
+    # platform-issued ID must not be turned into a synthetic identity.
+    id_source: str = "unknown"
 
 
 @dataclass
