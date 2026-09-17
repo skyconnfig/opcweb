@@ -153,6 +153,8 @@ def run(base_url: str) -> dict[str, object]:
         else:
             interaction_checks["task_detail"] = "skipped_empty"
 
+        interaction_checks["follow_up_center"] = page.get_by_text("FOLLOW-UP CENTER", exact=True).count() == 1
+
         page.goto(f"{base_url}#settings", wait_until="networkidle", timeout=30_000)
         page.wait_for_timeout(700)
         interaction_checks["text_model_settings"] = page.get_by_text("文本模型配置", exact=True).count() == 1

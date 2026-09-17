@@ -384,6 +384,8 @@ function defaultFollowDeadline() { const date = new Date(); date.setDate(date.ge
 function normalizeLeadAdvice(value: unknown): RecordShape | undefined { if (!value || typeof value !== 'object') return undefined; const advice = value as RecordShape; return advice.reply || advice.recommended_reply || advice.next_action || advice.follow_up_question ? advice : undefined }
 function taskStatusLabel(status?: string) { return ({ completed: '已完成', queued: '排队中', running: '运行中', paused: '已暂停', failed: '失败' } as Record<string, string>)[status || ''] || status || '未知' }
 function taskStatusTone(status?: string) { return status === 'completed' ? 'green' : status === 'failed' ? 'red' : 'amber' }
+function followTaskStatusLabel(status?: string) { return ({ PENDING: '待处理', OVERDUE: '已逾期', DONE: '已完成', CANCELLED: '已取消' } as Record<string, string>)[status || ''] || status || '未知' }
+function followTaskStatusTone(status?: string) { return status === 'DONE' ? 'green' : status === 'OVERDUE' ? 'red' : status === 'CANCELLED' ? 'neutral' : 'amber' }
 function downloadJson(filename: string, value: unknown) { const blob = new Blob([JSON.stringify(value, null, 2)], { type: 'application/json;charset=utf-8' }); const url = URL.createObjectURL(blob); const link = document.createElement('a'); link.href = url; link.download = filename; link.click(); URL.revokeObjectURL(url) }
 
 function BrainIcon() { return <span className="brain-icon"><Bot size={22} /></span> }
@@ -679,6 +681,12 @@ function TasksView({ project, providerContext }: RecordShape) {
   const [loading, setLoading] = useState(true)
   const [taskNotice, setTaskNotice] = useState('')
   const [eventStatus, setEventStatus] = useState('SSE 连接中…')
+  const [followTasks, setFollowTasks] = useState<RecordShape[]>([])
+  const [reminders, setReminders] = useState<RecordShape[]>([])
+  const [followTasksLoading, setFollowTasksLoading] = useState(true)
+  const [followTasksError, setFollowTasksError] = useState('')
+  const [followTaskFilter, setFollowTaskFilter] = useState('all')
+  const [followTaskBusy, setFollowTaskBusy] = useState<number | null>(null)
   const scheduleDirtyRef = useRef(false)
   const scheduleRevisionRef = useRef(0)
   const collectionRequirements = [{ key: 'keyword_search', label: '真实视频搜索' }, { key: 'comments', label: '公开评论采集' }]
@@ -688,12 +696,20 @@ function TasksView({ project, providerContext }: RecordShape) {
     if (showLoading) setLoading(true)
     const scheduleRevision = scheduleRevisionRef.current
     try {
-      const [taskRows, scheduleRow] = await Promise.all([request(`/api/tasks?project_id=${project.id}`), request(`/api/projects/${project.id}/schedule`)])
+      const [taskRows, scheduleRow, followTaskRows, reminderRows] = await Promise.all([
+        request(`/api/tasks?project_id=${project.id}`),
+        request(`/api/projects/${project.id}/schedule`),
+        request(`/api/follow-tasks?project_id=${project.id}`),
+        request(`/api/follow-task-reminders?project_id=${project.id}&unread_only=true&limit=100`),
+      ])
       setTasks(taskRows)
+      setFollowTasks(Array.isArray(followTaskRows) ? followTaskRows : [])
+      setReminders(Array.isArray(reminderRows) ? reminderRows : [])
+      setFollowTasksError('')
       if (!scheduleDirtyRef.current && scheduleRevision === scheduleRevisionRef.current) setSchedule(normalizeSchedule(scheduleRow))
       setScheduleLoaded(true)
       setError('')
-    } catch (err) { setError(errorText(err)) } finally { if (showLoading) setLoading(false) }
+    } catch (err) { setError(errorText(err)); setFollowTasksError(errorText(err)) } finally { if (showLoading) { setLoading(false); setFollowTasksLoading(false) } }
   }
   useEffect(() => {
     scheduleDirtyRef.current = false
@@ -703,6 +719,11 @@ function TasksView({ project, providerContext }: RecordShape) {
     setSchedule({ enabled: false, interval_minutes: 30, full: false })
     setScheduleStatus('')
     setScheduleStatusError(false)
+    setFollowTasks([])
+    setReminders([])
+    setFollowTasksError('')
+    setFollowTaskFilter('all')
+    setFollowTasksLoading(true)
     let stopped = false
     const poll = async (showLoading = false) => { if (stopped) return; await refresh(showLoading) }
     void poll(true)
@@ -758,9 +779,41 @@ function TasksView({ project, providerContext }: RecordShape) {
       setSchedule(normalized); scheduleDirtyRef.current = false; setScheduleDirty(false); setScheduleStatusError(false); setScheduleStatus(normalized.enabled ? '自动采集计划已启用' : '自动采集计划已关闭')
     } catch (err) { setScheduleStatusError(true); setScheduleStatus(errorText(err)) } finally { setScheduleBusy(false) }
   }
+  const followTaskAction = async (task: RecordShape, status: 'DONE' | 'CANCELLED') => {
+    setFollowTaskBusy(task.id)
+    setFollowTasksError('')
+    try {
+      const updated = await request(`/api/follow-tasks/${task.id}`, { method: 'PATCH', body: JSON.stringify({ status }) })
+      setFollowTasks((current) => current.map((item) => item.id === task.id ? updated : item))
+    } catch (err) {
+      setFollowTasksError(errorText(err))
+    } finally {
+      setFollowTaskBusy(null)
+    }
+  }
+  const markReminderRead = async (reminder: RecordShape) => {
+    setFollowTaskBusy(reminder.id)
+    setFollowTasksError('')
+    try {
+      await request(`/api/follow-task-reminders/${reminder.id}/read`, { method: 'PATCH' })
+      setReminders((current) => current.filter((item) => item.id !== reminder.id))
+    } catch (err) {
+      setFollowTasksError(errorText(err))
+    } finally {
+      setFollowTaskBusy(null)
+    }
+  }
   const scheduleControlsDisabled = !scheduleLoaded || scheduleBusy
   const scheduleStateLabel = scheduleDirty ? '有未保存变更' : schedule.enabled ? '已启用' : '已关闭'
   const scheduleStateTone = scheduleDirty ? 'amber' : schedule.enabled ? 'green' : 'neutral'
+  const pendingFollowTasks = followTasks.filter((task) => task.status === 'PENDING')
+  const overdueFollowTasks = followTasks.filter((task) => task.status === 'OVERDUE')
+  const todayFollowTasks = followTasks.filter((task) => ['PENDING', 'OVERDUE'].includes(task.status) && isToday(task.deadline))
+  const completedFollowTasks = followTasks.filter((task) => task.status === 'DONE')
+  const filteredFollowTasks = [...followTasks].filter((task) => followTaskFilter === 'all' || (followTaskFilter === 'pending' && task.status === 'PENDING') || (followTaskFilter === 'today' && ['PENDING', 'OVERDUE'].includes(task.status) && isToday(task.deadline)) || (followTaskFilter === 'overdue' && task.status === 'OVERDUE') || (followTaskFilter === 'done' && task.status === 'DONE')).sort((a, b) => {
+    const priority: Record<string, number> = { OVERDUE: 0, PENDING: 1, DONE: 2, CANCELLED: 3 }
+    return (priority[a.status] ?? 4) - (priority[b.status] ?? 4) || String(a.deadline || '').localeCompare(String(b.deadline || '')) || Number(a.id) - Number(b.id)
+  })
   return (
     <div className="page">
       <PageHeader eyebrow="ORCHESTRATION" title="任务中心" description="每次扫描都能暂停、恢复、重试，并从 checkpoint 继续。" actions={<Button variant="accent" icon={Plus} onClick={() => void start()} disabled={busy || !canCollect}>{busy ? '提交中…' : '新建扫描'}</Button>} />
@@ -793,6 +846,13 @@ function TasksView({ project, providerContext }: RecordShape) {
           <div className="checkpoint-note"><Check size={14} />任务状态已持久化</div>
         </section>
       </div>
+      <section className="panel follow-center" aria-label="跟进任务中心">
+        <div className="data-toolbar follow-center-heading"><div><SectionLabel>FOLLOW-UP CENTER</SectionLabel><h2>跟进任务与提醒</h2></div><StatusPill tone={reminders.length ? 'red' : 'neutral'}>{reminders.length ? `${reminders.length} 条未读提醒` : '暂无未读提醒'}</StatusPill></div>
+        {reminders.length > 0 && <div className="reminder-list" role="status" aria-live="polite">{reminders.slice(0, 5).map((reminder: RecordShape) => <div className="reminder-row" key={reminder.id}><span className="reminder-mark"><Clock3 size={14} /></span><div><b>{reminder.title || '跟进任务提醒'}</b><p>{reminder.message}</p><small>{formatDateTime(reminder.created_at)}</small></div><Button onClick={() => void markReminderRead(reminder)} disabled={followTaskBusy !== null}>{followTaskBusy === reminder.id ? '处理中…' : '标记已读'}</Button></div>)}</div>}
+        {followTasksError && <div className="error-inline" role="alert"><X size={14} /><span>{followTasksError}</span><Button onClick={() => void refresh(false)} disabled={followTasksLoading}>重试</Button></div>}
+        <div className="follow-center-stats" aria-label="跟进任务统计"><button className={followTaskFilter === 'pending' ? 'active' : ''} onClick={() => setFollowTaskFilter('pending')}><span>待处理</span><b>{pendingFollowTasks.length}</b></button><button className={followTaskFilter === 'today' ? 'active' : ''} onClick={() => setFollowTaskFilter('today')}><span>今日到期</span><b>{todayFollowTasks.length}</b></button><button className={followTaskFilter === 'overdue' ? 'active danger' : 'danger'} onClick={() => setFollowTaskFilter('overdue')}><span>已逾期</span><b>{overdueFollowTasks.length}</b></button><button className={followTaskFilter === 'done' ? 'active' : ''} onClick={() => setFollowTaskFilter('done')}><span>已完成</span><b>{completedFollowTasks.length}</b></button><button className={followTaskFilter === 'all' ? 'active' : ''} onClick={() => setFollowTaskFilter('all')}><span>全部任务</span><b>{followTasks.length}</b></button></div>
+        {followTasksLoading ? <div className="follow-center-empty"><LoaderCircle size={18} className="loading-spin" /><span>正在读取跟进任务…</span></div> : filteredFollowTasks.length ? <div className="follow-center-list">{filteredFollowTasks.map((task: RecordShape) => <div className={`follow-center-row ${String(task.status || '').toLowerCase()}`} key={task.id}><div className="follow-center-copy"><span className="follow-center-icon">{task.status === 'DONE' ? <Check size={14} /> : task.status === 'OVERDUE' ? <Clock3 size={14} /> : <ListChecks size={14} />}</span><div><b>{task.content}</b><small>潜客 #{task.lead_id} · 截止 {formatDateTime(task.deadline)} · {followTaskStatusLabel(task.status)}</small></div></div><div className="follow-center-actions"><StatusPill tone={followTaskStatusTone(task.status)}>{followTaskStatusLabel(task.status)}</StatusPill>{['PENDING', 'OVERDUE'].includes(task.status) && <><Button onClick={() => void followTaskAction(task, 'DONE')} disabled={followTaskBusy !== null}>{followTaskBusy === task.id ? '处理中…' : '完成'}</Button><Button onClick={() => void followTaskAction(task, 'CANCELLED')} disabled={followTaskBusy !== null}>取消</Button></>}</div></div>)}</div> : <div className="follow-center-empty"><ListChecks size={18} /><span>{followTaskFilter === 'all' ? '当前项目暂无跟进任务。' : '当前筛选暂无任务。'}</span></div>}
+      </section>
       {selectedTaskId && <section className="panel data-panel task-detail">
         <div className="data-toolbar"><div><SectionLabel>TASK DETAIL</SectionLabel><h2>执行详情 #{selectedTaskId}</h2></div><Button onClick={() => setSelectedTaskId(null)}>收起</Button></div>
         {detailError && <div className="error-inline"><span>{detailError}</span><Button onClick={() => { setDetailError(''); setTaskDetail(undefined); void request(`/api/tasks/${selectedTaskId}`).then(setTaskDetail).catch((err) => setDetailError(errorText(err))) }}>重试</Button></div>}
