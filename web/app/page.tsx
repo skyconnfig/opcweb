@@ -36,7 +36,8 @@ async function request(path: string, options?: RequestInit) {
   const abortFromCaller = () => controller.abort()
   if (callerSignal?.aborted) controller.abort()
   else callerSignal?.addEventListener('abort', abortFromCaller, { once: true })
-  const timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS)
+  let timedOut = false
+  const timeoutId = setTimeout(() => { timedOut = true; controller.abort() }, REQUEST_TIMEOUT_MS)
   try {
     const response = await fetch(`${API}${path}`, { ...options, headers, signal: controller.signal })
     if (!response.ok) {
@@ -53,7 +54,7 @@ async function request(path: string, options?: RequestInit) {
     }
     return response.json()
   } catch (error) {
-    if (error instanceof DOMException && error.name === 'AbortError') {
+    if (timedOut && error instanceof DOMException && error.name === 'AbortError') {
       throw new Error(`本地 API 请求超时（${REQUEST_TIMEOUT_MS / 1000} 秒），请确认后端已启动。`)
     }
     throw error
