@@ -34,6 +34,7 @@ class DouyinBrowserManager:
         headless: bool = False,
         proxy_server: str | None = None,
         debug_dir: str | Path | None = None,
+        profile_lock_timeout: float = 15.0,
         playwright_factory: Callable[[], Any] | None = None,
     ) -> None:
         configured_profile = profile_dir or os.getenv("DOUYIN_PROFILE_DIR") or os.getenv("DOUYIN_BROWSER_PROFILE_DIR")
@@ -55,11 +56,18 @@ class DouyinBrowserManager:
             or ""
         ).strip()
         self.debug_dir = Path(debug_dir or os.getenv("DOUYIN_DEBUG_DIR") or "data/debug").resolve()
+        configured_lock_timeout = os.getenv("DOUYIN_PROFILE_LOCK_TIMEOUT_SECONDS")
+        try:
+            self.profile_lock_timeout = max(0.1, float(configured_lock_timeout or profile_lock_timeout))
+        except (TypeError, ValueError):
+            self.profile_lock_timeout = profile_lock_timeout
+        self.profile_lock_path = self.profile_dir.parent / f".{self.profile_dir.name}.profile.lock"
         self._playwright_factory = playwright_factory
         self._account_key = str(self.profile_dir).casefold()
         self._lock = self._account_locks.setdefault(self._account_key, asyncio.Lock())
         self._playwright: Any = None
         self._context: Any = None
+        self._profile_lock_handle: Any = None
 
     @property
     def lock(self) -> asyncio.Lock:
@@ -133,6 +141,7 @@ class DouyinBrowserManager:
             ) from exc
 
         self.profile_dir.mkdir(parents=True, exist_ok=True)
+        await self._acquire_profile_lock()
         manager = None
         try:
             manager = (self._playwright_factory or async_playwright)()
@@ -274,6 +283,39 @@ class DouyinBrowserManager:
                 await playwright.stop()
             except Exception:
                 pass
+        await self._release_profile_lock()
+
+    async def _acquire_profile_lock(self) -> None:
+        """Hold an OS-level lock for the whole persistent profile lifetime.
+
+        The in-process asyncio lock prevents duplicate work in one API worker,
+        but Chromium profiles must also be exclusive across separate worker
+        processes.  The lock file contains no credentials and is released by
+        the operating system if the worker exits unexpectedly.
+        """
+
+        if self._profile_lock_handle is not None:
+            return
+        try:
+            self._profile_lock_handle = await asyncio.to_thread(
+                _open_profile_lock,
+                self.profile_lock_path,
+                self.profile_lock_timeout,
+            )
+        except TimeoutError as exc:
+            raise DouyinBrowserError(
+                "抖音浏览器 Profile 正被其他进程使用，请关闭重复的 API/浏览器实例后重试",
+                detail={
+                    "profile_dir": str(self.profile_dir),
+                    "lock_path": str(self.profile_lock_path),
+                    "error_type": "PROFILE_LOCKED",
+                },
+            ) from exc
+
+    async def _release_profile_lock(self) -> None:
+        handle, self._profile_lock_handle = self._profile_lock_handle, None
+        if handle is not None:
+            await asyncio.to_thread(_close_profile_lock, handle)
     async def capture_debug(
         self,
         page: Any,
@@ -307,6 +349,54 @@ class DouyinBrowserManager:
             return target
         except Exception:
             return None
+
+
+def _open_profile_lock(path: Path, timeout: float):
+    """Open and exclusively lock ``path`` without blocking the event loop."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle = path.open("a+b")
+    if path.stat().st_size == 0:
+        handle.write(b"0")
+        handle.flush()
+    deadline = time.monotonic() + timeout
+    try:
+        while True:
+            handle.seek(0)
+            try:
+                if os.name == "nt":
+                    import msvcrt
+
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                else:  # pragma: no cover - production target is Windows
+                    import fcntl
+
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return handle
+            except (BlockingIOError, OSError):
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(path)
+                time.sleep(0.1)
+    except Exception:
+        handle.close()
+        raise
+
+
+def _close_profile_lock(handle: Any) -> None:
+    try:
+        handle.seek(0)
+        if os.name == "nt":
+            import msvcrt
+
+            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        else:  # pragma: no cover - production target is Windows
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    except (OSError, ValueError):
+        pass
+    finally:
+        handle.close()
 
 
 def _playwright_channel(channel: str) -> str | None:

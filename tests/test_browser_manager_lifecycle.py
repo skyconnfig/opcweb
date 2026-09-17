@@ -3,6 +3,7 @@
 import pytest
 
 from app.providers.douyin.browser_manager import DouyinBrowserManager
+from app.providers.douyin.exceptions import DouyinBrowserError
 
 
 @pytest.mark.asyncio
@@ -63,3 +64,18 @@ async def test_browser_manager_reopens_a_stale_context_before_reusing_profile(tm
     assert old_transport.stopped is True
     assert manager._context is fresh
     assert fresh.events and fresh.events[0][0] == "close"
+
+
+@pytest.mark.asyncio
+async def test_browser_manager_profile_lock_is_exclusive_and_released(tmp_path):
+    first = DouyinBrowserManager(profile_dir=tmp_path / "profile", profile_lock_timeout=0.2)
+    second = DouyinBrowserManager(profile_dir=tmp_path / "profile", profile_lock_timeout=0.2)
+
+    await first._acquire_profile_lock()
+    with pytest.raises(DouyinBrowserError, match="Profile"):
+        await second._acquire_profile_lock()
+
+    await first._release_profile_lock()
+    await second._acquire_profile_lock()
+    assert first.profile_lock_path == second.profile_lock_path
+    await second._release_profile_lock()
