@@ -39,7 +39,7 @@ RulePreFilter：过滤“哈哈哈”、表情、无意义支持等低价值评�
         ↓
 LeadJudgeAgent：合并一级评论、二级回复和历史评论，判断潜客
         ↓
-潜客池 → 人工跟进 → AI 回复草稿 → 人工确认发送
+潜客池 → LeadAssistantAgent 生成跟进建议 → 人工编辑确认 → AI 回复草稿/真实发送
 ```
 
 ### 1. 项目与行业工作区
@@ -91,8 +91,10 @@ KeywordAgent 根据行业、地区、业务、客户画像、痛点和客户语�
 
 - 潜客按 S/A/B/C 分级，保留评分、意向、需求、预算、地区、时间和购买阶段。
 - 支持人设配置、知识库文本和回复策略，为潜客生成可编辑的回复草稿。
+- LeadAssistantAgent 接收行业上下文、潜客字段、评论历史、知识库和人设，仅输出 `reply`、`reason`、`risk`、`next_action` 四个文本字段。
+- 潜客详情支持保存人工跟进备注，并创建、完成或取消带截止时间的跟进任务。
 - 默认人工审核；点击确认后才会通过真实 Playwright 链路发送，并重新读取 DOM 验证结果。
-- 自动回复必须由用户主动开启，并同时满足意图、置信度、潜客分数、知识库、敏感风险和限速规则。
+- 回复策略开关只负责生成候选草稿；任何真实抖音回复都必须人工审核、编辑并显式确认，系统不会在扫描任务中自动发送。
 - 回复发送具备幂等保护、失败恢复、审核状态和事件记录，避免重复发送。
 
 ### 7. 数据分析与运行审计
@@ -181,7 +183,7 @@ docker compose up --build
 .venv\Scripts\python.exe -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
 ```
 
-生产编排使用 /ready 作为就绪探针。数据库迁移由 Alembic 管理，当前迁移 head 为 f4e5d6c7b8a9。
+生产编排使用 /ready 作为就绪探针。数据库迁移由 Alembic 管理，当前迁移 head 为 b8c9d0e1f2a3，包含浏览器会话与潜客跟进任务表。
 
 ## 项目结构
 
@@ -193,6 +195,7 @@ backend/app/tasks        采集任务、队列、调度器、checkpoint
 backend/alembic          数据库迁移
 web                      Next.js + React + TypeScript 前端
 tests                    Provider、规则预筛、评分、调度、SSE 和迁移测试
+scripts/frontend_smoke_test.py 真实浏览器前端桌面/移动端冒烟（只读）
 docs                     架构、商业化验收和第三方依赖说明
 ```
 
@@ -203,11 +206,15 @@ docs                     架构、商业化验收和第三方依赖说明
 cd web
 npm run lint
 npm run build
+cd ..
+.venv\Scripts\python.exe scripts\frontend_smoke_test.py --report data\acceptance\frontend-smoke-YYYYMMDD.json
 ```
 
-本地开发阶段已覆盖后端全量测试、前端类型检查和 Next.js 生产构建。真实抖音 E2E 仍依赖用户自己的登录态、平台页面状态和合规使用环境，验收记录见 [docs/real-acceptance-matrix.md](docs/real-acceptance-matrix.md)。
+`frontend_smoke_test.py` 使用本地真实浏览器检查 Next 静态资源、15 个导航页面、15 个 hash 深链接、评论/潜客/视频/任务详情面板、文本模型设置、移动端菜单和横向溢出；它不会创建项目、启动扫描、分析评论或发送回复。空工作区的详情检查会明确标记为跳过，不会注入 fixture。执行 `npm run build` 后，应先运行 `start.ps1`，再执行该冒烟脚本，避免复用旧 `.next` 开发进程。
 
-2026-09-17 最新复核：后端 `135 passed`，前端 lint/build 通过；当前真实抖音搜索仍被平台安全验证拦截，外部 `douyin-comments-crawler` 未启动，不能据此宣称真实商业化 E2E 已通过。
+本地开发阶段已覆盖后端全量测试、前端类型检查、Next.js 生产构建和只读浏览器冒烟。真实抖音 E2E 仍依赖用户自己的登录态、平台页面状态和合规使用环境，验收记录见 [docs/real-acceptance-matrix.md](docs/real-acceptance-matrix.md)。
+
+2026-09-17 最新复核：后端 `145 passed`，前端 lint/build 和交互冒烟通过；当前真实抖音搜索仍被平台安全验证拦截，外部 `douyin-comments-crawler` 未启动，不能据此宣称真实商业化 E2E 已通过。
 
 ## 数据与合规边界
 

@@ -16,7 +16,11 @@ services:
       CONTENT_PROVIDER: ${CONTENT_PROVIDER:-douyin-playwright}
       DOUYIN_COMMENTS_CRAWLER_URL: ${DOUYIN_COMMENTS_CRAWLER_URL:-http://host.docker.internal:8000}
       DOUYIN_PROFILE_DIR: ${DOUYIN_PROFILE_DIR:-/app/data/browser/douyin}
-      DOUYIN_HEADLESS: ${DOUYIN_HEADLESS:-true}
+      # Keep the first-run browser visible so an operator can complete login
+      # and any platform verification in the real Chromium session. Set
+      # DOUYIN_HEADLESS=true explicitly only for an already-authenticated
+      # server environment with an established operational login flow.
+      DOUYIN_HEADLESS: ${DOUYIN_HEADLESS:-false}
       DOUYIN_BROWSER_CHANNEL: ${DOUYIN_BROWSER_CHANNEL:-chromium}
       MEDIACRAWLER_PATH: ${MEDIACRAWLER_PATH:-}
       SOCIAL_HARVEST_PATH: ${SOCIAL_HARVEST_PATH:-}

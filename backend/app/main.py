@@ -9,19 +9,20 @@ from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from sqlalchemy import desc, func, or_, select, text, update
 from sqlalchemy.orm import Session, aliased
 
 from app.agents.llm import OpenAICompatibleProvider, input_hash, is_text_only_model, settings_with_db
 from app.errors import LLMError
+from app.agents.lead_assistant_agent import LeadAssistantAgent
 from app.agents.persona_agent import PersonaAgent
 from app.agents.lead_judge_agent import LeadJudgeAgent, RulePreFilter
 from app.agents.reply_agent import ReplyAgent
 from app.agents.radar_agent import RadarAgent
 from app.core.config import get_settings
 from app.db import SessionLocal, get_db
-from app.models import AgentRun, BrowserProfile, Comment, CommentReply, DouyinAccount, Keyword, KnowledgeEntry, Lead, LeadComment, LeadEvent, LeadSource, Persona, Project, ProviderRecord, ReplyPolicy, ScanSchedule, ScanTask, Setting, TaskCheckpoint, TaskEvent, TaskReport, TaskStep, Video, now_utc
+from app.models import AgentRun, BrowserProfile, BrowserSession, Comment, CommentReply, DouyinAccount, FollowTask, Keyword, KnowledgeEntry, Lead, LeadComment, LeadEvent, LeadSource, NotificationEvent, Persona, Project, ProviderRecord, ReplyPolicy, ScanSchedule, ScanTask, Setting, TaskCheckpoint, TaskEvent, TaskReport, TaskStep, Video, now_utc
 from app.providers.douyin.dto import DouyinCommentDTO, LoginStatus, ReplyStatus
 from app.providers.douyin.exceptions import DouyinError
 from app.providers.douyin.playwright_provider import DouyinPlaywrightProvider
@@ -34,7 +35,7 @@ from app.services.event_bus import event_bus, sse_line
 from app.services.radar_service import RadarService, _aggregate_coverage_status, _upsert_lead
 from app.services.reply_policy import DEFAULT_SENDING_LEASE_SECONDS, enforce_send_policy, record_reply_verification, recover_stale_sending
 from app.tasks.queue import claim_next_task
-from app.tasks.scheduler import create_scheduler, enqueue_due_schedules
+from app.tasks.scheduler import create_scheduler, enqueue_due_schedules, process_due_follow_task_reminders
 
 
 class ProjectCreate(BaseModel):
@@ -72,7 +73,64 @@ class ScheduleOut(BaseModel):
 
 
 class LeadStatusUpdate(BaseModel):
-    status: Literal["NEW", "FOLLOW_UP", "CONTACTED", "QUALIFIED", "WON", "LOST", "IGNORED"]
+    status: Literal["NEW", "FOLLOW_UP", "CONTACTED", "QUALIFIED", "WON", "LOST", "IGNORED"] | None = None
+    follow_note: str | None = Field(default=None, max_length=5000)
+
+    @model_validator(mode="after")
+    def require_update(self):
+        if self.status is None and self.follow_note is None:
+            raise ValueError("至少提供 status 或 follow_note")
+        return self
+
+
+class FollowTaskCreate(BaseModel):
+    content: str = Field(min_length=1, max_length=2000)
+    deadline: datetime
+
+    @field_validator("content")
+    @classmethod
+    def content_must_not_be_blank(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("跟进内容不能为空")
+        return value
+
+
+FollowTaskStatus = Literal["PENDING", "OVERDUE", "DONE", "CANCELLED"]
+
+
+class FollowTaskOut(BaseModel):
+    id: int
+    lead_id: int
+    project_id: int
+    content: str
+    deadline: datetime
+    status: FollowTaskStatus
+    completed_at: datetime | None
+    overdue_at: datetime | None
+    reminded_at: datetime | None
+    reminder_count: int
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class FollowTaskUpdate(BaseModel):
+    status: Literal["PENDING", "DONE", "CANCELLED"]
+
+
+class NotificationEventOut(BaseModel):
+    id: int
+    project_id: int
+    lead_id: int
+    follow_task_id: int
+    event_type: str
+    title: str
+    message: str
+    payload: dict
+    read_at: datetime | None
+    created_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
 
 
 class PersonaIn(BaseModel):
@@ -193,13 +251,32 @@ def _require_playwright_provider(provider: BaseContentProvider) -> DouyinPlaywri
     return provider
 
 
+def _require_provider_capability(provider: BaseContentProvider, capability: str, action: str) -> BaseContentProvider:
+    """Enforce the provider contract at the API boundary before side effects."""
+
+    capabilities = getattr(provider, "capabilities", None)
+    # Small internal test doubles and legacy adapters may not publish a
+    # capability map.  Only an explicit provider declaration can reject an
+    # operation; production providers all publish their capabilities.
+    if capabilities is not None and capabilities.get(capability) is not True:
+        raise HTTPException(
+            400,
+            {
+                "code": "PROVIDER_CAPABILITY_UNSUPPORTED",
+                "message": f"当前 Provider 不支持{action}",
+                "detail": {"provider": provider.name, "capability": capability},
+            },
+        )
+    return provider
+
+
 def active_llm(db: Session) -> OpenAICompatibleProvider:
     settings = get_settings()
     values = {item.key: read_setting(item.key, item.value, settings) for item in db.scalars(select(Setting)).all()}
     return OpenAICompatibleProvider(settings_with_db(settings, values))
 
 
-def _sync_douyin_account(db: Session, provider: DouyinPlaywrightProvider, status: LoginStatus | None, identity: dict[str, str] | None = None):
+def _sync_douyin_account(db: Session, provider: DouyinPlaywrightProvider, status: LoginStatus | None, identity: dict[str, str] | None = None, project_id: int | None = None, error: str = ""):
     """Persist browser/profile state without storing cookies or credentials."""
     account = db.scalar(select(DouyinAccount).where(DouyinAccount.name == "默认抖音账号"))
     if account is None:
@@ -238,9 +315,42 @@ def _sync_douyin_account(db: Session, provider: DouyinPlaywrightProvider, status
     profile.status = "ACTIVE" if provider.browser.is_running else "INACTIVE"
     if provider.browser.is_running:
         profile.last_used_at = now_utc()
+    session = db.scalar(
+        select(BrowserSession).where(
+            BrowserSession.project_id == project_id,
+            BrowserSession.profile_path == str(provider.browser.profile_dir),
+        )
+    )
+    if session is None:
+        session = BrowserSession(project_id=project_id, profile_path=str(provider.browser.profile_dir))
+        db.add(session)
+    session.status = _browser_session_status(provider, status, error)
+    session.last_check_time = now_utc()
+    session.last_error = error[:2000]
     db.commit()
     db.refresh(account)
     return account
+
+
+def _browser_session_status(provider: DouyinPlaywrightProvider, status: LoginStatus | None, error: str = "") -> str:
+    if error:
+        return "FAILED"
+    if not provider.browser.is_running:
+        return "LOGIN_REQUIRED"
+    if status is LoginStatus.LOGGED_IN:
+        return "READY"
+    if status is None:
+        return "RUNNING"
+    return "LOGIN_REQUIRED"
+
+
+def _get_browser_session(db: Session, provider: DouyinPlaywrightProvider, project_id: int | None = None) -> BrowserSession | None:
+    return db.scalar(
+        select(BrowserSession).where(
+            BrowserSession.project_id == project_id,
+            BrowserSession.profile_path == str(provider.browser.profile_dir),
+        )
+    )
 
 
 async def _task_worker(stop: asyncio.Event):
@@ -334,6 +444,15 @@ async def lifespan(app: FastAPI):
         coalesce=True,
         misfire_grace_time=30,
     )
+    scheduler.add_job(
+        process_due_follow_task_reminders,
+        "interval",
+        seconds=30,
+        id="follow-task-reminders",
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=30,
+    )
     scheduler.start()
     worker_stop = asyncio.Event()
     worker = asyncio.create_task(_task_worker(worker_stop))
@@ -359,7 +478,11 @@ async def llm_error_handler(request: Request, exc: LLMError):
 
 @app.exception_handler(DouyinError)
 async def douyin_error_handler(request: Request, exc: DouyinError):
-    return JSONResponse(status_code=409 if exc.code in {"DOUYIN_LOGIN_REQUIRED", "DOUYIN_VERIFICATION_REQUIRED", "DOUYIN_LOGIN_EXPIRED", "DOUYIN_COMMENT_AMBIGUOUS"} else 502, content={"code": exc.code, "message": exc.message, "detail": exc.detail})
+    detail = dict(exc.detail or {})
+    detail.setdefault("error_type", exc.code)
+    detail.setdefault("error_message", exc.message)
+    detail.setdefault("timestamp", now_utc().isoformat())
+    return JSONResponse(status_code=409 if exc.code in {"DOUYIN_LOGIN_REQUIRED", "DOUYIN_VERIFICATION_REQUIRED", "DOUYIN_LOGIN_EXPIRED", "DOUYIN_COMMENT_AMBIGUOUS"} else 502, content={"code": exc.code, "message": exc.message, "detail": detail})
 
 
 @app.exception_handler(HTTPException)
@@ -428,7 +551,8 @@ async def douyin_status(db: Session = Depends(get_db)):
     status = await provider.get_login_status()
     identity = await provider.get_account_identity() if status is LoginStatus.LOGGED_IN else {}
     account = _sync_douyin_account(db, provider, status, identity)
-    return {"provider": provider.name, "browser": "running" if provider.browser.is_running else "stopped", "login": status.value, "profile_dir": str(provider.browser.profile_dir), "headless": provider.browser.headless, "account_id": account.id, "account_name": account.name, "account_nickname": account.nickname, "douyin_user_id": account.douyin_user_id, "last_login_at": account.last_login_at, "account_status": account.status, "last_checked_at": account.last_checked_at}
+    session = _get_browser_session(db, provider)
+    return {"provider": provider.name, "browser": "running" if provider.browser.is_running else "stopped", "login": status.value, "profile_dir": str(provider.browser.profile_dir), "headless": provider.browser.headless, "account_id": account.id, "account_name": account.name, "account_nickname": account.nickname, "douyin_user_id": account.douyin_user_id, "last_login_at": account.last_login_at, "account_status": account.status, "last_checked_at": account.last_checked_at, "browser_session_id": session.id if session else None, "browser_session_status": session.status if session else None, "browser_session_last_check_time": session.last_check_time if session else None, "browser_session_last_error": session.last_error if session else ""}
 
 
 @app.post("/api/douyin/browser/start")
@@ -438,7 +562,8 @@ async def douyin_browser_start(db: Session = Depends(get_db)):
     status = await provider.get_login_status()
     identity = await provider.get_account_identity() if status is LoginStatus.LOGGED_IN else {}
     account = _sync_douyin_account(db, provider, status, identity)
-    return {"provider": provider.name, "browser": "running", "login": status.value, "account_id": account.id, "account_name": account.name, "account_nickname": account.nickname, "douyin_user_id": account.douyin_user_id, "last_login_at": account.last_login_at, "account_status": account.status, "message": "请在打开的真实抖音浏览器中完成扫码登录" if status is not LoginStatus.LOGGED_IN else "抖音登录状态已确认"}
+    session = _get_browser_session(db, provider)
+    return {"provider": provider.name, "browser": "running", "login": status.value, "account_id": account.id, "account_name": account.name, "account_nickname": account.nickname, "douyin_user_id": account.douyin_user_id, "last_login_at": account.last_login_at, "account_status": account.status, "browser_session_id": session.id if session else None, "browser_session_status": session.status if session else None, "message": "请在打开的真实抖音浏览器中完成扫码登录" if status is not LoginStatus.LOGGED_IN else "抖音登录状态已确认"}
 
 
 @app.post("/api/douyin/browser/close")
@@ -446,7 +571,8 @@ async def douyin_browser_close(db: Session = Depends(get_db)):
     provider = _require_playwright_provider(active_provider(db))
     await provider.close_browser()
     account = _sync_douyin_account(db, provider, None)
-    return {"provider": provider.name, "browser": "stopped", "login": LoginStatus.ERROR.value, "account_id": account.id, "account_name": account.name, "account_status": account.status}
+    session = _get_browser_session(db, provider)
+    return {"provider": provider.name, "browser": "stopped", "login": LoginStatus.ERROR.value, "account_id": account.id, "account_name": account.name, "account_status": account.status, "browser_session_id": session.id if session else None, "browser_session_status": session.status if session else None}
 
 
 @app.get("/api/douyin/login/status")
@@ -456,7 +582,8 @@ async def douyin_login_status(db: Session = Depends(get_db)):
     status = await provider.get_login_status()
     identity = await provider.get_account_identity() if status is LoginStatus.LOGGED_IN else {}
     account = _sync_douyin_account(db, provider, status, identity)
-    return {"status": status.value, "browser": "running" if provider.browser.is_running else "stopped", "account_id": account.id, "account_name": account.name, "account_nickname": account.nickname, "douyin_user_id": account.douyin_user_id, "last_login_at": account.last_login_at, "last_checked_at": account.last_checked_at, "account_status": account.status}
+    session = _get_browser_session(db, provider)
+    return {"status": status.value, "browser": "running" if provider.browser.is_running else "stopped", "account_id": account.id, "account_name": account.name, "account_nickname": account.nickname, "douyin_user_id": account.douyin_user_id, "last_login_at": account.last_login_at, "last_checked_at": account.last_checked_at, "account_status": account.status, "browser_session_id": session.id if session else None, "browser_session_status": session.status if session else None}
 
 
 class DouyinSearchIn(BaseModel):
@@ -470,7 +597,7 @@ async def douyin_search(payload: DouyinSearchIn, db: Session = Depends(get_db)):
     project = db.get(Project, payload.project_id)
     if not project:
         raise HTTPException(404, "项目不存在")
-    provider = active_provider(db)
+    provider = _require_provider_capability(active_provider(db), "keyword_search", "真实视频搜索")
     videos = await provider.search_videos(payload.keyword, payload.limit)
     radar = RadarAgent()
     output = []
@@ -497,11 +624,13 @@ async def sync_douyin_comments(video_id: int, limit: int | None = Query(None, ge
     video = db.get(Video, video_id)
     if not video:
         raise HTTPException(404, "视频不存在")
-    provider = active_provider(db)
+    provider = _require_provider_capability(active_provider(db), "comments", "公开评论采集")
     result = await provider.get_comments(video.platform_video_id, cursor=cursor)
     created = 0
     updated = 0
+    synced_platform_ids: list[str] = []
     for dto in result.items[: limit or get_settings().douyin_default_comment_limit]:
+        synced_platform_ids.append(dto.comment_id)
         existing = db.scalar(select(Comment).where(Comment.project_id == video.project_id, Comment.platform == dto.platform, Comment.platform_comment_id == dto.comment_id))
         if existing:
             # Repeated manual/scheduled syncs must reconcile mutable public
@@ -527,7 +656,14 @@ async def sync_douyin_comments(video_id: int, limit: int | None = Query(None, ge
         db.add(Comment(project_id=video.project_id, video_id=video.id, platform=dto.platform, platform_comment_id=dto.comment_id, platform_user_id=dto.user_id, id_source=getattr(dto, "id_source", "dom_attribute"), nickname=dto.nickname, profile_url=dto.profile_url, comment_url=getattr(dto, "comment_url", ""), content=dto.content, content_hash=input_hash(dto.content), parent_comment_id=dto.parent_comment_id, is_reply=getattr(dto, "is_reply", False), like_count=getattr(dto, "like_count", 0), created_at_platform=dto.created_at, coverage_status=result.coverage_status))
         created += 1
     db.commit()
-    return {"video_id": video.id, "received": result.items_received, "created": created, "updated": updated, "coverage_status": result.coverage_status, "next_cursor": result.next_cursor, "has_more": result.has_more}
+    synced_comments = db.scalars(
+        select(Comment).where(
+            Comment.video_id == video.id,
+            Comment.platform_comment_id.in_(set(synced_platform_ids)),
+        )
+    ).all() if synced_platform_ids else []
+    analysis = await RadarService(provider, active_llm(db)).analyze_video_comments(db, video, synced_comments)
+    return {"video_id": video.id, "received": result.items_received, "created": created, "updated": updated, "coverage_status": result.coverage_status, "next_cursor": result.next_cursor, "has_more": result.has_more, "analysis": analysis}
 
 
 @app.get("/api/projects", response_model=list[ProjectOut])
@@ -561,11 +697,14 @@ async def smart_mode(project_id: int, db: Session = Depends(get_db)):
 
 @app.post("/api/projects/{project_id}/scan")
 async def start_project_scan(project_id: int, full: bool = False, db: Session = Depends(get_db)):
+    provider = active_provider(db)
+    _require_provider_capability(provider, "keyword_search", "真实视频搜索")
+    _require_provider_capability(provider, "comments", "公开评论采集")
     try:
-        task_id = await RadarService(active_provider(db), active_llm(db)).start_scan(project_id, full)
+        task_id = await RadarService(provider, active_llm(db)).start_scan(project_id, full)
     except ValueError as exc:
         raise HTTPException(404, str(exc)) from exc
-    return {"task_id": task_id, "status": "queued", "provider": active_provider(db).name}
+    return {"task_id": task_id, "status": "queued", "provider": provider.name}
 
 
 @app.get("/api/projects/{project_id}/knowledge")
@@ -747,8 +886,10 @@ async def scan_video(video_id: int, db: Session = Depends(get_db)):
     video = db.get(Video, video_id)
     if not video:
         raise HTTPException(404, "视频不存在")
-    task_id = await RadarService(active_provider(db), active_llm(db)).start_scan(video.project_id)
-    return {"task_id": task_id}
+    # This endpoint is intentionally video-scoped. Project-wide resumable
+    # scans belong to /api/projects/{project_id}/scan; do not silently start
+    # unrelated keyword work when a caller asks for one video.
+    return await sync_douyin_comments(video_id, limit=None, cursor=None, db=db)
 
 
 @app.get("/api/comments")
@@ -761,7 +902,7 @@ def list_comments(project_id: int | None = None, limit: int = Query(100, ge=1, l
     rows = []
     for comment, video, lead, reply_status in db.execute(query).all():
         item = {column.name: getattr(comment, column.name) for column in Comment.__table__.columns}
-        item.update({"video_title": video.title, "video_url": video.url, "lead_id": lead.id if lead else None, "lead_score": lead.lead_score if lead else None, "lead_level": lead.lead_level if lead else None, "intent_level": lead.intent_level if lead else None, "reply_status": reply_status})
+        item.update({"keyword": video.keyword, "video_title": video.title, "video_url": video.url, "lead_id": lead.id if lead else None, "lead_score": lead.lead_score if lead else None, "lead_level": lead.lead_level if lead else None, "intent_level": lead.intent_level if lead else None, "reply_status": reply_status})
         rows.append(item)
     return rows
 
@@ -949,6 +1090,15 @@ async def _send_comment_reply_locked(comment_id: int, payload: ReplyActionIn, db
         db.add(reply)
     elif reply.status == "FAILED":
         raise HTTPException(409, {"code": "REPLY_RETRY_REQUIRES_REVIEW", "message": "发送失败的回复必须先执行 retry 审核转换", "detail": {"reply_id": reply.id}})
+    elif reply.status == "APPROVED" and payload.reply_text != reply.reply_text:
+        raise HTTPException(
+            409,
+            {
+                "code": "REPLY_APPROVED_TEXT_MISMATCH",
+                "message": "已批准的回复文本不可直接修改，请重新生成并审核",
+                "detail": {"reply_id": reply.id},
+            },
+        )
     elif payload.reply_text != reply.reply_text:
         reply.reply_text = payload.reply_text
         reply.reply_source = "MANUAL"
@@ -1125,7 +1275,8 @@ def lead_payload(db: Session, lead: Lead):
     comments = db.scalars(select(Comment).join(LeadComment, LeadComment.comment_id == Comment.id).where(LeadComment.lead_id == lead.id).order_by(Comment.id)).all()
     videos = db.scalars(select(Video).join(LeadSource, LeadSource.video_id == Video.id).where(LeadSource.lead_id == lead.id)).all()
     events = db.scalars(select(LeadEvent).where(LeadEvent.lead_id == lead.id).order_by(LeadEvent.created_at)).all()
-    return {**{column.name: getattr(lead, column.name) for column in Lead.__table__.columns}, "comments": comments, "videos": videos, "score_history": events}
+    follow_tasks = db.scalars(select(FollowTask).where(FollowTask.lead_id == lead.id).order_by(FollowTask.deadline, FollowTask.id)).all()
+    return {**{column.name: getattr(lead, column.name) for column in Lead.__table__.columns}, "comments": comments, "videos": videos, "score_history": events, "follow_tasks": follow_tasks}
 
 
 @app.get("/api/leads")
@@ -1153,13 +1304,91 @@ def update_lead(lead_id: int, payload: LeadStatusUpdate, db: Session = Depends(g
     lead = db.get(Lead, lead_id)
     if not lead:
         raise HTTPException(404, "潜客不存在")
-    previous = lead.status
-    lead.status = payload.status
-    if previous != payload.status:
-        db.add(LeadEvent(lead_id=lead.id, score=lead.lead_score, event_type="status_changed", note=f"{previous} -> {payload.status}"))
+    if payload.status is not None:
+        previous = lead.status
+        lead.status = payload.status
+        if previous != payload.status:
+            db.add(LeadEvent(lead_id=lead.id, score=lead.lead_score, event_type="status_changed", note=f"{previous} -> {payload.status}"))
+    if payload.follow_note is not None:
+        lead.follow_note = payload.follow_note.strip()
     db.commit()
     db.refresh(lead)
     return lead
+
+
+@app.get("/api/follow-tasks", response_model=list[FollowTaskOut])
+def list_all_follow_tasks(
+    project_id: int | None = Query(default=None, ge=1),
+    status: FollowTaskStatus | None = None,
+    db: Session = Depends(get_db),
+):
+    query = select(FollowTask).order_by(FollowTask.deadline, FollowTask.id)
+    if project_id is not None:
+        query = query.where(FollowTask.project_id == project_id)
+    if status is not None:
+        query = query.where(FollowTask.status == status)
+    return db.scalars(query).all()
+
+
+@app.get("/api/leads/{lead_id}/follow-tasks", response_model=list[FollowTaskOut])
+def list_follow_tasks(lead_id: int, db: Session = Depends(get_db)):
+    if not db.get(Lead, lead_id):
+        raise HTTPException(404, "潜客不存在")
+    return db.scalars(select(FollowTask).where(FollowTask.lead_id == lead_id).order_by(FollowTask.deadline, FollowTask.id)).all()
+
+
+@app.post("/api/leads/{lead_id}/follow-tasks", response_model=FollowTaskOut)
+def create_follow_task(lead_id: int, payload: FollowTaskCreate, db: Session = Depends(get_db)):
+    lead = db.get(Lead, lead_id)
+    if not lead:
+        raise HTTPException(404, "潜客不存在")
+    deadline = payload.deadline
+    if deadline.tzinfo is not None:
+        deadline = deadline.astimezone(timezone.utc).replace(tzinfo=None)
+    follow_task = FollowTask(lead_id=lead.id, project_id=lead.project_id, content=payload.content.strip(), deadline=deadline)
+    db.add(follow_task)
+    db.add(LeadEvent(lead_id=lead.id, score=lead.lead_score, event_type="follow_task_created", note=follow_task.content))
+    db.commit()
+    db.refresh(follow_task)
+    return follow_task
+
+
+@app.patch("/api/follow-tasks/{follow_task_id}", response_model=FollowTaskOut)
+def update_follow_task(follow_task_id: int, payload: FollowTaskUpdate, db: Session = Depends(get_db)):
+    follow_task = db.get(FollowTask, follow_task_id)
+    if not follow_task:
+        raise HTTPException(404, "跟进任务不存在")
+    follow_task.status = payload.status
+    follow_task.completed_at = now_utc() if payload.status == "DONE" else None
+    db.commit()
+    db.refresh(follow_task)
+    return follow_task
+
+
+@app.get("/api/follow-task-reminders", response_model=list[NotificationEventOut])
+def list_follow_task_reminders(
+    project_id: int | None = Query(default=None, ge=1),
+    unread_only: bool = False,
+    limit: int = Query(100, ge=1, le=500),
+    db: Session = Depends(get_db),
+):
+    query = select(NotificationEvent).where(NotificationEvent.event_type == "follow_task.overdue").order_by(desc(NotificationEvent.id)).limit(limit)
+    if project_id is not None:
+        query = query.where(NotificationEvent.project_id == project_id)
+    if unread_only:
+        query = query.where(NotificationEvent.read_at.is_(None))
+    return db.scalars(query).all()
+
+
+@app.patch("/api/follow-task-reminders/{reminder_id}/read", response_model=NotificationEventOut)
+def mark_follow_task_reminder_read(reminder_id: int, db: Session = Depends(get_db)):
+    reminder = db.get(NotificationEvent, reminder_id)
+    if not reminder or reminder.event_type != "follow_task.overdue":
+        raise HTTPException(404, "跟进提醒不存在")
+    reminder.read_at = reminder.read_at or now_utc()
+    db.commit()
+    db.refresh(reminder)
+    return reminder
 
 
 @app.post("/api/leads/{lead_id}/persona")
@@ -1202,6 +1431,111 @@ async def lead_persona(lead_id: int, db: Session = Depends(get_db)):
     lead.persona_advice = advice
     db.commit()
     return advice
+
+
+@app.post("/api/leads/{lead_id}/assistant")
+async def lead_assistant(lead_id: int, db: Session = Depends(get_db)):
+    """Generate text-only sales advice for a lead; never sends to Douyin."""
+
+    lead = db.get(Lead, lead_id)
+    if not lead:
+        raise HTTPException(404, "潜客不存在")
+    project = db.get(Project, lead.project_id)
+    if not project:
+        raise HTTPException(409, "潜客关联的项目不存在")
+    persona = db.scalar(select(Persona).where(Persona.project_id == project.id))
+    comments = db.scalars(
+        select(Comment)
+        .join(LeadComment, LeadComment.comment_id == Comment.id)
+        .where(LeadComment.lead_id == lead.id)
+        .order_by(Comment.id)
+    ).all()
+    knowledge = db.scalars(
+        select(KnowledgeEntry)
+        .where(KnowledgeEntry.project_id == project.id, KnowledgeEntry.enabled.is_(True))
+        .order_by(KnowledgeEntry.id)
+    ).all()
+    project_data = {
+        "industry": project.industry,
+        "location": project.location,
+        "service": project.service,
+        "target_customer": project.target_customer,
+        "price_range": project.price_range,
+        "description": project.description,
+    }
+    lead_data = {
+        "platform": lead.platform,
+        "nickname": lead.nickname,
+        "confidence": lead.confidence,
+        "lead_score": lead.lead_score,
+        "lead_level": lead.lead_level,
+        "intent_level": lead.intent_level,
+        "need": lead.need,
+        "location": lead.location,
+        "budget": lead.budget,
+        "time_requirement": lead.time_requirement,
+        "purchase_stage": lead.purchase_stage,
+        "pain_point": lead.pain_point,
+        "buying_signals": lead.buying_signals,
+        "summary": lead.summary,
+        "reason": lead.reason,
+        "recommended_action": lead.recommended_action,
+        "follow_note": lead.follow_note,
+    }
+    comment_data = [
+        {
+            "content": comment.content,
+            "nickname": comment.nickname,
+            "parent_comment_id": comment.parent_comment_id,
+            "is_reply": comment.is_reply,
+        }
+        for comment in comments
+    ]
+    knowledge_data = [
+        {"title": item.title, "content": item.content, "tags": item.tags, "enabled": item.enabled}
+        for item in knowledge
+    ]
+    persona_data = {
+        "name": persona.name,
+        "identity": persona.identity,
+        "experience": persona.experience,
+        "location": persona.location,
+        "tone": persona.tone,
+        "strengths": persona.strengths,
+        "forbidden_words": persona.forbidden_words,
+        "sample_reply": persona.sample_reply,
+    } if persona else {}
+    assistant_input = {
+        "project": project_data,
+        "lead": lead_data,
+        "comments": comment_data,
+        "knowledge": knowledge_data,
+        "persona": persona_data,
+    }
+    llm = active_llm(db)
+    agent = LeadAssistantAgent(llm)
+    llm.clear_last_call()
+    try:
+        advice = await agent.run(project_data, lead_data, comment_data, knowledge_data, persona_data)
+    except Exception as exc:
+        _agent_run_from_call(
+            db,
+            project.id,
+            "LeadAssistantAgent",
+            agent.prompt_version,
+            assistant_input,
+            {},
+            llm,
+            success=False,
+            error=str(exc),
+        )
+        db.commit()
+        raise
+    advice_data = advice.model_dump()
+    _agent_run_from_call(db, project.id, "LeadAssistantAgent", agent.prompt_version, assistant_input, advice_data, llm)
+    lead.persona_advice = {**(lead.persona_advice or {}), **advice_data}
+    db.commit()
+    return advice_data
 
 
 @app.post("/api/projects/{project_id}/personas")

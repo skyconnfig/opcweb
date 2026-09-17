@@ -4,7 +4,6 @@ import json
 import re
 from datetime import datetime, timedelta, timezone
 
-from fastapi import HTTPException
 from sqlalchemy import func, or_, select
 
 from app.agents.industry_agent import IndustryAgent
@@ -16,13 +15,10 @@ from app.agents.radar_agent import RadarAgent
 from app.agents.reply_agent import ReplyAgent
 from app.core.config import get_settings
 from app.db import SessionLocal
-from app.models import AgentRun, Comment, CommentReply, Keyword, KnowledgeEntry, Lead, LeadComment, LeadEvent, LeadSource, Persona, Project, ReplyPolicy, TaskArtifact, TaskCheckpoint, TaskEvent, TaskReport, TaskStep, ScanTask, Video, now_utc
+from app.models import AgentRun, Comment, CommentReply, FollowTask, Keyword, KnowledgeEntry, Lead, LeadComment, LeadEvent, LeadSource, Persona, Project, ReplyPolicy, TaskArtifact, TaskCheckpoint, TaskEvent, TaskReport, TaskStep, ScanTask, Video, now_utc
 from app.providers.base import BaseContentProvider
-from app.providers.douyin.dto import DouyinCommentDTO, ReplyStatus
-from app.providers.douyin.exceptions import DouyinError
 from app.services.event_bus import event_bus
 from app.tasks.queue import enqueue_scan
-from app.services.reply_policy import DEFAULT_SENDING_LEASE_SECONDS, enforce_send_policy
 
 
 def fingerprint(content: str) -> str:
@@ -106,6 +102,69 @@ class RadarService:
     async def start_scan(self, project_id: int, full: bool = False) -> int:
         with SessionLocal() as db:
             return enqueue_scan(db, project_id, full).id
+
+    async def analyze_video_comments(self, db, video: Video, comments: list[Comment]) -> dict:
+        """Run the text-only lead pipeline for comments from a manual sync.
+
+        Manual search/sync is a supported entry point, not a raw data import.
+        Keep it on the same rule-prefilter, thread-context, LeadJudge and
+        review-draft path as scheduled scans, while leaving the caller-owned
+        transaction and without inventing a scan task for a one-video action.
+        """
+
+        project = db.get(Project, video.project_id)
+        if project is None:
+            raise ValueError("项目不存在")
+        analyzed = filtered = leads = 0
+        errors: list[str] = []
+        seen_hashes: set[str] = set()
+        for comment in comments:
+            if not self.prefilter.should_analyze(comment.content, seen_hashes):
+                filtered += 1
+                continue
+            thread_ids = {value for value in (comment.platform_comment_id, comment.parent_comment_id) if value}
+            thread_filter = [Comment.platform_comment_id.in_(thread_ids), Comment.parent_comment_id.in_(thread_ids)] if thread_ids else []
+            history_filter = [Comment.platform_user_id == comment.platform_user_id] if comment.platform_user_id else []
+            history_rows = db.scalars(
+                select(Comment)
+                .where(Comment.project_id == project.id, Comment.platform == comment.platform, or_(*history_filter, *thread_filter))
+                .order_by(Comment.id)
+            ).all() if (history_filter or thread_filter) else [comment]
+            history_text = "\n".join(f"{index + 1}. {row.content}" for index, row in enumerate(history_rows))
+            project_data = {
+                "industry": project.industry,
+                "location": project.location,
+                "service": project.service,
+                "target_customer": project.target_customer,
+                "price_range": project.price_range,
+                "description": project.description,
+                "keyword": video.keyword,
+                "video_title": video.title,
+                "video_description": video.description,
+                "video_creator": video.creator,
+                "video_likes": video.likes,
+                "video_comments": video.comments,
+                "video_shares": video.shares,
+                "video_collects": video.collects,
+                "history_text": history_text,
+            }
+            comment_data = {"content": comment.content, "nickname": comment.nickname, "history_text": history_text, "parent_comment_id": comment.parent_comment_id}
+            self.llm.clear_last_call()
+            try:
+                judgment = await self.judge_agent.run(project_data, comment_data)
+            except Exception as exc:
+                self._record_agent_run(db, project.id, "LeadJudgeAgent", self.judge_agent.prompt_version, {"project": project_data, "comment": comment_data}, {}, success=False, error=str(exc))
+                errors.append(f"comment:{comment.id}: {exc}")
+                db.commit()
+                continue
+            self._record_agent_run(db, project.id, "LeadJudgeAgent", self.judge_agent.prompt_version, {"project": project_data, "comment": comment_data}, judgment)
+            analyzed += 1
+            if judgment["is_lead"]:
+                lead = _upsert_lead(db, project.id, comment, judgment, video.id)
+                leads += 1
+                await self._maybe_generate_reply_draft(db, project, video, comment, lead, project_data, comment_data, None)
+            db.commit()
+        return {"analyzed": analyzed, "filtered": filtered, "leads": leads, "errors": errors, "status": "PARTIAL" if errors else "SUCCESS"}
 
     async def run_task(self, task_id: int, full: bool = False):
         with SessionLocal() as db:
@@ -337,6 +396,7 @@ class RadarService:
                     comments_prefiltered=comments_prefiltered,
                     coverage_statuses=coverage_statuses,
                 )
+                metrics["collection_status"] = "SUCCESS"
                 _upsert_task_report(db, task_id, "行业扫描已完成", metrics)
                 project.status = "running"
                 db.commit()
@@ -356,9 +416,16 @@ class RadarService:
                     coverage_statuses=coverage_statuses,
                 )
                 metrics["failure"] = str(exc)
+                metrics.update(_collection_error_context(exc, partial=bool(videos_seen or comments_seen)))
                 _upsert_task_report(db, task_id, "行业扫描未完成", metrics)
                 db.commit()
-            await self.emit(task_id, project.id, "task.failed", f"任务失败：{exc}")
+            await self.emit(
+                task_id,
+                project.id,
+                "task.failed",
+                f"任务失败：{exc}",
+                _collection_error_context(exc, partial=bool(videos_seen or comments_seen)),
+            )
 
     async def _step(self, task_id, name, message, delay):
         if self._is_paused(task_id):
@@ -487,101 +554,29 @@ class RadarService:
         )
         db.add(reply)
         db.flush()
-        await self.emit(
-            task_id,
-            project.id,
-            "reply.generated",
-            "已生成 AI 回复草稿，等待人工审核",
-            {
-                "comment_id": comment.id,
-                "reply_id": reply.id,
-                "has_reply_text": bool(reply_text),
-                "need_human_review": decision.need_human_review,
-            },
-        )
+        if task_id is not None:
+            await self.emit(
+                task_id,
+                project.id,
+                "reply.generated",
+                "已生成 AI 回复草稿，等待人工审核",
+                {
+                    "comment_id": comment.id,
+                    "reply_id": reply.id,
+                    "has_reply_text": bool(reply_text),
+                    "need_human_review": decision.need_human_review,
+                },
+            )
 
-        # ``auto_reply_enabled`` is an explicit user opt-in. Once enabled, a
-        # safe ReplyAgent decision is sent through the same real Provider path
-        # as a manual reply. Sensitive or uncertain decisions remain in the
-        # review queue and never cause an external side effect.
-        if decision.need_human_review or decision.risk_flags or not reply_text:
-            db.commit()
-            await self.emit(task_id, project.id, "reply.waiting_review", "AI 回复因风险或不确定性进入人工审核", {"comment_id": comment.id, "reply_id": reply.id})
-            return
-
-        capabilities = getattr(self.provider, "capabilities", {})
-        if not hasattr(self.provider, "reply_comment") or not capabilities.get("reply_comment", False):
-            reply.error_code = "AUTO_REPLY_PROVIDER_UNAVAILABLE"
-            reply.error_message = "当前真实数据源不支持自动回复，请激活 Douyin Playwright 后人工发送"
-            db.commit()
-            await self.emit(task_id, project.id, "reply.waiting_review", reply.error_message, {"comment_id": comment.id, "reply_id": reply.id})
-            return
-
-        try:
-            enforce_send_policy(db, comment, lead=lead, automatic=True)
-        except HTTPException as exc:
-            detail = exc.detail if isinstance(exc.detail, dict) else {}
-            reply.error_code = str(detail.get("code") or "AUTO_REPLY_POLICY_BLOCKED")
-            reply.error_message = str(detail.get("message") or exc.detail or "自动回复策略阻止发送")
-            db.commit()
-            await self.emit(task_id, project.id, "reply.waiting_review", reply.error_message, {"comment_id": comment.id, "reply_id": reply.id, "code": reply.error_code})
-            return
-
-        reply.status = "SENDING"
-        reply.approved_at = now_utc()
-        reply.attempt_count = int(reply.attempt_count or 0) + 1
-        reply.sending_started_at = now_utc()
-        reply.send_lease_expires_at = now_utc() + timedelta(seconds=DEFAULT_SENDING_LEASE_SECONDS)
-        reply.error_code = ""
-        reply.error_message = ""
         db.commit()
-        await self.emit(task_id, project.id, "reply.sending", "自动回复正在通过真实抖音页面发送", {"comment_id": comment.id, "reply_id": reply.id})
-
-        target = DouyinCommentDTO(
-            platform=comment.platform,
-            comment_id=comment.platform_comment_id,
-            user_id=comment.platform_user_id,
-            nickname=comment.nickname,
-            profile_url=comment.profile_url,
-            content=comment.content,
-            created_at=comment.created_at_platform,
-            parent_comment_id=comment.parent_comment_id,
-            id_source=comment.id_source,
-            comment_url=comment.comment_url,
-        )
-        try:
-            result = await self.provider.reply_comment(video.url, target, reply_text)
-        except DouyinError as exc:
-            reply.status = "FAILED"
-            reply.error_code = exc.code
-            reply.error_message = exc.message
-            reply.sending_started_at = None
-            reply.send_lease_expires_at = None
-            db.commit()
-            await self.emit(task_id, project.id, "reply.failed", exc.message, {"comment_id": comment.id, "reply_id": reply.id, "code": exc.code})
-            return
-        except Exception as exc:
-            reply.status = "FAILED"
-            reply.error_code = "DOUYIN_REPLY_FAILED"
-            reply.error_message = str(exc)
-            reply.sending_started_at = None
-            reply.send_lease_expires_at = None
-            db.commit()
-            await self.emit(task_id, project.id, "reply.failed", "自动回复执行失败", {"comment_id": comment.id, "reply_id": reply.id, "code": reply.error_code})
-            return
-
-        reply.sent_at = now_utc()
-        reply.sending_started_at = None
-        reply.send_lease_expires_at = None
-        reply.status = "VERIFIED" if result.status is ReplyStatus.VERIFIED else "SENT_UNVERIFIED"
-        if reply.status == "VERIFIED":
-            reply.verified_at = now_utc()
-            event_type, message = "reply.verified", "自动回复已发送并通过真实 DOM 验证"
-        else:
-            reply.verification_due_at = now_utc() + timedelta(minutes=15)
-            event_type, message = "reply.sent", "自动回复已点击发送，但尚未通过真实 DOM 验证"
-        db.commit()
-        await self.emit(task_id, project.id, event_type, message, {"comment_id": comment.id, "reply_id": reply.id, "status": reply.status})
+        if task_id is not None:
+            await self.emit(
+                task_id,
+                project.id,
+                "reply.waiting_review",
+                "AI 回复草稿已生成；自动发送已禁用，必须人工审核并确认后发送",
+                {"comment_id": comment.id, "reply_id": reply.id, "code": "HUMAN_REVIEW_REQUIRED"},
+            )
 
     @staticmethod
     def _auto_reply_eligible(policy: ReplyPolicy | None, lead: Lead) -> bool:
@@ -733,6 +728,36 @@ def _task_report_metrics(
     }
 
 
+def _collection_error_context(exc: Exception, *, partial: bool = False) -> dict:
+    """Return a durable, text-only classification for a provider failure.
+
+    The task lifecycle remains ``failed`` so existing queue semantics stay
+    stable.  ``collection_status`` distinguishes a clean provider failure
+    from a partial collection and preserves the actionable DOM/login/risk
+    boundary for the task report and event stream.
+    """
+
+    detail = getattr(exc, "detail", {}) or {}
+    code = str(getattr(exc, "code", type(exc).__name__))
+    status_by_code = {
+        "DOUYIN_LOGIN_REQUIRED": "LOGIN_REQUIRED",
+        "DOUYIN_LOGIN_EXPIRED": "LOGIN_REQUIRED",
+        "DOUYIN_VERIFICATION_REQUIRED": "BLOCKED",
+        "DOUYIN_SELECTOR_NOT_FOUND": "DOM_CHANGED",
+        "DOUYIN_PAGE_PARSE_FAILED": "DOM_CHANGED",
+    }
+    status = status_by_code.get(code, "FAILED")
+    if partial and status == "FAILED":
+        status = "PARTIAL"
+    return {
+        "collection_status": status,
+        "error_type": code,
+        "error_message": str(getattr(exc, "message", str(exc))),
+        "url": str(detail.get("url") or detail.get("video_url") or detail.get("target_url") or ""),
+        "timestamp": now_utc().isoformat(),
+    }
+
+
 def _upsert_task_report(db, task_id: int, summary: str, metrics: dict) -> TaskReport:
     report = db.scalar(select(TaskReport).where(TaskReport.task_id == task_id))
     if report is None:
@@ -784,7 +809,24 @@ def _upsert_lead(db, project_id, comment, judgment, video_id, *, task_id: int | 
         db.add(LeadEvent(lead_id=lead.id, score=lead.lead_score, event_type="detected", note=comment.content))
     if task_id is not None:
         _record_task_artifact(db, task_id, "lead", lead.id, "created" if created else "updated")
+    if created:
+        db.add(
+            FollowTask(
+                lead_id=lead.id,
+                project_id=project_id,
+                content=f"首次跟进：{lead.need or '确认具体需求、预算和时间'}",
+                deadline=_default_follow_deadline(),
+            )
+        )
     return lead
+
+
+def _default_follow_deadline() -> datetime:
+    """Schedule the default human follow-up for 10:00 China time tomorrow."""
+
+    china_tz = timezone(timedelta(hours=8))
+    tomorrow = (datetime.now(china_tz) + timedelta(days=1)).date()
+    return datetime(tomorrow.year, tomorrow.month, tomorrow.day, 2, 0)
 
 
 def _video_score(likes, comments, index):

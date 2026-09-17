@@ -13,7 +13,7 @@ from app.providers.douyin.dto import (
     ReplyResult,
     ReplyStatus,
 )
-from app.providers.douyin.browser_manager import DouyinBrowserManager
+from app.providers.douyin.browser_manager import BrowserSessionManager, DouyinBrowserManager
 from app.providers.douyin.exceptions import (
     DouyinBrowserError,
     DouyinCommentAmbiguous,
@@ -34,6 +34,7 @@ __all__ = [
     "DouyinCommentDTO",
     "DouyinBrowserError",
     "DouyinBrowserManager",
+    "BrowserSessionManager",
     "DouyinCommentAmbiguous",
     "DouyinCommentNotFound",
     "DouyinError",

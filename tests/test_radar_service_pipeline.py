@@ -10,11 +10,11 @@ from sqlalchemy.pool import StaticPool
 from app.agents.llm import BaseLLMProvider, LLMCall
 from app.agents.reply_agent import ReplyDecision
 from app.db import Base
-from app.models import AgentRun, Comment, CommentReply, Keyword, KnowledgeEntry, Lead, LeadComment, LeadEvent, Persona, Project, ReplyPolicy, ScanTask, TaskArtifact, TaskCheckpoint, TaskEvent, TaskReport, TaskStep, Video
+from app.models import AgentRun, Comment, CommentReply, FollowTask, Keyword, KnowledgeEntry, Lead, LeadComment, LeadEvent, Persona, Project, ReplyPolicy, ScanTask, TaskArtifact, TaskCheckpoint, TaskEvent, TaskReport, TaskStep, Video
 from app.providers.base import BaseContentProvider, CommentDTO, CommentScanResult, ProviderHealth, VideoDTO
 from app.providers.douyin.dto import ReplyResult, ReplyStatus
 from app.services import radar_service
-from app.services.radar_service import RadarService, _keywords_after_checkpoint, _upsert_lead
+from app.services.radar_service import RadarService, _collection_error_context, _keywords_after_checkpoint, _upsert_lead
 from app.tasks.queue import enqueue_scan
 
 
@@ -113,6 +113,24 @@ def test_checkpoint_resume_uses_sorted_keyword_position_not_database_id():
     assert _keywords_after_checkpoint([first, second], first.id) == [second]
 
 
+def test_collection_error_context_preserves_actionable_provider_state():
+    from app.providers.douyin.exceptions import DouyinVerificationRequired
+
+    context = _collection_error_context(
+        DouyinVerificationRequired(
+            "抖音页面需要人工完成安全验证",
+            detail={"url": "https://www.douyin.com/search/装修"},
+        ),
+        partial=True,
+    )
+
+    assert context["collection_status"] == "BLOCKED"
+    assert context["error_type"] == "DOUYIN_VERIFICATION_REQUIRED"
+    assert context["error_message"]
+    assert context["url"].startswith("https://www.douyin.com/")
+    assert context["timestamp"]
+
+
 def _session(monkeypatch):
     engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
     Base.metadata.create_all(engine)
@@ -173,9 +191,11 @@ async def test_pipeline_persists_text_comments_judges_candidates_and_reports_rea
         report = db.scalar(select(TaskReport).where(TaskReport.task_id == task_id))
         runs = db.scalars(select(AgentRun).where(AgentRun.project_id == project_id, AgentRun.agent == "LeadJudgeAgent")).all()
         relations = db.scalars(select(LeadComment).join(Lead, Lead.id == LeadComment.lead_id)).all()
+        follow_tasks = db.scalars(select(FollowTask).where(FollowTask.project_id == project_id)).all()
 
     assert len(stored_comments) == 4
     assert len(leads) == 1
+    assert len(follow_tasks) == 1 and follow_tasks[0].status == "PENDING"
     assert leads[0].occurrence_count == 3
     assert len(relations) == 3
     assert len(runs) == 3 and all(run.success for run in runs)
@@ -336,7 +356,8 @@ async def test_pipeline_retry_does_not_skip_unprocessed_comments_in_failed_page(
             "page-2": CommentScanResult(page_two, "partial", 1, None, False),
         }
     )
-    llm = RecordingTextLLM(fail_calls={2, 3})
+    # Transport failures are retried by the task boundary, not by the agent.
+    llm = RecordingTextLLM(fail_calls={2})
     service = _service(provider, llm)
 
     await service.run_task(task_id, full=True)
@@ -358,7 +379,7 @@ async def test_pipeline_retry_does_not_skip_unprocessed_comments_in_failed_page(
     assert comments_count == 3
     assert report is not None and report.metrics["comments"] == 3 and report.metrics["coverage_status"] == "partial"
     assert provider.cursors == [None, None, "page-2"]
-    assert llm.calls == 5
+    assert llm.calls == 4
     assert all(text in "\n".join(llm.users) for text in ("长沙有没有？", "120平大概多少钱？", "年底准备装。"))
 
 
@@ -462,7 +483,7 @@ async def test_pipeline_auto_reply_policy_creates_review_only_draft(monkeypatch)
 
 
 @pytest.mark.asyncio
-async def test_pipeline_explicit_auto_reply_sends_and_persists_verified_result(monkeypatch):
+async def test_pipeline_auto_reply_setting_never_sends_without_human_confirmation(monkeypatch):
     sessions = _session(monkeypatch)
     task_id, project_id = _task(sessions)
     provider = AutoReplyProvider({None: CommentScanResult([_comment("c1", "user-1", "长沙装修大概多少钱？")], "partial", 1, None, False)})
@@ -486,11 +507,11 @@ async def test_pipeline_explicit_auto_reply_sends_and_persists_verified_result(m
 
     assert not task_error
     assert reply is not None
-    assert reply.status == "VERIFIED"
-    assert reply.approved_at is not None
-    assert reply.sent_at is not None
-    assert reply.verified_at is not None
-    assert provider.reply_calls == [(provider.video.url, "c1", "可以先按面积和施工范围帮你估算。")]
+    assert reply.status == "WAITING_REVIEW"
+    assert reply.approved_at is None
+    assert reply.sent_at is None
+    assert reply.verified_at is None
+    assert provider.reply_calls == []
 
 
 @pytest.mark.asyncio

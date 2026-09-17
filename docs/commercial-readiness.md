@@ -25,11 +25,17 @@ API 使用 `Authorization: Bearer <API_AUTH_TOKEN>`。前端容器在构建时�
 
 ## 自用验收顺序
 
+前端运行态可先执行以下只读检查；它只验证页面渲染和资源，不会触发采集、分析或回复：
+
+```powershell
+.\.venv\Scripts\python.exe scripts\frontend_smoke_test.py --report data\acceptance\frontend-smoke-YYYYMMDD.json
+```
+
 1. 创建项目并运行 IndustryAgent、KeywordAgent。
 2. 在数据源页健康检查并激活一个真实 Provider。
 3. 用少量关键词执行扫描，确认视频、评论、覆盖状态和 DOM 来源标记都有真实返回；分页边界以页面实际 DOM 为准，不把未知覆盖范围标成完整。
 4. 检查规则预筛后再调用 LeadJudgeAgent，并抽样人工复核潜客。
-5. 生成 PersonaAgent 建议，人工确认后再在平台内操作。
+5. 生成 LeadAssistantAgent 建议，人工确认后再在平台内操作；PersonaAgent 仍可用于人设化建议。
 6. 重启 API，确认 queued/running 任务会恢复，SSE 可以从持久化事件继续读取。
 
 ## 两个当前硬门槛
@@ -70,7 +76,7 @@ Playwright 验收必须由用户在可见浏览器中人工扫码并完成平台
 - 在任务中心按项目启用自动扫描，频率可选 10～30 分钟；默认关闭。
 - API 会将到期计划排入持久化任务队列；已有 queued/running 任务时跳过重复入队。
 - 计划的 `next_run_at` / `last_run_at` 会写入数据库，API 重启后由 APScheduler 继续检查。
-- SQLite 本地开发和 PostgreSQL/Docker 都使用 Alembic `upgrade head`；当前 head 为 `f4e5d6c7b8a9`，包含评论来源、回复恢复、采集任务来源和旧表空值规范化等迁移。
+- SQLite 本地开发和 PostgreSQL/Docker 都使用 Alembic `upgrade head`；当前 head 为 `b8c9d0e1f2a3`，包含评论来源、回复恢复、采集任务来源、旧表空值规范化、浏览器会话和潜客跟进任务等迁移。
 
 ## 仍需独立完成的商业规模能力
 

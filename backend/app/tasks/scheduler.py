@@ -7,11 +7,39 @@ from sqlalchemy import select
 from app.db import SessionLocal
 from app.models import ScanSchedule
 from app.providers.base import BaseContentProvider
+from app.services.event_bus import event_bus
+from app.services.follow_task_reminders import _utc_iso, mark_due_follow_tasks
 from app.tasks.queue import advance_schedule, enqueue_scan, has_active_scan, recover_stale_runtime_initializations
 
 
 def create_scheduler() -> AsyncIOScheduler:
     return AsyncIOScheduler(timezone="Asia/Shanghai")
+
+
+async def process_due_follow_task_reminders() -> int:
+    """Persist overdue reminders, then publish them to the in-app event bus."""
+
+    with SessionLocal() as db:
+        reminders = mark_due_follow_tasks(db)
+        db.commit()
+        events = [
+            {
+                "id": reminder.id,
+                "project_id": reminder.project_id,
+                "event_type": reminder.event_type,
+                "message": reminder.message,
+                "payload": reminder.payload,
+                "created_at": _utc_iso(reminder.created_at),
+            }
+            for reminder in reminders
+        ]
+
+    # Publish only after the database commit. A process restart can replay the
+    # durable row through a future notification API without fabricating a live
+    # event for a rolled-back transaction.
+    for event in events:
+        await event_bus.publish(event)
+    return len(events)
 
 
 async def enqueue_due_schedules(

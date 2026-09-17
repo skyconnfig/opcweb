@@ -1,3 +1,4 @@
+import asyncio
 import json
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
@@ -18,11 +19,12 @@ from app.agents.lead_judge_agent import LeadJudgeAgent, RulePreFilter
 from app.agents.llm import BaseLLMProvider, LLMCall, OpenAICompatibleProvider, is_text_only_model
 from app.agents.reply_agent import ReplyAgent
 from app.agents.persona_agent import PersonaAgent
+from app.agents.lead_assistant_agent import LeadAssistantAgent
 from app.errors import LLMNotConfiguredError
 from app.agents.radar_agent import RadarAgent
 from app.core.config import Settings
 from app.db import Base
-from app.main import ReplyActionIn, ReplyBatchIn, ReplyPolicyIn, ScheduleIn, send_comment_reply
+from app.main import ReplyActionIn, ReplyBatchIn, ReplyPolicyIn, ScheduleIn, _require_provider_capability, send_comment_reply
 from app.models import AgentRun, BrowserProfile, Comment, CommentReply, DouyinAccount, Lead, Project, ReplyPolicy, ScanSchedule, ScanTask, TaskCheckpoint, Video, now_utc
 from app.providers.external.douyin_comments_crawler import DouyinCommentsCrawlerExternalProvider
 from app.providers.external.social_harvest import SocialHarvestExternalProvider
@@ -33,6 +35,19 @@ from app.services.radar_service import fingerprint, lead_level
 from app.services.event_bus import sse_line
 from app.services.event_bus import event_bus
 from app.services.reply_policy import enforce_send_policy, record_reply_verification, recover_stale_sending
+
+
+def test_api_provider_capability_guard_rejects_explicitly_unsupported_action():
+    class Provider:
+        name = "Text-only adapter"
+        capabilities = {"keyword_search": True, "comments": False}
+
+    with pytest.raises(HTTPException) as caught:
+        _require_provider_capability(Provider(), "comments", "公开评论采集")
+
+    assert caught.value.status_code == 400
+    assert caught.value.detail["code"] == "PROVIDER_CAPABILITY_UNSUPPORTED"
+    assert caught.value.detail["detail"] == {"provider": "Text-only adapter", "capability": "comments"}
 from app.settings_store import decrypt_secret, encrypt_secret
 from app.tasks.checkpoint import checkpoint_snapshot
 from app.tasks.queue import advance_schedule, claim_next_task, enqueue_scan
@@ -333,6 +348,26 @@ async def test_text_only_agent_chain_and_history_context():
         await LeadJudgeAgent().run(project, {"content": "年底准备装"})
 
 
+@pytest.mark.asyncio
+async def test_lead_judge_does_not_retry_non_contract_errors():
+    class FailingProvider(BaseLLMProvider):
+        configured = True
+        model = "test-text-model"
+
+        def __init__(self):
+            super().__init__()
+            self.calls = 0
+
+        async def structured_output(self, system, user, schema):
+            self.calls += 1
+            raise RuntimeError("text provider unavailable")
+
+    provider = FailingProvider()
+    with pytest.raises(RuntimeError, match="text provider unavailable"):
+        await LeadJudgeAgent(provider).run({"industry": "装修"}, {"content": "120平多少钱"})
+    assert provider.calls == 1
+
+
 def test_lead_judge_accepts_required_text_contract_without_extra_intent_field():
     result = LeadJudgeAgent()._normalize(
         {
@@ -426,6 +461,71 @@ def test_persona_agent_normalizes_common_text_model_field_aliases():
     assert result["customer_insight"] == "用户正在比较方案"
     assert result["recommended_reply"].startswith("可以先说")
     assert result["warnings"] == ["不要承诺最低价", "不要索取联系方式"]
+
+
+def test_lead_assistant_uses_text_context_and_returns_review_fields():
+    class TextAssistant(BaseLLMProvider):
+        configured = True
+        model = "text-model"
+
+        async def structured_output(self, system, user, schema):
+            self.user_text = user
+            self.last_call = LLMCall(self.model, user, {"reply": "先确认面积和预算。"}, 12, 3, True, "")
+            return {
+                "reply": "先确认面积和预算。",
+                "reason": "客户已经表达了明确的购买问题。",
+                "risk": "报价需以现场需求为准。",
+                "next_action": "人工确认后继续询问户型和时间。",
+            }
+
+    provider = TextAssistant()
+    decision = asyncio.run(
+        LeadAssistantAgent(provider).run(
+            {"industry": "装修", "video_url": "https://example.com/video"},
+            {"need": "120平装修", "lead_score": 88},
+            [{"content": "120平大概多少钱？"}],
+            [{"title": "报价规则", "content": "需要结合面积和方案评估"}],
+            {"tone": "专业克制"},
+        )
+    )
+
+    assert decision.reply.startswith("先确认")
+    assert set(decision.model_dump()) == {"reply", "reason", "risk", "next_action"}
+    assert "video_url" not in provider.user_text
+    assert "120平大概多少钱" in provider.user_text
+
+
+@pytest.mark.asyncio
+async def test_lead_assistant_endpoint_persists_advice_and_audit_run(monkeypatch):
+    from app import main
+    from app.models import KnowledgeEntry, LeadComment
+
+    class TextAssistant(BaseLLMProvider):
+        configured = True
+        model = "text-model"
+
+        async def structured_output(self, system, user, schema):
+            self.last_call = LLMCall(self.model, f"{system}\n{user}", {}, 9, 4, True, "")
+            return {"reply": "我先帮你确认需求。", "reason": "评论表达了明确的咨询意图。", "risk": "具体方案需要人工核实。", "next_action": "人工确认面积和时间。"}
+
+    db = _reply_test_session()
+    comment = _reply_test_comment(db)
+    lead = Lead(project_id=comment.project_id, platform="douyin", platform_user_id="assistant-user", nickname="咨询客户", lead_score=88, lead_level="A", need="装修报价")
+    db.add(lead)
+    db.flush()
+    db.add(LeadComment(lead_id=lead.id, comment_id=comment.id))
+    db.add(KnowledgeEntry(project_id=comment.project_id, title="服务范围", content="先确认面积和时间，再提供方案", enabled=True))
+    db.commit()
+    monkeypatch.setattr(main, "active_llm", lambda _db: TextAssistant())
+
+    result = await main.lead_assistant(lead.id, db)
+
+    assert set(result) == {"reply", "reason", "risk", "next_action"}
+    assert result["reply"].startswith("我先")
+    db.refresh(lead)
+    assert lead.persona_advice["next_action"] == "人工确认面积和时间。"
+    run = db.scalar(select(AgentRun).where(AgentRun.agent == "LeadAssistantAgent"))
+    assert run is not None and run.success is True and run.prompt_version == "lead_assistant_text_v1"
 
 
 def test_lead_judge_rejects_string_true_that_is_not_a_boolean():
@@ -905,6 +1005,18 @@ def test_reply_policy_rejects_unsafe_configuration():
         ReplyPolicyIn(minimum_interval_seconds=0)
 
 
+def test_reply_policy_rejects_synthetic_comment_identity():
+    db = _reply_test_session()
+    comment = _reply_test_comment(db)
+    comment.id_source = "fingerprint"
+
+    with pytest.raises(HTTPException) as blocked:
+        enforce_send_policy(db, comment)
+
+    assert blocked.value.status_code == 409
+    assert blocked.value.detail["code"] == "COMMENT_ID_NOT_SENDABLE"
+
+
 def test_scan_auto_reply_gate_requires_explicit_policy_and_lead_thresholds():
     from app.services.radar_service import RadarService
 
@@ -1016,6 +1128,7 @@ def test_comment_list_includes_video_and_lead_context():
     rows = main.list_comments(comment.project_id, 100, db)
 
     assert rows[0]["video_title"] == "真实视频"
+    assert rows[0]["keyword"] == "装修"
     assert rows[0]["video_url"] == ""
     assert rows[0]["reply_status"] is None
     assert rows[0]["lead_id"] is None
@@ -1045,6 +1158,34 @@ async def test_manual_reply_requires_confirm_and_blocks_repeat(monkeypatch):
     assert repeated.value.status_code == 409
     assert repeated.value.detail["code"] == "REPLY_ALREADY_SENT"
     assert provider.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_manual_reply_cannot_change_approved_text_at_send_boundary(monkeypatch):
+    from app import main
+
+    db = _reply_test_session()
+    comment = _reply_test_comment(db)
+    approved = CommentReply(
+        project_id=comment.project_id,
+        comment_id=comment.id,
+        reply_text="已审核的回复",
+        status="APPROVED",
+        approved_at=now_utc(),
+    )
+    db.add(approved)
+    db.commit()
+    provider = _ReplyProvider(ReplyStatus.VERIFIED)
+    monkeypatch.setattr(main, "active_provider", lambda _db: provider)
+
+    with pytest.raises(HTTPException) as mismatch:
+        await send_comment_reply(comment.id, ReplyActionIn(reply_text="绕过审核的新回复", confirm=True), db)
+
+    assert mismatch.value.status_code == 409
+    assert mismatch.value.detail["code"] == "REPLY_APPROVED_TEXT_MISMATCH"
+    assert provider.calls == 0
+    db.refresh(approved)
+    assert approved.reply_text == "已审核的回复"
 
 
 @pytest.mark.asyncio
@@ -1092,6 +1233,102 @@ async def test_manual_comment_sync_reconciles_existing_dom_record(monkeypatch):
     assert comment.is_reply is True
     assert comment.like_count == 12
     assert comment.coverage_status == "partial"
+
+
+@pytest.mark.asyncio
+async def test_manual_comment_sync_runs_text_lead_pipeline(monkeypatch):
+    from app import main
+    from app.providers.base import CommentScanResult
+    from app.providers.douyin.dto import DouyinCommentDTO
+
+    class TextLLM(BaseLLMProvider):
+        configured = True
+        model = "manual-sync-text-test"
+
+        async def structured_output(self, system, user, schema):
+            self.last_call = LLMCall(self.model, user, {}, tokens=5, latency_ms=1)
+            return {
+                "is_lead": True,
+                "confidence": 0.95,
+                "lead_score": 92,
+                "intent_level": "high",
+                "need": "装修报价",
+                "location": "长沙",
+                "budget": "10万",
+                "time_requirement": "年底",
+                "purchase_stage": "准备咨询",
+                "pain_point": "担心增项",
+                "buying_signals": ["询价", "明确时间"],
+                "summary": "用户有明确装修计划",
+                "reason": "评论包含预算和时间",
+                "recommended_action": "人工跟进",
+                "should_reply": True,
+            }
+
+    db = _reply_test_session()
+    comment = _reply_test_comment(db)
+
+    class Provider:
+        async def get_comments(self, video_id, cursor=None):
+            return CommentScanResult(
+                items=[DouyinCommentDTO("douyin", "comment-2", "user-2", "客户2", "", "长沙120平大概多少钱？", id_source="dom_attribute")],
+                coverage_status="partial",
+                items_received=1,
+            )
+
+    monkeypatch.setattr(main, "active_provider", lambda _db: Provider())
+    monkeypatch.setattr(main, "active_llm", lambda _db: TextLLM())
+    result = await main.sync_douyin_comments(comment.video_id, limit=None, db=db)
+
+    assert result["analysis"]["status"] == "SUCCESS"
+    assert result["analysis"]["analyzed"] == 1
+    assert result["analysis"]["leads"] == 1
+    assert db.scalar(select(Lead).where(Lead.project_id == comment.project_id, Lead.nickname == "客户2")) is not None
+
+
+@pytest.mark.asyncio
+async def test_video_scan_route_is_scoped_to_one_video(monkeypatch):
+    from app import main
+
+    db = _reply_test_session()
+    comment = _reply_test_comment(db)
+    called = {}
+
+    async def sync(video_id, limit, cursor, db):
+        called.update(video_id=video_id, limit=limit, cursor=cursor, session=db)
+        return {"video_id": video_id, "analysis": {"status": "SUCCESS"}}
+
+    monkeypatch.setattr(main, "sync_douyin_comments", sync)
+    result = await main.scan_video(comment.video_id, db)
+
+    assert result["video_id"] == comment.video_id
+    assert called == {"video_id": comment.video_id, "limit": None, "cursor": None, "session": db}
+
+
+def test_lead_follow_task_and_note_are_durable():
+    from app import main
+    from app.main import FollowTaskCreate, FollowTaskUpdate, LeadStatusUpdate
+    from app.models import FollowTask
+
+    db = _reply_test_session()
+    comment = _reply_test_comment(db)
+    lead = Lead(project_id=comment.project_id, platform="douyin", platform_user_id="user-follow", nickname="待跟进客户")
+    db.add(lead)
+    db.commit()
+    db.refresh(lead)
+
+    updated = main.update_lead(lead.id, LeadStatusUpdate(follow_note="先确认面积和预算"), db)
+    follow_task = main.create_follow_task(
+        lead.id,
+        FollowTaskCreate(content="明天 10 点跟进报价", deadline=datetime(2026, 9, 18, 2, 0)),
+        db,
+    )
+    completed = main.update_follow_task(follow_task.id, FollowTaskUpdate(status="DONE"), db)
+
+    assert updated.follow_note == "先确认面积和预算"
+    assert completed.status == "DONE"
+    assert completed.completed_at is not None
+    assert db.scalar(select(FollowTask).where(FollowTask.lead_id == lead.id)).id == follow_task.id
 
 
 @pytest.mark.asyncio

@@ -28,6 +28,7 @@ class Project(Base):
     knowledge_entries: Mapped[list["KnowledgeEntry"]] = relationship(back_populates="project", cascade="all, delete-orphan")
     comment_replies: Mapped[list["CommentReply"]] = relationship(back_populates="project", cascade="all, delete-orphan")
     reply_policy: Mapped["ReplyPolicy | None"] = relationship(back_populates="project", uselist=False, cascade="all, delete-orphan")
+    browser_sessions: Mapped[list["BrowserSession"]] = relationship(back_populates="project", cascade="all, delete-orphan")
 
 
 class ScanSchedule(Base):
@@ -263,6 +264,33 @@ class BrowserProfile(Base):
     account: Mapped[DouyinAccount] = relationship(back_populates="browser_profiles")
 
 
+class BrowserSession(Base):
+    """Durable status for a project-scoped browser usage record.
+
+    The first version may share one authenticated Chromium profile across
+    projects.  ``project_id`` is nullable for that legacy account-level
+    session; project-scoped sessions can be recorded without storing cookies
+    or other credentials.
+    """
+
+    __tablename__ = "browser_sessions"
+    __table_args__ = (
+        UniqueConstraint("project_id", "profile_path", name="uq_browser_session_project_profile"),
+        Index("ix_browser_sessions_project_status", "project_id", "status"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    project_id: Mapped[int | None] = mapped_column(ForeignKey("projects.id"), index=True, nullable=True)
+    profile_path: Mapped[str] = mapped_column(String(500))
+    status: Mapped[str] = mapped_column(String(30), default="LOGIN_REQUIRED", index=True)
+    last_check_time: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    last_error: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now_utc)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=now_utc, onupdate=now_utc)
+
+    project: Mapped[Project | None] = relationship(back_populates="browser_sessions")
+
+
 class Lead(Base):
     __tablename__ = "leads"
     __table_args__ = (Index("ix_leads_project_score", "project_id", "lead_score"),)
@@ -291,6 +319,66 @@ class Lead(Base):
     first_seen_at: Mapped[datetime] = mapped_column(DateTime, default=now_utc)
     last_seen_at: Mapped[datetime] = mapped_column(DateTime, default=now_utc)
     persona_advice: Mapped[dict] = mapped_column(JSON, default=dict)
+    follow_note: Mapped[str] = mapped_column(Text, default="")
+    follow_tasks: Mapped[list["FollowTask"]] = relationship(back_populates="lead", cascade="all, delete-orphan")
+
+
+class FollowTask(Base):
+    """A human-owned reminder attached to a lead.
+
+    The scheduler only stores the reminder. It never sends a message or
+    performs an automated platform action.
+    """
+
+    __tablename__ = "follow_tasks"
+    __table_args__ = (Index("ix_follow_tasks_project_status_deadline", "project_id", "status", "deadline"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    lead_id: Mapped[int] = mapped_column(ForeignKey("leads.id"), index=True)
+    project_id: Mapped[int] = mapped_column(ForeignKey("projects.id"), index=True)
+    content: Mapped[str] = mapped_column(Text)
+    deadline: Mapped[datetime] = mapped_column(DateTime, index=True)
+    status: Mapped[str] = mapped_column(String(20), default="PENDING", index=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # The first overdue transition and reminder delivery are durable so a
+    # scheduler restart cannot emit the same in-app reminder again.
+    overdue_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
+    reminded_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
+    reminder_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now_utc)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=now_utc, onupdate=now_utc)
+
+    lead: Mapped[Lead] = relationship(back_populates="follow_tasks")
+    reminders: Mapped[list["NotificationEvent"]] = relationship(back_populates="follow_task", cascade="all, delete-orphan")
+
+
+class NotificationEvent(Base):
+    """A durable in-app notification emitted by a follow-task transition.
+
+    ``follow_task_id`` + ``event_type`` is the idempotency key.  The database
+    constraint is intentional: a second scheduler process cannot create a
+    duplicate overdue notification for the same task.
+    """
+
+    __tablename__ = "notification_events"
+    __table_args__ = (
+        UniqueConstraint("follow_task_id", "event_type", name="uq_notification_event_follow_task_type"),
+        Index("ix_notification_events_project_created", "project_id", "created_at"),
+        Index("ix_notification_events_project_read", "project_id", "read_at"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    project_id: Mapped[int] = mapped_column(ForeignKey("projects.id"), index=True)
+    lead_id: Mapped[int] = mapped_column(ForeignKey("leads.id"), index=True)
+    follow_task_id: Mapped[int] = mapped_column(ForeignKey("follow_tasks.id"), index=True)
+    event_type: Mapped[str] = mapped_column(String(80), nullable=False)
+    title: Mapped[str] = mapped_column(String(200), nullable=False)
+    message: Mapped[str] = mapped_column(Text, nullable=False)
+    payload: Mapped[dict] = mapped_column(JSON, default=dict)
+    read_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now_utc)
+
+    follow_task: Mapped[FollowTask] = relationship(back_populates="reminders")
 
 
 class LeadComment(Base):

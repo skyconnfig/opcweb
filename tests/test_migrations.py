@@ -39,6 +39,7 @@ def test_fresh_sqlite_upgrade_reaches_current_head(tmp_path):
         agent_run_columns = {row[1] for row in connection.execute("PRAGMA table_info(agent_runs)")}
         lead_columns = {row[1] for row in connection.execute("PRAGMA table_info(leads)")}
         reply_columns = {row[1] for row in connection.execute("PRAGMA table_info(comment_replies)")}
+        follow_task_columns = {row[1] for row in connection.execute("PRAGMA table_info(follow_tasks)")}
         tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
 
     assert revision == _current_head()
@@ -47,8 +48,10 @@ def test_fresh_sqlite_upgrade_reaches_current_head(tmp_path):
     assert "task_id" in agent_run_columns
     assert "task_artifacts" in tables
     assert "comment_url" in comment_columns
-    assert {"confidence", "time_requirement"} <= lead_columns
-    assert {"knowledge_entries", "comment_replies", "browser_profiles"} <= tables
+    assert {"confidence", "time_requirement", "follow_note"} <= lead_columns
+    assert {"knowledge_entries", "comment_replies", "browser_profiles", "browser_sessions", "follow_tasks"} <= tables
+    assert {"overdue_at", "reminded_at", "reminder_count"} <= follow_task_columns
+    assert "notification_events" in tables
     assert {"sending_started_at", "send_lease_expires_at", "platform_reply_id", "verification_attempt_count"} <= reply_columns
 
 
@@ -108,8 +111,12 @@ def test_legacy_sqlite_upgrade_adds_reply_recovery_columns(tmp_path):
     with sqlite3.connect(database) as connection:
         reply_columns = {row[1] for row in connection.execute("PRAGMA table_info(comment_replies)")}
         comment_columns = {row[1] for row in connection.execute("PRAGMA table_info(comments)")}
+        follow_task_columns = {row[1] for row in connection.execute("PRAGMA table_info(follow_tasks)")}
+        tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         revision = connection.execute("SELECT version_num FROM alembic_version").fetchone()[0]
 
     assert revision == _current_head()
     assert "comment_url" in comment_columns
     assert {"sending_started_at", "send_lease_expires_at", "verification_error_message"} <= reply_columns
+    assert {"overdue_at", "reminded_at", "reminder_count"} <= follow_task_columns
+    assert "notification_events" in tables

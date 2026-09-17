@@ -17,6 +17,10 @@ from app.models import Comment, CommentReply, Lead, ReplyPolicy, now_utc
 
 
 _SENT_STATUSES = ("SENDING", "SENT", "SENT_UNVERIFIED", "VERIFIED")
+# Only identities obtained from a platform field or a real comment URL are
+# safe write targets.  A DOM fingerprint is useful for deduplication and
+# review, but it is not an address that can safely receive an external reply.
+_REPLYABLE_COMMENT_ID_SOURCES = frozenset({"platform_field", "dom_attribute", "url"})
 DEFAULT_SENDING_LEASE_SECONDS = 5 * 60
 
 
@@ -140,6 +144,12 @@ def enforce_send_policy(
     lead: Lead | None = None,
     automatic: bool = False,
 ) -> ReplyPolicy:
+    id_source = str(comment.id_source or "").strip().lower()
+    if id_source not in _REPLYABLE_COMMENT_ID_SOURCES:
+        raise _policy_error(
+            "COMMENT_ID_NOT_SENDABLE",
+            "该评论没有平台原生 ID 或真实评论 URL，系统禁止向不确定目标发送回复",
+        )
     policy = policy_for(db, comment.project_id)
     if not policy.enabled:
         raise _policy_error("REPLY_POLICY_DISABLED", "当前项目的回复策略已禁用")

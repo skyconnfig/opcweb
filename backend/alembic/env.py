@@ -53,7 +53,7 @@ def _ensure_legacy_columns(connection) -> None:
             "input_text": "TEXT DEFAULT ''",
             "error": "TEXT DEFAULT ''",
         },
-        "leads": {"time_requirement": "VARCHAR(120) DEFAULT ''", "confidence": "FLOAT DEFAULT 0"},
+        "leads": {"time_requirement": "VARCHAR(120) DEFAULT ''", "confidence": "FLOAT DEFAULT 0", "follow_note": "TEXT DEFAULT ''"},
         "scan_tasks": {"full": "BOOLEAN DEFAULT FALSE"},
         "comment_replies": {
             "sending_started_at": "DATETIME",
@@ -64,6 +64,11 @@ def _ensure_legacy_columns(connection) -> None:
             "verification_due_at": "DATETIME",
             "verification_error_code": "VARCHAR(80) DEFAULT ''",
             "verification_error_message": "TEXT DEFAULT ''",
+        },
+        "follow_tasks": {
+            "overdue_at": "DATETIME",
+            "reminded_at": "DATETIME",
+            "reminder_count": "INTEGER DEFAULT 0",
         },
     }
     inspector = inspect(connection)

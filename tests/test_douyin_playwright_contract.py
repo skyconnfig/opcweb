@@ -13,7 +13,7 @@ from app.providers.base import CommentDTO
 from app.core.config import PROJECT_ROOT
 from app.providers.douyin.browser_manager import DouyinBrowserManager
 from app.providers.douyin.dto import LoginStatus
-from app.providers.douyin.exceptions import DouyinVerificationRequired
+from app.providers.douyin.exceptions import DouyinReplyFailed, DouyinVerificationRequired
 from app.providers.douyin.playwright_provider import DouyinPlaywrightProvider
 
 
@@ -351,13 +351,29 @@ async def test_reply_flow_types_into_draft_editor_via_keyboard_not_fill():
 
     result = await provider.reply_comment(
         "https://www.douyin.com/video/real-video",
-        CommentDTO("douyin", "comment-42", "", "客户", "", "原始评论"),
+        CommentDTO("douyin", "comment-42", "", "客户", "", "原始评论", id_source="dom_attribute"),
         "请留下联系方式",
     )
 
     assert result.verified is True
     assert page.keyboard.typed == [("请留下联系方式", 40)]
     assert draft.fill_calls == []
+
+
+@pytest.mark.asyncio
+async def test_reply_flow_rejects_fingerprint_identity_before_opening_page():
+    browser = BrowserDouble(PageDouble())
+    browser.is_running = False
+    provider = DouyinPlaywrightProvider(browser_manager=browser)
+
+    with pytest.raises(DouyinReplyFailed, match="禁止发送"):
+        await provider.reply_comment(
+            "https://www.douyin.com/video/real-video",
+            CommentDTO("douyin", "synthetic-id", "", "客户", "", "原始评论", id_source="fingerprint"),
+            "请留下联系方式",
+        )
+
+    assert browser.is_running is False
 
 
 def test_sub_comments_capability_is_explicitly_unclaimed():

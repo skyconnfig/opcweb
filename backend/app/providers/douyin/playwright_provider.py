@@ -14,7 +14,7 @@ from typing import Any, Iterable
 from urllib.parse import quote, unquote, urljoin, urlparse
 
 from app.providers.base import BaseContentProvider, CommentDTO, CommentScanResult, ProviderHealth
-from app.providers.douyin.browser_manager import DouyinBrowserManager
+from app.providers.douyin.browser_manager import BrowserSessionManager, DouyinBrowserManager
 from app.providers.douyin.dto import (
     DouyinCommentDTO,
     DouyinVideoDTO,
@@ -67,7 +67,7 @@ class DouyinPlaywrightProvider(BaseContentProvider):
         headless: bool = False,
         proxy_server: str | None = None,
     ) -> None:
-        self.browser = browser_manager or DouyinBrowserManager(
+        self.browser = browser_manager or BrowserSessionManager(
             profile_dir=profile_dir,
             channel=browser_channel,
             headless=headless,
@@ -406,6 +406,12 @@ class DouyinPlaywrightProvider(BaseContentProvider):
         comment: CommentDTO,
         text: str,
     ) -> ReplyResult:
+        id_source = str(getattr(comment, "id_source", "") or "").strip().lower()
+        if id_source not in {"platform_field", "dom_attribute", "url"}:
+            raise DouyinReplyFailed(
+                "评论缺少平台原生 ID 或真实评论 URL，禁止发送到不确定目标",
+                detail={"comment_id": comment.comment_id, "id_source": id_source or "unknown"},
+            )
         text = text.strip()
         if not text:
             raise DouyinReplyFailed("回复内容不能为空")
