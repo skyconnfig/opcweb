@@ -264,20 +264,45 @@ class RadarService:
                                     db.commit()
                                     raise exc
                                 self._record_agent_run(db, project.id, "LeadJudgeAgent", self.judge_agent.prompt_version, {"project": project_data, "comment": comment_data}, judgment, task_id=task_id)
+                                detected_lead = None
                                 if judgment["is_lead"]:
-                                    lead = _upsert_lead(db, project.id, c, judgment, video.id, task_id=task_id)
+                                    detected_lead = _upsert_lead(db, project.id, c, judgment, video.id, task_id=task_id)
                                     leads_seen += 1
                                     await self._maybe_generate_reply_draft(
                                         db,
                                         project,
                                         video,
                                         c,
-                                        lead,
+                                        detected_lead,
                                         project_data,
                                         comment_data,
                                         task_id,
                                     )
                                 db.commit()
+                                await self.emit(
+                                    task_id,
+                                    project.id,
+                                    "comment.analyzed",
+                                    f"已完成评论意图判断：{c.nickname or '未知用户'}",
+                                    {
+                                        "comment_id": c.id,
+                                        "is_lead": bool(judgment["is_lead"]),
+                                        "lead_score": judgment.get("lead_score", 0),
+                                    },
+                                )
+                                if detected_lead is not None:
+                                    await self.emit(
+                                        task_id,
+                                        project.id,
+                                        "lead.detected",
+                                        f"发现潜客信号：{detected_lead.nickname or '未知用户'}",
+                                        {
+                                            "comment_id": c.id,
+                                            "lead_id": detected_lead.id,
+                                            "lead_score": detected_lead.lead_score,
+                                            "lead_level": detected_lead.lead_level,
+                                        },
+                                    )
                                 processed_comment_ids.add(c.id)
                                 # Keep the cursor that produced this page
                                 # until every item in the page is durable and
@@ -445,7 +470,7 @@ class RadarService:
             decision_data,
             task_id=task_id,
         )
-        if not decision.should_reply or not decision.reply_text.strip():
+        if not decision.should_reply and not decision.need_human_review:
             return
 
         reply_text = decision.reply_text.strip()
@@ -462,12 +487,24 @@ class RadarService:
         )
         db.add(reply)
         db.flush()
+        await self.emit(
+            task_id,
+            project.id,
+            "reply.generated",
+            "已生成 AI 回复草稿，等待人工审核",
+            {
+                "comment_id": comment.id,
+                "reply_id": reply.id,
+                "has_reply_text": bool(reply_text),
+                "need_human_review": decision.need_human_review,
+            },
+        )
 
         # ``auto_reply_enabled`` is an explicit user opt-in. Once enabled, a
         # safe ReplyAgent decision is sent through the same real Provider path
         # as a manual reply. Sensitive or uncertain decisions remain in the
         # review queue and never cause an external side effect.
-        if decision.need_human_review or decision.risk_flags:
+        if decision.need_human_review or decision.risk_flags or not reply_text:
             db.commit()
             await self.emit(task_id, project.id, "reply.waiting_review", "AI 回复因风险或不确定性进入人工审核", {"comment_id": comment.id, "reply_id": reply.id})
             return

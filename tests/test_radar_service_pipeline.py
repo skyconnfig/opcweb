@@ -10,7 +10,7 @@ from sqlalchemy.pool import StaticPool
 from app.agents.llm import BaseLLMProvider, LLMCall
 from app.agents.reply_agent import ReplyDecision
 from app.db import Base
-from app.models import AgentRun, Comment, CommentReply, Keyword, KnowledgeEntry, Lead, LeadComment, LeadEvent, Persona, Project, ReplyPolicy, ScanTask, TaskArtifact, TaskCheckpoint, TaskReport, TaskStep, Video
+from app.models import AgentRun, Comment, CommentReply, Keyword, KnowledgeEntry, Lead, LeadComment, LeadEvent, Persona, Project, ReplyPolicy, ScanTask, TaskArtifact, TaskCheckpoint, TaskEvent, TaskReport, TaskStep, Video
 from app.providers.base import BaseContentProvider, CommentDTO, CommentScanResult, ProviderHealth, VideoDTO
 from app.providers.douyin.dto import ReplyResult, ReplyStatus
 from app.services import radar_service
@@ -208,6 +208,59 @@ async def test_pipeline_persists_text_comments_judges_candidates_and_reports_rea
     assert report.metrics["s_leads"] == 0
     assert all(text in llm.users[-1] for text in ("长沙有没有？", "120平大概多少钱？", "年底准备装。"))
     assert "https://" not in llm.users[-1]
+
+
+@pytest.mark.asyncio
+async def test_pipeline_emits_analysis_and_lead_events_after_durable_commit(monkeypatch):
+    sessions = _session(monkeypatch)
+    task_id, project_id = _task(sessions)
+    provider = ScriptedProvider({None: CommentScanResult([_comment("c1", "user-1", "长沙装修大概多少钱？")], "partial", 1, None, False)})
+    events: list[tuple[str, dict]] = []
+
+    async def capture(_task_id, _project_id, event_type, _message, payload=None):
+        events.append((event_type, payload or {}))
+
+    service = _service(provider, RecordingTextLLM())
+    service.emit = capture
+    await service.run_task(task_id, full=True)
+
+    assert {event_type for event_type, _ in events} >= {"comment.analyzed", "lead.detected"}
+    analyzed = next(payload for event_type, payload in events if event_type == "comment.analyzed")
+    detected = next(payload for event_type, payload in events if event_type == "lead.detected")
+    assert analyzed["is_lead"] is True
+    assert detected["lead_id"] > 0
+    with sessions() as db:
+        persisted = db.scalars(select(TaskEvent).where(TaskEvent.task_id == task_id)).all()
+    # The test emitter intentionally replaces persistence; this assertion
+    # protects the event contract without coupling it to the event bus.
+    assert persisted == []
+
+
+@pytest.mark.asyncio
+async def test_auto_reply_knowledge_gap_stays_in_review_queue(monkeypatch):
+    sessions = _session(monkeypatch)
+    task_id, project_id = _task(sessions)
+    provider = ScriptedProvider({None: CommentScanResult([_comment("c1", "user-1", "长沙装修大概多少钱？")], "partial", 1, None, False)})
+    events: list[str] = []
+
+    async def capture(_task_id, _project_id, event_type, _message, payload=None):
+        events.append(event_type)
+
+    with sessions() as db:
+        db.add(ReplyPolicy(project_id=project_id, enabled=True, auto_reply_enabled=True, minimum_confidence=0.8, minimum_lead_score=70))
+        db.commit()
+
+    service = _service(provider, RecordingTextLLM())
+    service.emit = capture
+    await service.run_task(task_id, full=True)
+
+    with sessions() as db:
+        reply = db.scalar(select(CommentReply).where(CommentReply.project_id == project_id))
+    assert reply is not None
+    assert reply.status == "WAITING_REVIEW"
+    assert reply.reply_text == ""
+    assert "KNOWLEDGE_INSUFFICIENT" in reply.error_code
+    assert "reply.generated" in events
 
 
 @pytest.mark.asyncio

@@ -816,7 +816,14 @@ async def analyze_comment(comment_id: int, db: Session = Depends(get_db)):
 
 
 def _reply_payload(db: Session, comment: Comment, decision: dict, *, reply_source: str = "AI") -> CommentReply:
-    reply = CommentReply(project_id=comment.project_id, comment_id=comment.id, platform=comment.platform, reply_text=decision.get("reply_text", ""), reply_source=reply_source, status="WAITING_REVIEW" if decision.get("should_reply") and decision.get("reply_text") else "SKIPPED", generated_at=now_utc(), error_message=decision.get("reason", ""), error_code=",".join(decision.get("risk_flags", [])))
+    # A blocked decision with ``need_human_review=true`` is still an actionable
+    # review item.  Keeping it as SKIPPED makes the UI lose the only place
+    # where an operator can supply a manual, verified answer when the model
+    # has no safe text to suggest (for example, missing knowledge).
+    needs_review = bool(decision.get("need_human_review"))
+    has_reply = bool(str(decision.get("reply_text", "")).strip())
+    status = "WAITING_REVIEW" if (has_reply or needs_review) else "SKIPPED"
+    reply = CommentReply(project_id=comment.project_id, comment_id=comment.id, platform=comment.platform, reply_text=decision.get("reply_text", ""), reply_source=reply_source, status=status, generated_at=now_utc(), error_message=decision.get("reason", ""), error_code=",".join(decision.get("risk_flags", [])))
     db.add(reply)
     return reply
 
