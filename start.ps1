@@ -25,8 +25,50 @@ function Test-ProjectPort([int] $port) {
   throw "端口 $port 已被其他进程占用，请先处理端口占用后再启动。"
 }
 
-# A second invocation should be harmless when both project services are alive.
-if ((Test-ProjectPort 8689) -and (Test-ProjectPort 5173)) {
+function Test-WebStaticAssets {
+  try {
+    $html = (Invoke-WebRequest -UseBasicParsing -Uri 'http://127.0.0.1:5173/' -TimeoutSec 5).Content
+    $assetUrls = [regex]::Matches($html, '(?:src|href)="([^"]*?/_next/static/[^"]+)"') |
+      ForEach-Object { $_.Groups[1].Value } |
+      Where-Object { $_ } |
+      Select-Object -Unique
+    if (-not $assetUrls) { return $false }
+    foreach ($assetUrl in $assetUrls) {
+      $url = if ($assetUrl.StartsWith('/')) { 'http://127.0.0.1:5173' + $assetUrl } else { $assetUrl }
+      $asset = Invoke-WebRequest -UseBasicParsing -Uri $url -TimeoutSec 5
+      $contentType = [string]$asset.Headers['Content-Type']
+      if ($asset.StatusCode -ne 200 -or $asset.Content.Length -lt 100 -or $contentType -match '(?i)text/html') { return $false }
+    }
+    return $true
+  } catch {
+    return $false
+  }
+}
+
+function Stop-ProjectWebProcesses {
+  $rootPattern = [regex]::Escape($root)
+  $projectWebProcesses = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
+    $commandLine = [string]$_.CommandLine
+    ($commandLine -match $rootPattern) -and
+      ($commandLine -match '(?i)(next[\\/]dist[\\/]server[\\/]lib[\\/]start-server\.js|next[\\/]dist[\\/]bin[\\/]next|npm(?:\.cmd)?\s+run\s+dev)')
+  })
+  foreach ($process in $projectWebProcesses | Sort-Object ProcessId -Descending) {
+    Stop-Process -Id $process.ProcessId -Force -ErrorAction SilentlyContinue
+  }
+  for ($attempt = 0; $attempt -lt 20; $attempt++) {
+    $listeners = @(Get-NetTCPConnection -LocalPort 5173 -State Listen -ErrorAction SilentlyContinue)
+    if (-not $listeners) { return }
+    Start-Sleep -Milliseconds 250
+  }
+  throw 'Web 进程未能在预期时间内退出，请检查 5173 端口后重试。'
+}
+
+# A production build can invalidate the .next assets used by an existing dev
+# server. Check every local CSS/JS asset before treating the Web process as ready.
+$apiAlive = Test-ProjectPort 8689
+$webAlive = Test-ProjectPort 5173
+$webAssetsHealthy = $webAlive -and (Test-WebStaticAssets)
+if ($apiAlive -and $webAssetsHealthy) {
   Write-Host 'AI Lead Radar 已在运行：API 8689，Web 5173。'
   exit 0
 }
@@ -51,6 +93,10 @@ if (-not (Test-Path -LiteralPath $alembic)) { throw 'Alembic was not installed.'
 $browserRoot = Join-Path $env:USERPROFILE 'AppData\Local\ms-playwright'
 if (-not (Get-ChildItem -LiteralPath $browserRoot -Directory -Filter 'chromium-*' -ErrorAction SilentlyContinue)) { throw 'Playwright Chromium is missing. Run .venv\Scripts\playwright.exe install chromium.' }
 if (-not (Test-Path -LiteralPath 'web\node_modules')) { Set-Location web; npm install; Set-Location $root }
+$webNeedsRestart = $webAlive -and -not $webAssetsHealthy
+if ($webNeedsRestart) {
+  Stop-ProjectWebProcesses
+}
 $reloadArg = if ($reload) { ' --reload' } else { '' }
 if (-not (Test-ProjectPort 8689)) {
   $serverCommand = "Set-Location '$root'; & '$python' -m uvicorn app.main:app --app-dir backend$reloadArg --loop app.uvicorn_loop:create_loop --port 8689"

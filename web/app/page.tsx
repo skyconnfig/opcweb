@@ -5,6 +5,7 @@ import type { LucideIcon } from 'lucide-react'
 import { Activity, ArrowDownRight, ArrowUpRight, BarChart3, Bot, Check, ChevronDown, ChevronRight, CircleHelp, Clock3, Database, FileText, Gauge, LayoutDashboard, ListChecks, LoaderCircle, Menu, MessageCircle, Moon, MoreHorizontal, PanelLeftClose, PanelLeftOpen, Pause, Play, Plus, Radar, RefreshCw, Search, Settings, SlidersHorizontal, Sparkles, Sun, Target, UserRound, Video, Wifi, X, Zap } from 'lucide-react'
 
 const API = ''
+const REQUEST_TIMEOUT_MS = 30_000
 const SCHEDULE_INTERVALS = Array.from({ length: 21 }, (_, index) => index + 10)
 type RecordShape = Record<string, any>
 type ViewKey = 'overview' | 'smart' | 'keywords' | 'videos' | 'comments' | 'leads' | 'replies' | 'knowledge' | 'persona' | 'agents' | 'tasks' | 'analytics' | 'providers' | 'douyin' | 'settings'
@@ -30,20 +31,36 @@ const navigation: Array<{ key: ViewKey; label: string; icon: LucideIcon; section
 async function request(path: string, options?: RequestInit) {
   const headers = new Headers(options?.headers)
   headers.set('Content-Type', 'application/json')
-  const response = await fetch(`${API}${path}`, { ...options, headers })
-  if (!response.ok) {
-    const body = await response.json().catch(() => ({}))
-    const detailValue = body?.detail
-    const detail = Array.isArray(detailValue)
-      ? detailValue.map((item: RecordShape) => `${Array.isArray(item.loc) ? item.loc.join('.') : '参数'}：${item.msg}`).join('；')
-      : typeof detailValue === 'string'
-        ? detailValue
-        : detailValue && typeof detailValue === 'object'
-          ? [detailValue.error_message, detailValue.message, detailValue.error_type, detailValue.url].filter(Boolean).join(' · ')
-          : ''
-    throw new Error([body?.message || body?.code || `请求失败 ${response.status}`, detail].filter(Boolean).join('：'))
+  const controller = new AbortController()
+  const callerSignal = options?.signal
+  const abortFromCaller = () => controller.abort()
+  if (callerSignal?.aborted) controller.abort()
+  else callerSignal?.addEventListener('abort', abortFromCaller, { once: true })
+  const timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS)
+  try {
+    const response = await fetch(`${API}${path}`, { ...options, headers, signal: controller.signal })
+    if (!response.ok) {
+      const body = await response.json().catch(() => ({}))
+      const detailValue = body?.detail
+      const detail = Array.isArray(detailValue)
+        ? detailValue.map((item: RecordShape) => `${Array.isArray(item.loc) ? item.loc.join('.') : '参数'}：${item.msg}`).join('；')
+        : typeof detailValue === 'string'
+          ? detailValue
+          : detailValue && typeof detailValue === 'object'
+            ? [detailValue.error_message, detailValue.message, detailValue.error_type, detailValue.url].filter(Boolean).join(' · ')
+            : ''
+      throw new Error([body?.message || body?.code || `请求失败 ${response.status}`, detail].filter(Boolean).join('：'))
+    }
+    return response.json()
+  } catch (error) {
+    if (error instanceof DOMException && error.name === 'AbortError') {
+      throw new Error(`本地 API 请求超时（${REQUEST_TIMEOUT_MS / 1000} 秒），请确认后端已启动。`)
+    }
+    throw error
+  } finally {
+    clearTimeout(timeoutId)
+    callerSignal?.removeEventListener('abort', abortFromCaller)
   }
-  return response.json()
 }
 
 async function requestWithRetry(path: string, options?: RequestInit, attempts = 3) {
