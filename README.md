@@ -166,7 +166,7 @@ LLM_MODEL=deepseek-chat
 5. 进入“任务中心 → 自动采集”，选择 10～30 分钟间隔并保存。
 6. 在“热门视频”“评论池”和“潜客池”检查结果，先人工审核，再生成和发送回复。
 
-登录态保存在 data/browser/douyin，服务重启后会复用。主 API 的 Playwright 浏览器与外部 douyin-comments-crawler 不应同时占用同一个 Chromium Profile；如需独立运行 crawler，请先关闭主 API 浏览器，或配置独立 Profile。
+旧项目的兼容登录态保存在 `data/browser/douyin`，服务重启后会复用；新建项目会登记独立的 `data/browser/projects/project-<id>` Profile，首次使用时需在该项目的可见浏览器中完成登录。系统通过 OS 级锁阻止多个进程同时占用同一个 Profile。主 API 的 Playwright 浏览器与外部 douyin-comments-crawler 不应同时占用同一个 Chromium Profile；如需独立运行 crawler，请先关闭主 API 浏览器，或配置独立 Profile。
 
 ## Docker 部署
 
