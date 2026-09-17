@@ -2,6 +2,7 @@ import asyncio
 import json
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Literal
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
@@ -209,6 +210,7 @@ class SettingsInput(BaseModel):
 
 _douyin_provider: DouyinPlaywrightProvider | None = None
 _crawler_provider: DouyinCommentsCrawlerExternalProvider | None = None
+_project_douyin_providers: dict[str, DouyinPlaywrightProvider] = {}
 _reply_send_locks: dict[int, asyncio.Lock] = {}
 
 
@@ -243,6 +245,82 @@ def active_provider(db: Session | None = None):
     if provider is None:
         raise HTTPException(503, {"code": "PROVIDER_NOT_CONFIGURED", "message": f"不支持的数据源配置: {selected}", "detail": {"allowed": sorted(aliases)}})
     return provider
+
+
+def project_profile_path(project_id: int, configured_profile: str) -> Path:
+    """Return the stable on-disk Chromium Profile path for one project."""
+
+    base = Path(configured_profile or "data/browser/douyin")
+    if not base.is_absolute():
+        base = Path(__file__).resolve().parents[2] / base
+    base = base.resolve()
+    return (base.parent / "projects" / f"project-{project_id}").resolve()
+
+
+def _configured_profile_path(settings) -> Path:
+    configured = Path(settings.douyin_profile_dir or "data/browser/douyin")
+    if not configured.is_absolute():
+        configured = Path(__file__).resolve().parents[2] / configured
+    return configured.resolve()
+
+
+def _legacy_profile_project_id(db: Session, settings) -> int | None:
+    """Find the existing project that owns the pre-isolation Profile.
+
+    Older versions recorded one account-level session with a nullable
+    ``project_id``.  Adopt it only for the most recently updated existing
+    project; newly created projects are mapped explicitly to their own path.
+    This preserves the current login without silently sharing it with future
+    projects.
+    """
+
+    legacy_path = str(_configured_profile_path(settings))
+    legacy = db.scalar(
+        select(BrowserSession).where(
+            BrowserSession.project_id.is_(None),
+            BrowserSession.profile_path == legacy_path,
+        )
+    )
+    if legacy is None:
+        return None
+    return db.scalar(select(Project.id).order_by(desc(Project.updated_at), desc(Project.id)).limit(1))
+
+
+def _ensure_project_browser_session(db: Session, project_id: int, settings, *, new_project: bool = False) -> BrowserSession:
+    session = db.scalar(select(BrowserSession).where(BrowserSession.project_id == project_id))
+    if session is not None:
+        return session
+    configured_path = _configured_profile_path(settings)
+    use_legacy = not new_project and _legacy_profile_project_id(db, settings) == project_id
+    profile_path = configured_path if use_legacy else project_profile_path(project_id, str(configured_path))
+    session = BrowserSession(project_id=project_id, profile_path=str(profile_path), status="LOGIN_REQUIRED")
+    db.add(session)
+    db.flush()
+    return session
+
+
+def active_provider_for_project(db: Session, project_id: int | None):
+    """Resolve an active provider without breaking legacy test adapters."""
+
+    provider = active_provider(db)
+    if project_id is None or not isinstance(provider, DouyinPlaywrightProvider):
+        return provider
+    settings = get_settings()
+    session = _ensure_project_browser_session(db, project_id, settings)
+    profile_path = Path(session.profile_path).resolve()
+    if profile_path == provider.browser.profile_dir:
+        return provider
+    cache_key = f"{profile_path}|{provider.browser.channel}|{provider.browser.headless}|{provider.browser.proxy_server}"
+    cached = _project_douyin_providers.get(cache_key)
+    if cached is None:
+        cached = DouyinPlaywrightProvider(
+            profile_dir=str(profile_path),
+            browser_channel=settings.douyin_browser_channel,
+            headless=settings.douyin_headless,
+            proxy_server=settings.douyin_proxy_server,
+        )
+        _project_douyin_providers[cache_key] = cached
+    return cached
 
 
 def _require_playwright_provider(provider: BaseContentProvider) -> DouyinPlaywrightProvider:
@@ -362,7 +440,8 @@ async def _task_worker(stop: asyncio.Event):
                 if claimed:
                     task_id, full = claimed
                     try:
-                        provider = active_provider(db)
+                        task = db.get(ScanTask, task_id)
+                        provider = active_provider_for_project(db, task.project_id if task else None)
                         llm = active_llm(db)
                     except Exception as exc:
                         # A task is already durable and marked running when
@@ -464,6 +543,8 @@ async def lifespan(app: FastAPI):
         await worker
         if _douyin_provider is not None:
             await _douyin_provider.close()
+        for provider in list(_project_douyin_providers.values()):
+            await provider.close()
 
 
 app = FastAPI(title="AI 截流雷达", version="0.1.0", lifespan=lifespan)
@@ -542,47 +623,55 @@ def ready(db: Session = Depends(get_db)):
 
 
 @app.get("/api/douyin/status")
-async def douyin_status(db: Session = Depends(get_db)):
-    provider = _require_playwright_provider(active_provider(db))
+async def douyin_status(project_id: int | None = Query(None), db: Session = Depends(get_db)):
+    if project_id is not None and db.get(Project, project_id) is None:
+        raise HTTPException(404, "项目不存在")
+    provider = _require_playwright_provider(active_provider_for_project(db, project_id))
     # Re-open the persistent context after an API restart so the saved
     # Chromium session is checked instead of reporting NOT_STARTED and
     # sending the user through login again.
     await provider.ensure_browser_started()
     status = await provider.get_login_status()
     identity = await provider.get_account_identity() if status is LoginStatus.LOGGED_IN else {}
-    account = _sync_douyin_account(db, provider, status, identity)
-    session = _get_browser_session(db, provider)
+    account = _sync_douyin_account(db, provider, status, identity, project_id=project_id)
+    session = _get_browser_session(db, provider, project_id)
     return {"provider": provider.name, "browser": "running" if provider.browser.is_running else "stopped", "login": status.value, "profile_dir": str(provider.browser.profile_dir), "headless": provider.browser.headless, "account_id": account.id, "account_name": account.name, "account_nickname": account.nickname, "douyin_user_id": account.douyin_user_id, "last_login_at": account.last_login_at, "account_status": account.status, "last_checked_at": account.last_checked_at, "browser_session_id": session.id if session else None, "browser_session_status": session.status if session else None, "browser_session_last_check_time": session.last_check_time if session else None, "browser_session_last_error": session.last_error if session else ""}
 
 
 @app.post("/api/douyin/browser/start")
-async def douyin_browser_start(db: Session = Depends(get_db)):
-    provider = _require_playwright_provider(active_provider(db))
+async def douyin_browser_start(project_id: int | None = Query(None), db: Session = Depends(get_db)):
+    if project_id is not None and db.get(Project, project_id) is None:
+        raise HTTPException(404, "项目不存在")
+    provider = _require_playwright_provider(active_provider_for_project(db, project_id))
     await provider.start_browser()
     status = await provider.get_login_status()
     identity = await provider.get_account_identity() if status is LoginStatus.LOGGED_IN else {}
-    account = _sync_douyin_account(db, provider, status, identity)
-    session = _get_browser_session(db, provider)
+    account = _sync_douyin_account(db, provider, status, identity, project_id=project_id)
+    session = _get_browser_session(db, provider, project_id)
     return {"provider": provider.name, "browser": "running", "login": status.value, "account_id": account.id, "account_name": account.name, "account_nickname": account.nickname, "douyin_user_id": account.douyin_user_id, "last_login_at": account.last_login_at, "account_status": account.status, "browser_session_id": session.id if session else None, "browser_session_status": session.status if session else None, "message": "请在打开的真实抖音浏览器中完成扫码登录" if status is not LoginStatus.LOGGED_IN else "抖音登录状态已确认"}
 
 
 @app.post("/api/douyin/browser/close")
-async def douyin_browser_close(db: Session = Depends(get_db)):
-    provider = _require_playwright_provider(active_provider(db))
+async def douyin_browser_close(project_id: int | None = Query(None), db: Session = Depends(get_db)):
+    if project_id is not None and db.get(Project, project_id) is None:
+        raise HTTPException(404, "项目不存在")
+    provider = _require_playwright_provider(active_provider_for_project(db, project_id))
     await provider.close_browser()
-    account = _sync_douyin_account(db, provider, None)
-    session = _get_browser_session(db, provider)
+    account = _sync_douyin_account(db, provider, None, project_id=project_id)
+    session = _get_browser_session(db, provider, project_id)
     return {"provider": provider.name, "browser": "stopped", "login": LoginStatus.ERROR.value, "account_id": account.id, "account_name": account.name, "account_status": account.status, "browser_session_id": session.id if session else None, "browser_session_status": session.status if session else None}
 
 
 @app.get("/api/douyin/login/status")
-async def douyin_login_status(db: Session = Depends(get_db)):
-    provider = _require_playwright_provider(active_provider(db))
+async def douyin_login_status(project_id: int | None = Query(None), db: Session = Depends(get_db)):
+    if project_id is not None and db.get(Project, project_id) is None:
+        raise HTTPException(404, "项目不存在")
+    provider = _require_playwright_provider(active_provider_for_project(db, project_id))
     await provider.ensure_browser_started()
     status = await provider.get_login_status()
     identity = await provider.get_account_identity() if status is LoginStatus.LOGGED_IN else {}
-    account = _sync_douyin_account(db, provider, status, identity)
-    session = _get_browser_session(db, provider)
+    account = _sync_douyin_account(db, provider, status, identity, project_id=project_id)
+    session = _get_browser_session(db, provider, project_id)
     return {"status": status.value, "browser": "running" if provider.browser.is_running else "stopped", "account_id": account.id, "account_name": account.name, "account_nickname": account.nickname, "douyin_user_id": account.douyin_user_id, "last_login_at": account.last_login_at, "last_checked_at": account.last_checked_at, "account_status": account.status, "browser_session_id": session.id if session else None, "browser_session_status": session.status if session else None}
 
 
@@ -597,7 +686,7 @@ async def douyin_search(payload: DouyinSearchIn, db: Session = Depends(get_db)):
     project = db.get(Project, payload.project_id)
     if not project:
         raise HTTPException(404, "项目不存在")
-    provider = _require_provider_capability(active_provider(db), "keyword_search", "真实视频搜索")
+    provider = _require_provider_capability(active_provider_for_project(db, project.id), "keyword_search", "真实视频搜索")
     videos = await provider.search_videos(payload.keyword, payload.limit)
     radar = RadarAgent()
     output = []
@@ -624,7 +713,7 @@ async def sync_douyin_comments(video_id: int, limit: int | None = Query(None, ge
     video = db.get(Video, video_id)
     if not video:
         raise HTTPException(404, "视频不存在")
-    provider = _require_provider_capability(active_provider(db), "comments", "公开评论采集")
+    provider = _require_provider_capability(active_provider_for_project(db, video.project_id), "comments", "公开评论采集")
     result = await provider.get_comments(video.platform_video_id, cursor=cursor)
     created = 0
     updated = 0
@@ -675,6 +764,10 @@ def list_projects(db: Session = Depends(get_db)):
 def create_project(payload: ProjectCreate, db: Session = Depends(get_db)):
     project = Project(**payload.model_dump(), status="draft")
     db.add(project)
+    db.flush()
+    # New projects never inherit the legacy account-level Profile.  The
+    # directory is created lazily by Playwright when the project is started.
+    _ensure_project_browser_session(db, project.id, get_settings(), new_project=True)
     db.commit()
     db.refresh(project)
     return project
@@ -692,12 +785,14 @@ def get_project(project_id: int, db: Session = Depends(get_db)):
 async def smart_mode(project_id: int, db: Session = Depends(get_db)):
     if not db.get(Project, project_id):
         raise HTTPException(404, "项目不存在")
-    return await RadarService(active_provider(db), active_llm(db)).analyze_project(project_id)
+    return await RadarService(active_provider_for_project(db, project_id), active_llm(db)).analyze_project(project_id)
 
 
 @app.post("/api/projects/{project_id}/scan")
 async def start_project_scan(project_id: int, full: bool = False, db: Session = Depends(get_db)):
-    provider = active_provider(db)
+    if not db.get(Project, project_id):
+        raise HTTPException(404, "项目不存在")
+    provider = active_provider_for_project(db, project_id)
     _require_provider_capability(provider, "keyword_search", "真实视频搜索")
     _require_provider_capability(provider, "comments", "公开评论采集")
     try:
@@ -1060,7 +1155,7 @@ async def _send_comment_reply_locked(comment_id: int, payload: ReplyActionIn, db
     # second real platform send.
     recover_stale_sending(db, comment_id=comment.id)
     project, video, lead, _ = _comment_context(db, comment)
-    provider = active_provider(db)
+    provider = active_provider_for_project(db, comment.project_id)
     capabilities = getattr(provider, "capabilities", None)
     if not hasattr(provider, "reply_comment") or (capabilities is not None and not capabilities.get("reply_comment", False)):
         raise HTTPException(400, "当前 Provider 仅支持采集，不支持真实回复；请激活 Douyin Playwright")
@@ -1224,7 +1319,7 @@ async def verify_reply(reply_id: int, db: Session = Depends(get_db)):
     video = db.get(Video, comment.video_id)
     if not video:
         raise HTTPException(409, "回复关联的视频记录不存在")
-    provider = active_provider(db)
+    provider = active_provider_for_project(db, comment.project_id)
     if not hasattr(provider, "verify_reply"):
         raise HTTPException(400, "当前 Provider 不支持真实回复核验")
     target = DouyinCommentDTO(

@@ -219,7 +219,7 @@ function ViewRouter({ view, project, navigate, providerContext, onProjectCreated
   if (view === 'tasks') return <TasksView project={project} providerContext={providerContext} />
   if (view === 'analytics') return <AnalyticsView project={project} />
   if (view === 'providers') return <ProvidersRegistryView onProviderChanged={providerContext?.retry} />
-  if (view === 'douyin') return <DouyinConnectionView providerContext={providerContext} />
+  if (view === 'douyin') return <DouyinConnectionView project={project} providerContext={providerContext} />
   if (view === 'settings') return <SettingsViewLive project={project} />
   return <DashboardLive project={project} navigate={navigate} />
 }
@@ -954,7 +954,7 @@ function ProvidersRegistryView({ onProviderChanged }: RecordShape) {
   return <div className="page"><PageHeader eyebrow="PROVIDER REGISTRY" title="数据源" description="当前版本启用抖音 Playwright；采集来自真实 DOM 和公开文本。" actions={<Button icon={RefreshCw} onClick={() => void refresh()} disabled={busy}>{busy ? '检查中…' : '刷新状态'}</Button>} />{error && <div className="error-banner" role="alert"><X size={15} /><span>{error}</span><Button onClick={() => void refresh()}>重试</Button></div>}{notice && <div className="success-banner" role="status"><Check size={15} /><span>{notice}</span><button onClick={() => setNotice('')} aria-label="关闭提示">关闭</button></div>}{loading ? <div className="panel form-loading"><LoaderCircle size={18} className="loading-spin" /><span>正在读取数据源状态…</span></div> : <>{items.length ? <div className="provider-grid">{items.map((provider: RecordShape, index) => { const active = isActive(provider); return <section className="panel provider-card" key={provider.id || provider.name}><div className="provider-card-head"><span className={`provider-mark provider-${index}`}><Database size={18} /></span><div className="toolbar-actions"><StatusPill tone={active ? 'accent' : provider.status === 'connected' ? 'green' : 'neutral'}>{active ? '当前使用' : provider.status || 'unknown'}</StatusPill>{active && provider.status && <StatusPill tone={provider.status === 'connected' ? 'green' : 'neutral'}>{provider.status}</StatusPill>}</div></div><h2>{provider.name}</h2><p>{provider.note}</p>{provider.endpoint && <code>{provider.endpoint}</code>}<div className="capability-list">{Object.entries(provider.capabilities || {}).map(([key, value]) => <span className={value ? 'on' : ''} key={key}><i />{key.replace(/_/g, ' ')}</span>)}</div><div className="provider-actions"><Button variant="secondary" icon={Wifi} onClick={() => void health(provider)} disabled={busy}>{busy ? '检查中…' : '检查真实连接'}</Button>{!active && <Button variant="accent" onClick={() => void activate(provider)} disabled={busy}>切换为当前源</Button>}</div></section>})}</div> : <EmptyState icon={Database} text="暂无已注册数据源。" action={{ label: '重试', onClick: () => void refresh() }} />}</>}<div className="compliance-bar"><Check size={15} /><span><b>边界声明：</b>抖音采集仍不使用视觉模型；系统不接入视觉模型，不做 OCR、视频帧分析、图片理解或风控绕过。</span></div></div>
 }
 
-function DouyinConnectionView({ providerContext }: RecordShape) {
+function DouyinConnectionView({ project, providerContext }: RecordShape) {
   const [state, setState] = useState<RecordShape>({ browser: 'stopped', login: 'NOT_STARTED' })
   const [error, setError] = useState('')
   const [checking, setChecking] = useState(true)
@@ -963,24 +963,25 @@ function DouyinConnectionView({ providerContext }: RecordShape) {
   const loginRequirements = [{ key: 'login', label: '真实浏览器登录' }]
   const canLogin = providerSupports(providerContext, 'login')
   const loginCapabilityMessage = providerCapabilityMessage(providerContext, loginRequirements)
+  const projectQuery = project?.id ? `?project_id=${encodeURIComponent(String(project.id))}` : ''
   const refresh = async () => {
     if (statusCheckInFlight.current) return
     statusCheckInFlight.current = true
     const capabilityMessage = providerCapabilityMessage(providerContext, loginRequirements)
     if (capabilityMessage) { setError(capabilityMessage); setChecking(false); statusCheckInFlight.current = false; return }
     setChecking(true)
-    try { setState(await requestWithRetry('/api/douyin/status')); setStatusLoaded(true); setError('') }
+    try { setState(await requestWithRetry(`/api/douyin/status${projectQuery}`)); setStatusLoaded(true); setError('') }
     catch (err: any) { setError(err.message) }
     finally { setChecking(false); statusCheckInFlight.current = false }
   }
-  useEffect(() => { void refresh() }, [providerContext?.loading, providerContext?.name, providerContext?.error])
+  useEffect(() => { void refresh() }, [providerContext?.loading, providerContext?.name, providerContext?.error, projectQuery])
   useEffect(() => {
     if (!canLogin) return
     const intervalId = window.setInterval(() => { void refresh() }, 10000)
     return () => window.clearInterval(intervalId)
-  }, [canLogin, providerContext?.name])
-  const start = async () => { if (statusCheckInFlight.current) return; if (!canLogin) { setError(loginCapabilityMessage); return } statusCheckInFlight.current = true; setChecking(true); try { setState(await request('/api/douyin/browser/start', { method: 'POST' })); setStatusLoaded(true); setError('') } catch (err: any) { setError(err.message) } finally { setChecking(false); statusCheckInFlight.current = false } }
-  const close = async () => { if (statusCheckInFlight.current) return; if (!canLogin) { setError(loginCapabilityMessage); return } statusCheckInFlight.current = true; setChecking(true); try { setState(await request('/api/douyin/browser/close', { method: 'POST' })); setStatusLoaded(true); setError('') } catch (err: any) { setError(err.message) } finally { setChecking(false); statusCheckInFlight.current = false } }
+  }, [canLogin, providerContext?.name, projectQuery])
+  const start = async () => { if (statusCheckInFlight.current) return; if (!canLogin) { setError(loginCapabilityMessage); return } statusCheckInFlight.current = true; setChecking(true); try { setState(await request(`/api/douyin/browser/start${projectQuery}`, { method: 'POST' })); setStatusLoaded(true); setError('') } catch (err: any) { setError(err.message) } finally { setChecking(false); statusCheckInFlight.current = false } }
+  const close = async () => { if (statusCheckInFlight.current) return; if (!canLogin) { setError(loginCapabilityMessage); return } statusCheckInFlight.current = true; setChecking(true); try { setState(await request(`/api/douyin/browser/close${projectQuery}`, { method: 'POST' })); setStatusLoaded(true); setError('') } catch (err: any) { setError(err.message) } finally { setChecking(false); statusCheckInFlight.current = false } }
   const loggedIn = state.login === 'LOGGED_IN'
   const needsVerification = state.login === 'VERIFICATION_REQUIRED'
   const statusUnavailable = !checking && !statusLoaded
