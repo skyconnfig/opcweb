@@ -63,14 +63,17 @@ class LeadJudgeAgent:
             raise LLMNotConfiguredError("LeadJudgeAgent 需要已配置的文本模型")
         prompt = "你是潜客判断 Agent。只分析文字评论、评论上下文、来源视频文字字段和公开互动数据，不使用任何画面。严格返回 JSON，并保留 is_lead、confidence、lead_score、lead_level、intent_level、need、location、budget、time_requirement、purchase_stage、pain_point、buying_signals、summary、reason、recommended_action、should_reply。"
         payload = json.dumps({"project": self._text_context(project), "comment": comment}, ensure_ascii=False)
-        last_error = None
+        last_error: LLMInvalidResponseError | None = None
         for _ in range(2):
             try:
                 result = await self.llm.structured_output(prompt, payload, {"type": "object"})
                 return self._normalize(result, project, comment)
-            except Exception as exc:
+            except LLMInvalidResponseError as exc:
                 last_error = exc
-        raise last_error
+                if self.llm.last_call is not None:
+                    self.llm.last_call.success = False
+                    self.llm.last_call.error = str(exc)
+        raise last_error or LLMInvalidResponseError("LeadJudgeAgent 输出无效")
 
     def _normalize(self, result: dict, project: dict, comment: dict) -> dict:
         required = ("is_lead", "confidence", "lead_score", "intent_level", "need", "location", "budget", "time_requirement", "purchase_stage", "pain_point", "buying_signals", "summary", "reason", "recommended_action", "should_reply")
