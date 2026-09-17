@@ -199,7 +199,7 @@ def active_llm(db: Session) -> OpenAICompatibleProvider:
     return OpenAICompatibleProvider(settings_with_db(settings, values))
 
 
-def _sync_douyin_account(db: Session, provider: DouyinPlaywrightProvider, status: LoginStatus | None):
+def _sync_douyin_account(db: Session, provider: DouyinPlaywrightProvider, status: LoginStatus | None, identity: dict[str, str] | None = None):
     """Persist browser/profile state without storing cookies or credentials."""
     account = db.scalar(select(DouyinAccount).where(DouyinAccount.name == "默认抖音账号"))
     if account is None:
@@ -212,6 +212,11 @@ def _sync_douyin_account(db: Session, provider: DouyinPlaywrightProvider, status
     account.last_checked_at = now_utc()
     if status is LoginStatus.LOGGED_IN and previous_status != LoginStatus.LOGGED_IN.value:
         account.last_login_at = account.last_checked_at
+    identity = identity or {}
+    if identity.get("nickname"):
+        account.nickname = identity["nickname"][:120]
+    if identity.get("douyin_user_id"):
+        account.douyin_user_id = identity["douyin_user_id"][:120]
 
     profile = db.scalar(
         select(BrowserProfile).where(
@@ -421,7 +426,8 @@ async def douyin_status(db: Session = Depends(get_db)):
     # sending the user through login again.
     await provider.ensure_browser_started()
     status = await provider.get_login_status()
-    account = _sync_douyin_account(db, provider, status)
+    identity = await provider.get_account_identity() if status is LoginStatus.LOGGED_IN else {}
+    account = _sync_douyin_account(db, provider, status, identity)
     return {"provider": provider.name, "browser": "running" if provider.browser.is_running else "stopped", "login": status.value, "profile_dir": str(provider.browser.profile_dir), "headless": provider.browser.headless, "account_id": account.id, "account_name": account.name, "account_nickname": account.nickname, "douyin_user_id": account.douyin_user_id, "last_login_at": account.last_login_at, "account_status": account.status, "last_checked_at": account.last_checked_at}
 
 
@@ -430,7 +436,8 @@ async def douyin_browser_start(db: Session = Depends(get_db)):
     provider = _require_playwright_provider(active_provider(db))
     await provider.start_browser()
     status = await provider.get_login_status()
-    account = _sync_douyin_account(db, provider, status)
+    identity = await provider.get_account_identity() if status is LoginStatus.LOGGED_IN else {}
+    account = _sync_douyin_account(db, provider, status, identity)
     return {"provider": provider.name, "browser": "running", "login": status.value, "account_id": account.id, "account_name": account.name, "account_nickname": account.nickname, "douyin_user_id": account.douyin_user_id, "last_login_at": account.last_login_at, "account_status": account.status, "message": "请在打开的真实抖音浏览器中完成扫码登录" if status is not LoginStatus.LOGGED_IN else "抖音登录状态已确认"}
 
 
@@ -447,8 +454,9 @@ async def douyin_login_status(db: Session = Depends(get_db)):
     provider = _require_playwright_provider(active_provider(db))
     await provider.ensure_browser_started()
     status = await provider.get_login_status()
-    account = _sync_douyin_account(db, provider, status)
-    return {"status": status.value, "browser": "running" if provider.browser.is_running else "stopped", "account_id": account.id, "account_status": account.status}
+    identity = await provider.get_account_identity() if status is LoginStatus.LOGGED_IN else {}
+    account = _sync_douyin_account(db, provider, status, identity)
+    return {"status": status.value, "browser": "running" if provider.browser.is_running else "stopped", "account_id": account.id, "account_name": account.name, "account_nickname": account.nickname, "douyin_user_id": account.douyin_user_id, "last_login_at": account.last_login_at, "last_checked_at": account.last_checked_at, "account_status": account.status}
 
 
 class DouyinSearchIn(BaseModel):

@@ -65,6 +65,18 @@ SELECTORS: dict[str, tuple[SelectorSpec, ...]] = {
         role("button", "用户菜单"),
         css('[data-e2e*="nav-user" i] a[href*="/user/"]'),
     ),
+    "login.account_name": (
+        css('[data-e2e="user-name"]'),
+        css('[data-e2e="nav-user-name"]'),
+        css('[data-e2e="user-profile-name"]'),
+        css('[class*="user-name" i]'),
+        css('[class*="nickname" i]'),
+    ),
+    "login.profile": (
+        css('a[href*="/user/"]'),
+        css('[data-e2e="user-profile"] a[href]'),
+        css('[data-e2e="nav-user"] a[href]'),
+    ),
     "verification.marker": (
         css('[data-e2e*="verify" i]'),
         css('[class*="captcha" i]'),

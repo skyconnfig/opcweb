@@ -301,6 +301,30 @@ def test_douyin_browser_state_is_persisted_without_credentials():
     assert db.scalar(select(BrowserProfile).where(BrowserProfile.account_id == account.id)).status == "INACTIVE"
 
 
+def test_douyin_account_identity_is_persisted_when_dom_provides_it():
+    from app import main
+
+    class Browser:
+        profile_dir = "data/browser/identity-account"
+        channel = "chromium"
+        headless = False
+        is_running = True
+
+    class Provider:
+        browser = Browser()
+
+    db = _reply_test_session()
+    account = main._sync_douyin_account(
+        db,
+        Provider(),
+        LoginStatus.LOGGED_IN,
+        {"nickname": "真实昵称", "douyin_user_id": "real-user-9"},
+    )
+
+    assert account.nickname == "真实昵称"
+    assert account.douyin_user_id == "real-user-9"
+
+
 async def test_text_only_agent_chain_and_history_context():
     project = {"industry": "装修", "location": "长沙", "service": "旧房翻新", "target_customer": "准备装修的长沙业主", "price_range": "5万-30万", "description": "提供设计与施工"}
     with pytest.raises(LLMNotConfiguredError):

@@ -12,6 +12,7 @@ import pytest
 from app.providers.base import CommentDTO
 from app.core.config import PROJECT_ROOT
 from app.providers.douyin.browser_manager import DouyinBrowserManager
+from app.providers.douyin.dto import LoginStatus
 from app.providers.douyin.exceptions import DouyinVerificationRequired
 from app.providers.douyin.playwright_provider import DouyinPlaywrightProvider
 
@@ -520,6 +521,41 @@ async def test_login_detection_keeps_visible_security_challenge_as_verification_
     provider = DouyinPlaywrightProvider(browser_manager=browser)
 
     assert await provider._detect_login_status(page) == "VERIFICATION_REQUIRED"
+
+
+@pytest.mark.asyncio
+async def test_account_identity_reads_only_real_dom_account_metadata():
+    account = LocatorDouble(
+        text="账号菜单文本",
+        children={
+            '[data-e2e="user-name"]': LocatorDouble(text="真实昵称"),
+            'a[href*="/user/"]': LocatorDouble(attrs={"href": "/user/real-user-9"}),
+        },
+    )
+    page = PageDouble({
+        '[data-e2e="user-avatar"]': account,
+        '[data-e2e="user-name"]': LocatorDouble(text="真实昵称"),
+    })
+    provider = DouyinPlaywrightProvider(browser_manager=BrowserDouble(page))
+    provider._detect_login_status = lambda *_args, **_kwargs: _async_value(LoginStatus.LOGGED_IN)
+
+    identity = await provider.get_account_identity()
+
+    assert identity == {"nickname": "真实昵称", "douyin_user_id": "real-user-9"}
+
+
+@pytest.mark.asyncio
+async def test_account_identity_accepts_real_dom_accessibility_metadata():
+    account = LocatorDouble(attrs={"aria-label": "真实昵称"}, children={
+        'a[href*="/user/"]': LocatorDouble(attrs={"href": "/user/real-user-10"}),
+    })
+    page = PageDouble({'[data-e2e="user-avatar"]': account})
+    provider = DouyinPlaywrightProvider(browser_manager=BrowserDouble(page))
+    provider._detect_login_status = lambda *_args, **_kwargs: _async_value(LoginStatus.LOGGED_IN)
+
+    identity = await provider.get_account_identity()
+
+    assert identity == {"nickname": "真实昵称", "douyin_user_id": "real-user-10"}
 
 
 @pytest.mark.asyncio

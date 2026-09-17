@@ -121,6 +121,55 @@ class DouyinPlaywrightProvider(BaseContentProvider):
     async def login_status(self) -> LoginStatus:
         return await self.get_login_status()
 
+    async def get_account_identity(self) -> dict[str, str]:
+        """Read the currently rendered account identity from real DOM text.
+
+        The account table stores only this non-sensitive identity metadata. It
+        never reads cookie values, passwords, or browser storage. Missing
+        optional selectors are reported as empty fields rather than guessed
+        placeholders because Douyin changes the account-menu markup between
+        page shapes.
+        """
+
+        if not self.browser.is_running:
+            return {}
+        try:
+            async with self.browser.locked_page() as page:
+                if await self._detect_login_status(page) is not LoginStatus.LOGGED_IN:
+                    return {}
+                account = await self._find(page, "login.account", page=page, required=False)
+                if account is None:
+                    return {}
+                nickname = await self._optional_text(account, "login.account_name", page=page)
+                if not nickname:
+                    # Some pages expose the nickname as the account-menu
+                    # anchor's own text instead of a named child.
+                    nickname = await self._optional_text(account, page=page)
+                profile = await self._find(account, "login.profile", page=page, required=False)
+                for candidate in (account, profile):
+                    if nickname or candidate is None:
+                        continue
+                    for attr in ("data-nickname", "data-name", "aria-label", "title", "alt"):
+                        value = (await self._attribute(candidate, attr)).strip()
+                        if value and value not in {"个人主页", "用户菜单", "用户头像", "头像"}:
+                            nickname = value
+                            break
+                profile_url = await self._attribute(profile, "href") if profile else ""
+                if not profile_url:
+                    profile_url = await self._attribute(account, "href")
+                profile_url = urljoin(self.home_url, profile_url) if profile_url else ""
+                user_id = _last_path_segment(profile_url)
+                return {
+                    "nickname": nickname[:120],
+                    "douyin_user_id": user_id[:120],
+                }
+        except Exception:
+            # Identity is supplemental metadata. The authoritative login
+            # state remains available even when an optional menu selector
+            # drifts, so do not turn a successful session check into a fake
+            # account or a hard failure.
+            return {}
+
     async def health_check(self) -> ProviderHealth:
         """Check the real browser, page reachability, and login state."""
 
