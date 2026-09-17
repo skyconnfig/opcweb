@@ -97,6 +97,11 @@ class DouyinBrowserManager:
         except Exception:
             return False
 
+    async def ensure_healthy(self) -> bool:
+        """Return whether the current persistent context can accept work."""
+
+        return await self.is_healthy()
+
     async def start(self, *, url: str = HOME_URL) -> Any:
         """Start/reuse the visible persistent context and open ``url``."""
 
@@ -108,10 +113,17 @@ class DouyinBrowserManager:
 
     async def _start_unlocked(self) -> Any:
         if self._context is not None:
-            pages = list(self._context.pages)
-            if pages:
+            if await self.is_healthy():
+                pages = list(self._context.pages)
                 return self._preferred_page(pages)
-            return await self._context.new_page()
+            # A crashed Chromium process can leave a non-None Context object
+            # behind. Dispose it before opening the on-disk profile again.
+            await self._dispose_unlocked()
+        elif self._playwright is not None:
+            # A close event may clear the context before the transport object
+            # is stopped. Do not leak the old Playwright transport into the
+            # next browser lifecycle.
+            await self._dispose_unlocked()
 
         try:
             from playwright.async_api import async_playwright
@@ -139,6 +151,9 @@ class DouyinBrowserManager:
                 user_data_dir=str(self.profile_dir),
                 **launch_options,
             )
+            on_close = getattr(self._context, "on", None)
+            if callable(on_close):
+                on_close("close", self._handle_context_closed)
             pages = list(self._context.pages)
             return self._preferred_page(pages) if pages else await self._context.new_page()
         except Exception as exc:
@@ -149,6 +164,11 @@ class DouyinBrowserManager:
                 f"无法启动 Douyin 浏览器: {type(exc).__name__}: {exc!r}",
                 detail={"profile_dir": str(self.profile_dir), "channel": self.channel, "proxy_configured": bool(self.proxy_server), "error_type": type(exc).__name__},
             ) from exc
+
+    def _handle_context_closed(self, *_args: Any) -> None:
+        """Invalidate in-memory state when Chromium closes unexpectedly."""
+
+        self._context = None
 
     async def open(self, url: str) -> Any:
         """Navigate the current profile to a real Douyin URL."""
@@ -254,7 +274,6 @@ class DouyinBrowserManager:
                 await playwright.stop()
             except Exception:
                 pass
-
     async def capture_debug(
         self,
         page: Any,
@@ -308,3 +327,15 @@ def _env_bool(name: str, default: bool) -> bool:
     if value is None:
         return default
     return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+class BrowserSessionManager(DouyinBrowserManager):
+    """Named application boundary for persistent browser session lifecycle.
+
+    ``DouyinBrowserManager`` remains available for backwards compatibility;
+    this name makes the session-management responsibility explicit to callers
+    and leaves room for project/account routing without changing Playwright
+    behavior in the first version.
+    """
+
+    pass
