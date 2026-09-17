@@ -5,7 +5,7 @@ import type { LucideIcon } from 'lucide-react'
 import { Activity, ArrowDownRight, ArrowUpRight, BarChart3, Bot, Check, ChevronDown, ChevronRight, CircleHelp, Clock3, Database, FileText, Gauge, LayoutDashboard, ListChecks, LoaderCircle, Menu, MessageCircle, Moon, MoreHorizontal, PanelLeftClose, PanelLeftOpen, Pause, Play, Plus, Radar, RefreshCw, Search, Settings, SlidersHorizontal, Sparkles, Sun, Target, UserRound, Video, Wifi, X, Zap } from 'lucide-react'
 
 const API = ''
-const SCHEDULE_INTERVALS = [10, 15, 20, 25, 30] as const
+const SCHEDULE_INTERVALS = Array.from({ length: 21 }, (_, index) => index + 10)
 type RecordShape = Record<string, any>
 type ViewKey = 'overview' | 'smart' | 'keywords' | 'videos' | 'comments' | 'leads' | 'replies' | 'knowledge' | 'persona' | 'agents' | 'tasks' | 'analytics' | 'providers' | 'douyin' | 'settings'
 
@@ -31,7 +31,18 @@ async function request(path: string, options?: RequestInit) {
   const headers = new Headers(options?.headers)
   headers.set('Content-Type', 'application/json')
   const response = await fetch(`${API}${path}`, { ...options, headers })
-  if (!response.ok) { const body = await response.json().catch(() => ({})); const detail = Array.isArray(body.detail) ? body.detail.map((item: RecordShape) => `${Array.isArray(item.loc) ? item.loc.join('.') : '参数'}：${item.msg}`).join('；') : typeof body.detail === 'string' ? body.detail : ''; throw new Error([body.message || body.code || `请求失败 ${response.status}`, detail].filter(Boolean).join('：')) }
+  if (!response.ok) {
+    const body = await response.json().catch(() => ({}))
+    const detailValue = body?.detail
+    const detail = Array.isArray(detailValue)
+      ? detailValue.map((item: RecordShape) => `${Array.isArray(item.loc) ? item.loc.join('.') : '参数'}：${item.msg}`).join('；')
+      : typeof detailValue === 'string'
+        ? detailValue
+        : detailValue && typeof detailValue === 'object'
+          ? [detailValue.error_message, detailValue.message, detailValue.error_type, detailValue.url].filter(Boolean).join(' · ')
+          : ''
+    throw new Error([body?.message || body?.code || `请求失败 ${response.status}`, detail].filter(Boolean).join('：'))
+  }
   return response.json()
 }
 
@@ -71,6 +82,30 @@ function normalizeSchedule(value: RecordShape) {
   return { ...value, enabled: Boolean(value?.enabled), full: Boolean(value?.full), interval_minutes: SCHEDULE_INTERVALS.includes(interval as (typeof SCHEDULE_INTERVALS)[number]) ? interval : 30 }
 }
 
+function providerNameKey(value: unknown) {
+  return String(value || '').trim().toLowerCase().replace(/[\s_]+/g, '-')
+}
+
+function providerSupports(context: RecordShape | undefined, capability: string) {
+  return Boolean(context && !context.loading && !context.error && context.name && context.status === 'connected' && context.capabilities?.[capability] === true)
+}
+
+function providerCapabilityMessage(context: RecordShape | undefined, requirements: Array<{ key: string; label: string }>) {
+  const labels = requirements.map((requirement) => requirement.label).join('、')
+  if (!context || context.loading) return `正在读取当前数据源能力，暂不可${labels}。`
+  if (context.error) return `无法确认当前数据源能力，已暂停${labels}：${context.error}`
+  if (!context.name) return `当前数据源未确认，已暂停${labels}。`
+  if (context.status !== 'connected') return `当前数据源“${context.name}”状态为“${context.status || '未连接'}”，已暂停${labels}；请先在数据源页面完成健康检查。`
+  const missing = requirements.filter((requirement) => !providerSupports(context, requirement.key))
+  return missing.length ? `当前数据源“${context.name}”不支持${missing.map((requirement) => requirement.label).join('、')}；请切换到支持这些能力的数据源。` : ''
+}
+
+function ProviderCapabilityNotice({ context, requirements }: RecordShape) {
+  const message = providerCapabilityMessage(context, requirements)
+  if (!message) return null
+  return <div className="error-inline" role="alert"><X size={15} /><span>{message}</span>{context?.retry && <Button icon={RefreshCw} onClick={() => void context.retry()} disabled={context.loading}>刷新能力</Button>}</div>
+}
+
 
 export default function Page() {
   const [view, setView] = useState<ViewKey>('overview')
@@ -81,6 +116,7 @@ export default function Page() {
   const [mobileNav, setMobileNav] = useState(false)
   const [projectsLoading, setProjectsLoading] = useState(true)
   const [projectsError, setProjectsError] = useState('')
+  const [providerState, setProviderState] = useState<RecordShape>({ loading: true, error: '', name: '', status: '', capabilities: {} })
 
   const loadProjects = async () => {
     setProjectsLoading(true)
@@ -99,9 +135,19 @@ export default function Page() {
   }
 
   useEffect(() => {
-    const savedView = window.location.hash.replace('#', '') as ViewKey
-    if (navigation.some((item) => item.key === savedView)) setView(savedView)
+    const applyHashView = () => {
+      const hashView = window.location.hash.replace(/^#/, '') as ViewKey
+      if (navigation.some((item) => item.key === hashView)) setView(hashView)
+      else if (!hashView) setView('overview')
+    }
+    applyHashView()
+    window.addEventListener('hashchange', applyHashView)
+    window.addEventListener('popstate', applyHashView)
     void loadProjects()
+    return () => {
+      window.removeEventListener('hashchange', applyHashView)
+      window.removeEventListener('popstate', applyHashView)
+    }
   }, [])
   useEffect(() => {
     const savedTheme = window.localStorage.getItem('radar:theme')
@@ -110,12 +156,26 @@ export default function Page() {
   useEffect(() => {
     if (project?.id) window.localStorage.setItem('radar:project', String(project.id))
   }, [project?.id])
+  const loadProviderState = async () => {
+    setProviderState((current) => ({ ...current, loading: true, error: '' }))
+    try {
+      const [providers, settings] = await Promise.all([request('/api/providers'), request('/api/settings')])
+      const activeName = providerNameKey(settings.content_provider)
+      const active = (Array.isArray(providers) ? providers : []).find((item: RecordShape) => providerNameKey(item.name) === activeName)
+      if (!active) throw new Error(activeName ? `未找到当前数据源：${settings.content_provider}` : '后端未返回当前数据源')
+      setProviderState({ loading: false, error: '', name: active.name, status: active.status || '', capabilities: active.capabilities || {} })
+    } catch (error) {
+      setProviderState((current) => ({ ...current, loading: false, error: errorText(error), name: '', capabilities: {} }))
+    }
+  }
+  useEffect(() => { void loadProviderState() }, [])
   useEffect(() => {
     document.documentElement.dataset.theme = dark ? 'dark' : 'light'
     window.localStorage.setItem('radar:theme', dark ? 'dark' : 'light')
   }, [dark])
   function navigate(next: ViewKey) { setView(next); window.history.replaceState(null, '', `#${next}`); setMobileNav(false) }
-  return <div className="product-shell"><Sidebar view={view} navigate={navigate} collapsed={collapsed} setCollapsed={setCollapsed} mobileNav={mobileNav} setMobileNav={setMobileNav} project={project} projects={projects} setProject={setProject} /><main className="workspace"><Topbar view={view} dark={dark} setDark={setDark} setMobileNav={setMobileNav} navigate={navigate} project={project} /><div className="workspace-scroll">{projectsLoading ? <LoadingPage text="正在读取本地工作区…" /> : projectsError ? <ErrorPage message={projectsError} onRetry={() => void loadProjects()} /> : <ViewRouter view={view} project={project} navigate={navigate} onProjectCreated={(created: RecordShape) => { setProject(created); setProjects((current) => [created, ...current.filter((item) => item.id !== created.id)]) }} />}</div></main></div>
+  const providerContext = { ...providerState, retry: loadProviderState }
+  return <div className="product-shell"><Sidebar view={view} navigate={navigate} collapsed={collapsed} setCollapsed={setCollapsed} mobileNav={mobileNav} setMobileNav={setMobileNav} project={project} projects={projects} setProject={setProject} /><main className="workspace"><Topbar view={view} dark={dark} setDark={setDark} setMobileNav={setMobileNav} navigate={navigate} project={project} /><div className="workspace-scroll">{projectsLoading ? <LoadingPage text="正在读取本地工作区…" /> : projectsError ? <ErrorPage message={projectsError} onRetry={() => void loadProjects()} /> : <ViewRouter view={view} project={project} navigate={navigate} providerContext={providerContext} onProjectCreated={(created: RecordShape) => { setProject(created); setProjects((current) => [created, ...current.filter((item) => item.id !== created.id)]) }} />}</div></main></div>
 }
 
 function Sidebar({ view, navigate, collapsed, setCollapsed, mobileNav, setMobileNav, project, projects, setProject }: RecordShape) {
@@ -127,21 +187,21 @@ function Topbar({ view, dark, setDark, setMobileNav, navigate }: RecordShape) {
   return <header className="topbar"><div className="topbar-left"><button className="mobile-menu" onClick={() => setMobileNav(true)} aria-label="打开导航"><Menu size={18} /></button><span className="top-context">工作区</span><ChevronRight size={14} className="top-chevron" /><span className="top-current">{label}</span></div><div className="topbar-right"><div className="runtime-chip"><span className="status-dot" />本地 API</div><button className="top-icon-button" onClick={() => navigate('comments')} aria-label="搜索评论" title="搜索评论"><Search size={17} /></button><button className="top-icon-button" onClick={() => setDark(!dark)} aria-label="切换主题">{dark ? <Sun size={17} /> : <Moon size={17} />}</button><div className="top-profile">L</div></div></header>
 }
 
-function ViewRouter({ view, project, navigate, onProjectCreated }: RecordShape) {
+function ViewRouter({ view, project, navigate, providerContext, onProjectCreated }: RecordShape) {
   if (!project?.id && !['smart', 'providers', 'douyin', 'settings'].includes(view)) return <EmptyWorkspaceView navigate={navigate} />
-  if (view === 'smart') return <SmartViewLive project={project} navigate={navigate} onProjectCreated={onProjectCreated} />
+  if (view === 'smart') return <SmartViewLive project={project} navigate={navigate} providerContext={providerContext} onProjectCreated={onProjectCreated} />
   if (view === 'keywords') return <KeywordsViewLive project={project} />
-  if (view === 'videos') return <VideosViewLive project={project} />
-  if (view === 'comments') return <CommentsView project={project} />
+  if (view === 'videos') return <VideosViewLive project={project} providerContext={providerContext} />
+  if (view === 'comments') return <CommentsView project={project} providerContext={providerContext} />
   if (view === 'leads') return <LeadsView project={project} navigate={navigate} />
-  if (view === 'replies') return <RepliesView project={project} />
+  if (view === 'replies') return <RepliesView project={project} providerContext={providerContext} />
   if (view === 'knowledge') return <KnowledgeView project={project} />
   if (view === 'persona') return <PersonaView project={project} />
   if (view === 'agents') return <AgentsViewLive project={project} />
-  if (view === 'tasks') return <TasksView project={project} />
+  if (view === 'tasks') return <TasksView project={project} providerContext={providerContext} />
   if (view === 'analytics') return <AnalyticsView project={project} />
-  if (view === 'providers') return <ProvidersRegistryView />
-  if (view === 'douyin') return <DouyinConnectionView />
+  if (view === 'providers') return <ProvidersRegistryView onProviderChanged={providerContext?.retry} />
+  if (view === 'douyin') return <DouyinConnectionView providerContext={providerContext} />
   if (view === 'settings') return <SettingsViewLive project={project} />
   return <DashboardLive project={project} navigate={navigate} />
 }
@@ -151,7 +211,7 @@ function EmptyWorkspaceView({ navigate }: RecordShape) { return <div className="
 function LoadingPage({ text = '加载中…' }: { text?: string }) { return <div className="page"><section className="panel page-loading"><LoaderCircle size={20} className="loading-spin" /><span>{text}</span></section></div> }
 function ErrorPage({ message, onRetry }: { message: string; onRetry: () => void }) { return <div className="page"><section className="panel page-error"><X size={20} /><h2>无法读取工作区</h2><p>{message}</p><Button variant="accent" icon={RefreshCw} onClick={onRetry}>重试</Button></section></div> }
 
-function SmartViewLive({ project, navigate, onProjectCreated }: RecordShape) {
+function SmartViewLive({ project, navigate, providerContext, onProjectCreated }: RecordShape) {
   const [form, setForm] = useState({ name: '我的行业雷达', industry: project.industry || '', location: project.location || '', service: '', price_range: '', target_customer: '', description: '' })
   const [provider, setProvider] = useState('加载中…')
   const [stage, setStage] = useState('')
@@ -167,9 +227,13 @@ function SmartViewLive({ project, navigate, onProjectCreated }: RecordShape) {
     setError('')
   }, [project.id])
   const set = (key: string, value: string) => setForm((current) => ({ ...current, [key]: value }))
+  const collectionRequirements = [{ key: 'keyword_search', label: '真实视频搜索' }, { key: 'comments', label: '公开评论采集' }]
+  const canCollect = collectionRequirements.every((requirement) => providerSupports(providerContext, requirement.key))
   async function activate() {
     setError('')
     if (!form.name.trim() || !form.industry.trim()) { setError('请先填写项目名称和行业'); return }
+    const collectionMessage = providerCapabilityMessage(providerContext, collectionRequirements)
+    if (collectionMessage) { setError(collectionMessage); return }
     setResult(undefined); setStage('creating')
     try {
       let projectId = createdProjectId
@@ -190,7 +254,7 @@ function SmartViewLive({ project, navigate, onProjectCreated }: RecordShape) {
   }
   const progress = stage === 'done' ? 5 : stage === 'scanning' ? 3 : stage === 'analyzing' ? 1 : 0
   const workflow = ['理解行业与客户语言', '生成高意图关键词', '发现并排序机会视频', '分析公开评论信号', '归档潜客并生成建议']
-  return <div className="page"><PageHeader eyebrow="INDUSTRY INTELLIGENCE" title="智能截流" description="描述你的业务，系统会生成搜索策略并开始监听公开需求。" actions={<div className="provider-chip"><span className="status-dot" />{provider}</div>} />{error && <div className="error-banner"><X size={15} /><span>{error}</span><button onClick={() => setError('')} aria-label="关闭错误">关闭</button></div>}<div className="smart-grid"><section className="panel form-panel"><PanelHeader label="PROJECT BRIEF" title="业务画像" action={<span className="required-note">* 必填信息</span>} /><div className="form-grid"><Field label="项目名称" required value={form.name} onChange={(value: string) => set('name', value)} placeholder="我的行业雷达" /><Field label="行业" required value={form.industry} onChange={(value: string) => set('industry', value)} placeholder="装修、教育、财税" /><Field label="地区" value={form.location} onChange={(value: string) => set('location', value)} placeholder="例如：长沙" /><Field label="业务 / 产品服务" wide value={form.service} onChange={(value: string) => set('service', value)} placeholder="你具体提供什么服务？" /><Field label="客单价" value={form.price_range} onChange={(value: string) => set('price_range', value)} placeholder="例如：5万-30万" /><Field label="目标客户" wide value={form.target_customer} onChange={(value: string) => set('target_customer', value)} placeholder="谁最可能购买？" /><Field label="补充介绍" wide area value={form.description} onChange={(value: string) => set('description', value)} placeholder="优势、客户痛点、服务限制…" /></div><div className="form-actions"><Button variant="accent" icon={Sparkles} onClick={activate} disabled={Boolean(stage) && stage !== 'failed'}>{stage === 'done' ? '雷达已开启' : stage === 'failed' ? '重试扫描' : stage ? '处理中…' : '分析并开启智能模式'}</Button><span className="form-footnote"><Check size={13} />默认人工审核；自动回复需在设置中显式开启</span></div></section><section className="panel workflow-panel"><PanelHeader label="AUTOMATION PLAN" title="系统将自动完成" /><div className="workflow-list">{workflow.map((label, index) => { const done = index < progress; const current = Boolean(stage) && !done && index === progress; return <div className={`workflow-row ${done ? 'complete' : ''}`} key={label}><span>{done ? <Check size={13} /> : current ? <span className="spinner" /> : String(index + 1).padStart(2, '0')}</span><b>{label}</b>{current && <small className="workflow-current">处理中</small>}</div> })}</div>{result ? <div className="analysis-summary"><div className="summary-number">{result.keyword_count ?? '—'}</div><div><b>个行业关键词已生成</b><span>高机会词将优先进入扫描队列</span></div></div> : <div className="workflow-note"><BrainIcon /><b>准备好后，系统会持续工作</b><span>扫描完成后，你可以在任务中心查看进度和失败重试。</span></div>}</section></div></div>
+  return <div className="page"><PageHeader eyebrow="INDUSTRY INTELLIGENCE" title="智能截流" description="描述你的业务，系统会生成搜索策略并开始监听公开需求。" actions={<div className="provider-chip"><span className="status-dot" />{provider}</div>} />{error && <div className="error-banner"><X size={15} /><span>{error}</span><button onClick={() => setError('')} aria-label="关闭错误">关闭</button></div>}<ProviderCapabilityNotice context={providerContext} requirements={collectionRequirements} /><div className="smart-grid"><section className="panel form-panel"><PanelHeader label="PROJECT BRIEF" title="业务画像" action={<span className="required-note">* 必填信息</span>} /><div className="form-grid"><Field label="项目名称" required value={form.name} onChange={(value: string) => set('name', value)} placeholder="我的行业雷达" /><Field label="行业" required value={form.industry} onChange={(value: string) => set('industry', value)} placeholder="装修、教育、财税" /><Field label="地区" value={form.location} onChange={(value: string) => set('location', value)} placeholder="例如：长沙" /><Field label="业务 / 产品服务" wide value={form.service} onChange={(value: string) => set('service', value)} placeholder="你具体提供什么服务？" /><Field label="客单价" value={form.price_range} onChange={(value: string) => set('price_range', value)} placeholder="例如：5万-30万" /><Field label="目标客户" wide value={form.target_customer} onChange={(value: string) => set('target_customer', value)} placeholder="谁最可能购买？" /><Field label="补充介绍" wide area value={form.description} onChange={(value: string) => set('description', value)} placeholder="优势、客户痛点、服务限制…" /></div><div className="form-actions"><Button variant="accent" icon={Sparkles} onClick={() => void activate()} disabled={(!canCollect) || (Boolean(stage) && stage !== 'failed')}>{stage === 'done' ? '雷达已开启' : stage === 'failed' ? '重试扫描' : stage ? '处理中…' : '分析并开启智能模式'}</Button><span className="form-footnote"><Check size={13} />默认人工审核；自动回复需在设置中显式开启</span></div></section><section className="panel workflow-panel"><PanelHeader label="AUTOMATION PLAN" title="系统将自动完成" /><div className="workflow-list">{workflow.map((label, index) => { const done = index < progress; const current = Boolean(stage) && !done && index === progress; return <div className={`workflow-row ${done ? 'complete' : ''}`} key={label}><span>{done ? <Check size={13} /> : current ? <span className="spinner" /> : String(index + 1).padStart(2, '0')}</span><b>{label}</b>{current && <small className="workflow-current">处理中</small>}</div> })}</div>{result ? <div className="analysis-summary"><div className="summary-number">{result.keyword_count ?? '—'}</div><div><b>个行业关键词已生成</b><span>高机会词将优先进入扫描队列</span></div></div> : <div className="workflow-note"><BrainIcon /><b>准备好后，系统会持续工作</b><span>扫描完成后，你可以在任务中心查看进度和失败重试。</span></div>}</section></div></div>
 }
 
 function PageHeader({ eyebrow, title, description, actions }: RecordShape) { return <div className="page-header"><div><div className="eyebrow">{eyebrow}</div><h1>{title}</h1>{description && <p>{description}</p>}</div>{actions && <div className="header-actions">{actions}</div>}</div> }
@@ -205,6 +269,8 @@ function DashboardLive({ project, navigate }: RecordShape) {
   const [error, setError] = useState('')
   const [live, setLive] = useState<RecordShape[]>([])
   const [douyin, setDouyin] = useState<RecordShape>({ browser: 'stopped', login: 'NOT_STARTED' })
+  const [refreshToken, setRefreshToken] = useState(0)
+  const refreshTimerRef = useRef<number | undefined>(undefined)
   useEffect(() => {
     let stopped = false
     const load = async () => {
@@ -224,7 +290,7 @@ function DashboardLive({ project, navigate }: RecordShape) {
     }
     void load()
     return () => { stopped = true }
-  }, [project.id])
+  }, [project.id, refreshToken])
   useEffect(() => { request('/api/douyin/status').then(setDouyin).catch(() => {}) }, [])
   useEffect(() => {
     let source: EventSource | undefined
@@ -242,7 +308,14 @@ function DashboardLive({ project, navigate }: RecordShape) {
           lastEventId = nextEventId
           window.sessionStorage.setItem(cursorKey, String(lastEventId))
         }
-        try { setLive((current) => [...current.slice(-7), JSON.parse(event.data)]) } catch {}
+        try {
+          const payload = JSON.parse(event.data) as RecordShape
+          setLive((current) => [...current.slice(-7), payload])
+          if (['video.discovered', 'comment.discovered', 'lead.detected', 'task.completed', 'task.failed'].includes(String(payload.event_type))) {
+            if (refreshTimerRef.current !== undefined) window.clearTimeout(refreshTimerRef.current)
+            refreshTimerRef.current = window.setTimeout(() => setRefreshToken((current) => current + 1), 250)
+          }
+        } catch {}
       }
       source.onerror = () => {
         source?.close()
@@ -250,7 +323,12 @@ function DashboardLive({ project, navigate }: RecordShape) {
       }
     }
     connect()
-    return () => { stopped = true; source?.close(); if (retryTimer) window.clearTimeout(retryTimer) }
+    return () => {
+      stopped = true
+      source?.close()
+      if (retryTimer) window.clearTimeout(retryTimer)
+      if (refreshTimerRef.current !== undefined) window.clearTimeout(refreshTimerRef.current)
+    }
   }, [project.id])
   const stats = data.stats || {}
   const events = [...(data.events || []), ...live].slice(-8)
@@ -280,9 +358,12 @@ function SignalBar({ label, value, color }: RecordShape) {
 }
 function CheckRow({ label, done }: RecordShape) { return <div className={`check-row ${done ? 'done' : ''}`}><span className="check-box">{done && <Check size={12} />}</span><span>{label}</span>{done ? <small>完成</small> : <small className="next-label">待处理</small>}</div> }
 function EmptyState({ icon: Icon, text, action }: RecordShape) { return <div className="empty-state"><Icon size={22} /><span>{text}</span>{action && <button onClick={action.onClick}>{action.label} <ArrowUpRight size={13} /></button>}</div> }
-function formatTime(value?: string) { return value ? new Date(value).toLocaleTimeString('zh-CN', { hour12: false }) : '--:--' }
-function formatDateTime(value?: string | null) { return value ? new Date(value).toLocaleString('zh-CN', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : '未安排' }
-function isToday(value?: string | null) { if (!value) return false; const date = new Date(value); const now = new Date(); return !Number.isNaN(date.getTime()) && date.getFullYear() === now.getFullYear() && date.getMonth() === now.getMonth() && date.getDate() === now.getDate() }
+function parseBackendDate(value?: string | null) { if (!value) return undefined; const raw = String(value).trim(); if (!raw) return undefined; const normalized = /(?:Z|[+-]\d\d:\d\d)$/i.test(raw) ? raw : `${raw}Z`; const date = new Date(normalized); return Number.isNaN(date.getTime()) ? undefined : date }
+function formatTime(value?: string | null) { return parseBackendDate(value)?.toLocaleTimeString('zh-CN', { hour12: false }) || '--:--' }
+function formatDateTime(value?: string | null) { return parseBackendDate(value)?.toLocaleString('zh-CN', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' }) || '未安排' }
+function isToday(value?: string | null) { const date = parseBackendDate(value); const now = new Date(); return Boolean(date && date.getFullYear() === now.getFullYear() && date.getMonth() === now.getMonth() && date.getDate() === now.getDate()) }
+function defaultFollowDeadline() { const date = new Date(); date.setDate(date.getDate() + 1); date.setHours(10, 0, 0, 0); const pad = (value: number) => String(value).padStart(2, '0'); return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}` }
+function normalizeLeadAdvice(value: unknown): RecordShape | undefined { if (!value || typeof value !== 'object') return undefined; const advice = value as RecordShape; return advice.reply || advice.recommended_reply || advice.next_action || advice.follow_up_question ? advice : undefined }
 function taskStatusLabel(status?: string) { return ({ completed: '已完成', queued: '排队中', running: '运行中', paused: '已暂停', failed: '失败' } as Record<string, string>)[status || ''] || status || '未知' }
 function taskStatusTone(status?: string) { return status === 'completed' ? 'green' : status === 'failed' ? 'red' : 'amber' }
 function downloadJson(filename: string, value: unknown) { const blob = new Blob([JSON.stringify(value, null, 2)], { type: 'application/json;charset=utf-8' }); const url = URL.createObjectURL(blob); const link = document.createElement('a'); link.href = url; link.download = filename; link.click(); URL.revokeObjectURL(url) }
@@ -294,28 +375,59 @@ function TableSkeleton({ rows }: { rows: number }) { return <div className="tabl
 
 
 function LeadDrawer({ lead, close, project, onUpdated }: RecordShape) {
-  const [advice, setAdvice] = useState<RecordShape>()
+  const [advice, setAdvice] = useState<RecordShape | undefined>(normalizeLeadAdvice(lead.persona_advice))
   const [loading, setLoading] = useState(false)
   const [adviceError, setAdviceError] = useState('')
   const [status, setStatus] = useState(lead.status || 'NEW')
   const [statusBusy, setStatusBusy] = useState(false)
   const [statusMessage, setStatusMessage] = useState('')
+  const [followNote, setFollowNote] = useState(lead.follow_note || '')
+  const [noteBusy, setNoteBusy] = useState(false)
+  const [followTasks, setFollowTasks] = useState<RecordShape[]>([])
+  const [followTasksLoading, setFollowTasksLoading] = useState(true)
+  const [followTasksError, setFollowTasksError] = useState('')
+  const [followTaskBusy, setFollowTaskBusy] = useState<number | null>(null)
+  const [taskContent, setTaskContent] = useState('')
+  const [taskDeadline, setTaskDeadline] = useState('')
   const statuses: Record<string, string> = { NEW: '新发现', FOLLOW_UP: '待跟进', CONTACTED: '已联系', QUALIFIED: '有效客户', WON: '已成交', LOST: '未成交', IGNORED: '忽略' }
-  useEffect(() => { setStatus(lead.status || 'NEW') }, [lead.id, lead.status])
-  async function generate() { if (!lead.id || typeof lead.id !== 'number') return; setLoading(true); setAdviceError(''); try { setAdvice(await request(`/api/leads/${lead.id}/persona`, { method: 'POST' })) } catch (error) { setAdviceError(errorText(error)) } finally { setLoading(false) } }
+  useEffect(() => {
+    setStatus(lead.status || 'NEW')
+    setAdvice(normalizeLeadAdvice(lead.persona_advice))
+    setFollowNote(lead.follow_note || '')
+    setTaskContent('')
+    setTaskDeadline(defaultFollowDeadline())
+    setFollowTasks([])
+    setFollowTasksError('')
+    setFollowTasksLoading(true)
+    if (!lead.id) return
+    request(`/api/leads/${lead.id}/follow-tasks`).then((items) => setFollowTasks(Array.isArray(items) ? items : [])).catch((error) => setFollowTasksError(errorText(error))).finally(() => setFollowTasksLoading(false))
+  }, [lead.id, lead.status, lead.follow_note])
+  async function generate() { if (!lead.id || typeof lead.id !== 'number') return; setLoading(true); setAdviceError(''); try { setAdvice(await request(`/api/leads/${lead.id}/assistant`, { method: 'POST' })) } catch (error) { setAdviceError(errorText(error)) } finally { setLoading(false) } }
   async function changeStatus(next: string) { setStatusBusy(true); setStatusMessage('保存中…'); try { const updated = await request(`/api/leads/${lead.id}`, { method: 'PATCH', body: JSON.stringify({ status: next }) }); setStatus(updated.status); onUpdated?.(updated); setStatusMessage('状态已更新') } catch (error: any) { setStatus(lead.status || 'NEW'); setStatusMessage(error.message) } finally { setStatusBusy(false) } }
-  return <div className="drawer-backdrop" onClick={close}><aside className="lead-drawer" onClick={(event) => event.stopPropagation()}><div className="drawer-head"><span className="eyebrow">LEAD PROFILE</span><button className="icon-button" onClick={close}><X size={17} /></button></div><div className="drawer-identity"><span className="drawer-avatar">{(lead.nickname || '客')[0]}</span><div><h2>{lead.nickname || '未提供昵称'}</h2><span>抖音用户 · {lead.platform_user_id || '未提供用户标识'}</span></div><div className="drawer-score"><b>{lead.lead_score == null ? '—' : Math.round(lead.lead_score)}</b><small>{lead.lead_level ? `${lead.lead_level} 级` : '未分级'}</small></div></div><div className="drawer-status"><label htmlFor="lead-status">CRM 状态</label><select id="lead-status" className="select-control" value={status} onChange={(event) => void changeStatus(event.target.value)} disabled={statusBusy}>{Object.entries(statuses).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select>{statusMessage && <span>{statusMessage}</span>}</div><div className="drawer-facts"><div><span>需求</span><b>{lead.need || '未识别'}</b></div><div><span>地区</span><b>{lead.location || project.location || '未识别'}</b></div><div><span>预算</span><b>{lead.budget || '未识别'}</b></div><div><span>阶段</span><b>{lead.purchase_stage || '未识别'}</b></div></div><div className="drawer-section"><SectionLabel>AI SUMMARY</SectionLabel><p>{lead.summary || '暂无 AI 摘要。'}</p></div><div className="drawer-section"><SectionLabel>BUYING SIGNALS</SectionLabel><div className="signal-tags">{lead.buying_signals?.length ? lead.buying_signals.map((signal: string) => <span key={signal}><Check size={12} />{signal}</span>) : <span>暂无已记录信号</span>}</div></div><div className="drawer-section"><SectionLabel>COMMENT CONTEXT</SectionLabel>{lead.comments?.length ? <div className="history-list">{lead.comments.map((comment: RecordShape) => <div key={comment.id}><time>{formatDateTime(comment.created_at_platform || comment.created_at)}</time><p>{comment.content}</p></div>)}</div> : <p>暂无可展示的历史评论上下文。</p>}</div><div className="drawer-section"><SectionLabel>SOURCE VIDEOS</SectionLabel>{lead.videos?.length ? <div className="source-list">{lead.videos.map((video: RecordShape) => <a key={video.id} href={video.url || '#'} target="_blank" rel="noreferrer">{video.title || '无标题视频'} <ArrowUpRight size={12} /></a>)}</div> : <p>暂无来源视频记录。</p>}</div><div className="drawer-advice"><div className="drawer-advice-head"><div><SectionLabel>PERSONA AGENT</SectionLabel><b>人工跟进建议</b></div><Bot size={19} /></div>{advice ? <><blockquote>{advice.recommended_reply}</blockquote><p className="next-question"><b>下一问</b>{advice.follow_up_question}</p></> : <><p>生成一条专业、克制的回答建议，不会自动发送。</p><Button variant="accent" icon={Sparkles} onClick={generate} disabled={loading}>{loading ? '生成中…' : '生成跟进建议'}</Button></>}</div></aside></div>
+  async function saveFollowNote() { setNoteBusy(true); setStatusMessage('保存备注中…'); try { const updated = await request(`/api/leads/${lead.id}`, { method: 'PATCH', body: JSON.stringify({ follow_note: followNote }) }); setFollowNote(updated.follow_note || ''); onUpdated?.(updated); setStatusMessage('人工备注已保存') } catch (error) { setStatusMessage(errorText(error)) } finally { setNoteBusy(false) } }
+  async function createFollowTask() {
+    const content = taskContent.trim()
+    if (!content) { setFollowTasksError('请输入跟进任务内容'); return }
+    const deadline = new Date(taskDeadline)
+    if (!taskDeadline || Number.isNaN(deadline.getTime())) { setFollowTasksError('请选择有效的截止时间'); return }
+    setFollowTaskBusy(-1); setFollowTasksError('')
+    try { const created = await request(`/api/leads/${lead.id}/follow-tasks`, { method: 'POST', body: JSON.stringify({ content, deadline: deadline.toISOString() }) }); setFollowTasks((current) => [...current, created].sort((a, b) => String(a.deadline).localeCompare(String(b.deadline)) || Number(a.id) - Number(b.id))); setTaskContent(''); setTaskDeadline(defaultFollowDeadline()) } catch (error) { setFollowTasksError(errorText(error)) } finally { setFollowTaskBusy(null) }
+  }
+  async function updateFollowTask(task: RecordShape, nextStatus: string) { setFollowTaskBusy(task.id); setFollowTasksError(''); try { const updated = await request(`/api/follow-tasks/${task.id}`, { method: 'PATCH', body: JSON.stringify({ status: nextStatus }) }); setFollowTasks((current) => current.map((item) => item.id === task.id ? updated : item)) } catch (error) { setFollowTasksError(errorText(error)) } finally { setFollowTaskBusy(null) } }
+  return <div className="drawer-backdrop" onClick={close}><aside className="lead-drawer" role="dialog" aria-modal="true" aria-label="潜客详情" onClick={(event) => event.stopPropagation()}><div className="drawer-head"><span className="eyebrow">LEAD PROFILE</span><button className="icon-button" onClick={close} aria-label="关闭潜客详情"><X size={17} /></button></div><div className="drawer-identity"><span className="drawer-avatar">{(lead.nickname || '客')[0]}</span><div><h2>{lead.nickname || '未提供昵称'}</h2><span>抖音用户 · {lead.platform_user_id || '未提供用户标识'}</span></div><div className="drawer-score"><b>{lead.lead_score == null ? '—' : Math.round(lead.lead_score)}</b><small>{lead.lead_level ? `${lead.lead_level} 级` : '未分级'}</small></div></div><div className="drawer-status"><label htmlFor="lead-status">CRM 状态</label><select id="lead-status" className="select-control" value={status} onChange={(event) => void changeStatus(event.target.value)} disabled={statusBusy}>{Object.entries(statuses).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select>{statusMessage && <span>{statusMessage}</span>}</div><div className="drawer-facts"><div><span>需求</span><b>{lead.need || '未识别'}</b></div><div><span>地区</span><b>{lead.location || project.location || '未识别'}</b></div><div><span>预算</span><b>{lead.budget || '未识别'}</b></div><div><span>阶段</span><b>{lead.purchase_stage || '未识别'}</b></div></div><div className="drawer-section"><SectionLabel>HUMAN NOTE</SectionLabel><textarea className="drawer-note-editor" value={followNote} onChange={(event) => setFollowNote(event.target.value)} rows={3} maxLength={5000} placeholder="记录人工沟通、下一步或客户补充信息" disabled={noteBusy} /><div className="drawer-actions"><Button onClick={() => void saveFollowNote()} disabled={noteBusy}>{noteBusy ? '保存中…' : '保存人工备注'}</Button></div></div><div className="drawer-section follow-tasks-section"><div className="follow-tasks-heading"><SectionLabel>FOLLOW-UP TASKS</SectionLabel><span>{followTasks.filter((task) => task.status === 'PENDING').length} 项待处理</span></div><div className="follow-task-form"><input value={taskContent} onChange={(event) => setTaskContent(event.target.value)} placeholder="例如：明天 10 点回访预算" aria-label="跟进任务内容" maxLength={2000} disabled={followTaskBusy !== null} /><input type="datetime-local" value={taskDeadline} onChange={(event) => setTaskDeadline(event.target.value)} aria-label="跟进任务截止时间" disabled={followTaskBusy !== null} /><Button variant="accent" onClick={() => void createFollowTask()} disabled={followTaskBusy !== null}>{followTaskBusy === -1 ? '添加中…' : '添加任务'}</Button></div>{followTasksError && <div className="error-inline" role="alert"><X size={14} /><span>{followTasksError}</span></div>}{followTasksLoading ? <div className="drawer-loading"><LoaderCircle size={16} className="loading-spin" /><span>正在读取跟进任务…</span></div> : followTasks.length ? <div className="follow-task-list">{followTasks.map((task: RecordShape) => <div className={`follow-task-row ${task.status !== 'PENDING' ? 'completed' : ''}`} key={task.id}><div><b>{task.content}</b><small>{formatDateTime(task.deadline)} · {task.status === 'DONE' ? '已完成' : task.status === 'CANCELLED' ? '已取消' : '待处理'}</small></div>{task.status === 'PENDING' && <div className="toolbar-actions"><Button onClick={() => void updateFollowTask(task, 'DONE')} disabled={followTaskBusy !== null}>完成</Button><Button onClick={() => void updateFollowTask(task, 'CANCELLED')} disabled={followTaskBusy !== null}>取消</Button></div>}</div>)}</div> : <p className="drawer-detail-muted">暂无跟进任务，可在此创建一个提醒。</p>}</div><div className="drawer-section"><SectionLabel>AI SUMMARY</SectionLabel><p>{lead.summary || '暂无 AI 摘要。'}</p></div><div className="drawer-section"><SectionLabel>BUYING SIGNALS</SectionLabel><div className="signal-tags">{lead.buying_signals?.length ? lead.buying_signals.map((signal: string) => <span key={signal}><Check size={12} />{signal}</span>) : <span>暂无已记录信号</span>}</div></div><div className="drawer-section"><SectionLabel>COMMENT CONTEXT</SectionLabel>{lead.comments?.length ? <div className="history-list">{lead.comments.map((comment: RecordShape) => <div key={comment.id}><time>{formatDateTime(comment.created_at_platform || comment.created_at)}</time><p>{comment.content}</p></div>)}</div> : <p>暂无可展示的历史评论上下文。</p>}</div><div className="drawer-section"><SectionLabel>SOURCE VIDEOS</SectionLabel>{lead.videos?.length ? <div className="source-list">{lead.videos.map((video: RecordShape) => <a key={video.id} href={video.url || '#'} target="_blank" rel="noreferrer">{video.title || '无标题视频'} <ArrowUpRight size={12} /></a>)}</div> : <p>暂无来源视频记录。</p>}</div><div className="drawer-advice">{adviceError && <div className="error-inline" role="alert"><X size={14} /><span>{adviceError}</span></div>}<div className="drawer-advice-head"><div><SectionLabel>AI SALES ASSISTANT</SectionLabel><b>人工跟进建议</b></div><Bot size={19} /></div>{advice ? <><blockquote>{advice.reply || advice.recommended_reply || '暂无回复建议'}</blockquote><p className="next-question"><b>判断理由</b>{advice.reason || '暂无判断理由'}</p><p className="next-question"><b>风险提示</b>{advice.risk || '未识别'}</p><p className="next-question"><b>下一步</b>{advice.next_action || advice.follow_up_question || '请人工确认后继续'}</p></> : <><p>生成一条专业、克制的回答建议，不会自动发送。</p><Button variant="accent" icon={Sparkles} onClick={generate} disabled={loading}>{loading ? '生成中…' : '生成跟进建议'}</Button></>}</div></aside></div>
 }
 
 function AgentsViewLive({ project }: RecordShape) {
   const [runs, setRuns] = useState<RecordShape[]>([])
+  const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
-  const agents = [{ name: 'IndustryAgent', label: '行业理解', desc: '仅使用行业文字和结构化字段。', icon: BrainIcon }, { name: 'KeywordAgent', label: '关键词发现', desc: '生成 100–300 个文本关键词。', icon: Search }, { name: 'LeadJudgeAgent', label: '潜客判断', desc: '规则预筛后调用文本模型判断意图。', icon: Target }, { name: 'PersonaAgent', label: '人设跟进', desc: '输出仅供人工审核的文本建议。', icon: MessageCircle }]
-  useEffect(() => { request(`/api/agent-runs?project_id=${project.id}&limit=40`).then(setRuns).catch((err: any) => setError(err.message)) }, [project.id])
-  return <div className="page"><PageHeader eyebrow="AGENT SYSTEM" title="智能体" description="所有 Agent 只处理文字、结构化字段和公开视频元数据。" />{error && <div className="error-banner"><X size={15} />{error}</div>}<div className="agent-grid">{agents.map(({ name, label, desc, icon: Icon }) => <section className="panel agent-card" key={name}><div className="agent-card-top"><span className="agent-glyph"><Icon size={19} /></span><StatusPill tone="neutral">实际运行状态</StatusPill></div><h2>{label}</h2><span className="agent-code">{name} · v1</span><p>{desc}</p><div className="agent-card-foot"><span><Activity size={13} />纯文本模型 · 可观测</span><ChevronRight size={15} /></div></section>)}</div><section className="panel registry-panel"><div><SectionLabel>PROMPT REGISTRY</SectionLabel><h2>每次判断都可追踪</h2><p>记录 prompt version、输入哈希、耗时、token 和结构化输出。</p></div><div className="registry-numbers"><span><b>{runs.length}</b>最近运行</span><span><b>{runs.filter((item) => item.success).length}</b>成功</span></div></section><section className="panel data-panel agent-runs-panel"><div className="data-toolbar"><div><SectionLabel>RUN HISTORY</SectionLabel><h2>文本模型调用记录</h2></div><span className="muted">不保存图片或视频帧</span></div>{runs.length ? <table><thead><tr><th>Agent</th><th>模型</th><th>Prompt</th><th>Tokens</th><th>耗时</th><th>结果</th><th>时间</th></tr></thead><tbody>{runs.map((run: RecordShape) => <tr key={run.id}><td><b>{run.agent}</b></td><td>{run.model || '—'}</td><td>{run.prompt_version || '—'}</td><td>{run.token_usage || 0}</td><td>{run.latency_ms || 0} ms</td><td><StatusPill tone={run.success ? 'green' : 'red'}>{run.success ? '成功' : '失败'}</StatusPill></td><td>{formatDateTime(run.created_at)}</td></tr>)}</tbody></table> : <EmptyState icon={Bot} text="暂无 Agent 运行记录；完成一次智能分析后会显示。" />}</section></div>
+  const agents = [{ name: 'IndustryAgent', label: '行业理解', desc: '仅使用行业文字和结构化字段。', icon: BrainIcon }, { name: 'KeywordAgent', label: '关键词发现', desc: '生成 100–300 个文本关键词。', icon: Search }, { name: 'RadarAgent', label: '机会评分', desc: '依据标题、描述和公开互动元数据排序视频。', icon: Radar }, { name: 'LeadJudgeAgent', label: '潜客判断', desc: '规则预筛后调用文本模型判断意图。', icon: Target }, { name: 'ReplyAgent', label: '回复草稿', desc: '结合人设与知识库生成待审核文本。', icon: MessageCircle }, { name: 'PersonaAgent', label: '人设跟进', desc: '输出仅供人工审核的文本建议。', icon: UserRound }, { name: 'LeadAssistantAgent', label: '销售助手', desc: '结合评论历史、知识库和人设生成下一步建议。', icon: Bot }]
+  const reload = async () => { setLoading(true); setError(''); try { setRuns(await request(`/api/agent-runs?project_id=${project.id}&limit=40`)) } catch (err) { setError(errorText(err)) } finally { setLoading(false) } }
+  useEffect(() => { void reload() }, [project.id])
+  return <div className="page"><PageHeader eyebrow="AGENT SYSTEM" title="智能体" description="所有 Agent 只处理文字、结构化字段和公开视频元数据。" actions={<Button icon={RefreshCw} onClick={() => void reload()} disabled={loading}>{loading ? '加载中…' : '刷新记录'}</Button>} />{error && <div className="error-banner"><X size={15} /><span>{error}</span><button onClick={() => setError('')} aria-label="关闭错误">关闭</button></div>}{loading ? <div className="panel page-loading" role="status" aria-live="polite"><LoaderCircle size={20} className="loading-spin" /><span>正在读取 Agent 运行记录…</span></div> : <><div className="agent-grid">{agents.map(({ name, label, desc, icon: Icon }) => <section className="panel agent-card" key={name}><div className="agent-card-top"><span className="agent-glyph"><Icon size={19} /></span><StatusPill tone="neutral">实际运行状态</StatusPill></div><h2>{label}</h2><span className="agent-code">{name} · v1</span><p>{desc}</p><div className="agent-card-foot"><span><Activity size={13} />纯文本模型 · 可观测</span><ChevronRight size={15} /></div></section>)}</div><section className="panel registry-panel"><div><SectionLabel>PROMPT REGISTRY</SectionLabel><h2>每次判断都可追踪</h2><p>记录 prompt version、输入哈希、耗时、token 和结构化输出。</p></div><div className="registry-numbers"><span><b>{runs.length}</b>最近运行</span><span><b>{runs.filter((item) => item.success).length}</b>成功</span></div></section><section className="panel data-panel agent-runs-panel"><div className="data-toolbar"><div><SectionLabel>RUN HISTORY</SectionLabel><h2>文本模型调用记录</h2></div><span className="muted">不保存图片或视频帧</span></div>{runs.length ? <div className="table-scroll"><table><thead><tr><th>Agent</th><th>模型</th><th>Prompt</th><th>Tokens</th><th>耗时</th><th>结果</th><th>时间</th></tr></thead><tbody>{runs.map((run: RecordShape) => <tr key={run.id}><td><b>{run.agent}</b></td><td>{run.model || '—'}</td><td>{run.prompt_version || '—'}</td><td>{run.token_usage || 0}</td><td>{run.latency_ms || 0} ms</td><td><StatusPill tone={run.success ? 'green' : 'red'}>{run.success ? '成功' : '失败'}</StatusPill></td><td>{formatDateTime(run.created_at)}</td></tr>)}</tbody></table></div> : <EmptyState icon={Bot} text="暂无 Agent 运行记录；完成一次智能分析后会显示。" />}</section></> }</div>
 }
 
-function CommentsView({ project }: RecordShape) {
+function CommentsView({ project, providerContext }: RecordShape) {
   const [items, setItems] = useState<RecordShape[]>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
@@ -327,6 +439,9 @@ function CommentsView({ project }: RecordShape) {
   const [detail, setDetail] = useState<RecordShape>()
   const [detailLoading, setDetailLoading] = useState(false)
   const [detailError, setDetailError] = useState('')
+  const replyRequirements = [{ key: 'reply_comment', label: '真实评论回复' }]
+  const canReply = providerSupports(providerContext, 'reply_comment')
+  const replyCapabilityMessage = providerCapabilityMessage(providerContext, replyRequirements)
 
   const reload = async () => {
     setLoading(true)
@@ -338,22 +453,27 @@ function CommentsView({ project }: RecordShape) {
     setSelectedId(id); setDetail(undefined); setDetailLoading(true); setDetailError('')
     try { setDetail(await request(`/api/comments/${id}`)) } catch (err) { setDetailError(errorText(err)) } finally { setDetailLoading(false) }
   }
-  const refreshDetail = async (id: number) => { try { setDetail(await request(`/api/comments/${id}`)); setDetailError('') } catch (err) { setDetailError(errorText(err)) } }
-  const analyze = async (id: number) => { setBusy(id); setError(''); try { await request(`/api/comments/${id}/analyze`, { method: 'POST' }); await reload(); if (selectedId === id) await refreshDetail(id) } catch (err) { setError(errorText(err)) } finally { setBusy(null) } }
-  const generate = async (id: number) => { setBusy(id); setError(''); try { await request(`/api/comments/${id}/generate-reply`, { method: 'POST' }); await reload(); if (selectedId === id) await refreshDetail(id) } catch (err) { setError(errorText(err)) } finally { setBusy(null) } }
+  const refreshDetail = async (id: number) => { setDetailLoading(true); try { setDetail(await request(`/api/comments/${id}`)); setDetailError('') } catch (err) { setDetailError(errorText(err)) } finally { setDetailLoading(false) } }
+  const setActionError = (id: number, error: unknown) => { const message = errorText(error); if (selectedId === id) setDetailError(message); else setError(message) }
+  const analyze = async (id: number) => { setBusy(id); if (selectedId === id) setDetailError(''); else setError(''); try { await request(`/api/comments/${id}/analyze`, { method: 'POST' }); await reload(); if (selectedId === id) await refreshDetail(id) } catch (err) { setActionError(id, err) } finally { setBusy(null) } }
+  const generate = async (id: number) => { setBusy(id); if (selectedId === id) setDetailError(''); else setError(''); try { await request(`/api/comments/${id}/generate-reply`, { method: 'POST' }); await reload(); if (selectedId === id) await refreshDetail(id) } catch (err) { setActionError(id, err) } finally { setBusy(null) } }
+  const approve = async (id: number, text: string) => {
+    const replyText = text.trim()
+    const latestReply = detail?.replies?.[0]
+    if (!latestReply?.id) { setDetailError('请先生成回复草稿'); return }
+    if (!replyText) { setDetailError('通过前必须填写回复文本'); return }
+    setBusy(id); setDetailError('')
+    try { await request(`/api/replies/${latestReply.id}`, { method: 'PATCH', body: JSON.stringify({ action: 'approve', reply_text: replyText }) }); await reload(); await refreshDetail(id) } catch (err) { setDetailError(errorText(err)) } finally { setBusy(null) }
+  }
   const send = async (id: number, text: string) => {
     const replyText = text.trim()
     if (!replyText) { setDetailError('回复文本不能为空'); return }
+    if (!canReply) { setDetailError(replyCapabilityMessage); return }
+    const latestReply = detail?.replies?.[0]
+    if (!latestReply?.id || latestReply.status !== 'APPROVED') { setDetailError('请先通过人工审核，再发送回复'); return }
     if (!window.confirm('确认在真实抖音页面发送这条回复？')) return
     setBusy(id); setDetailError('')
     try {
-      const latestReply = detail?.replies?.[0]
-      if (latestReply?.status === 'FAILED') {
-        await request(`/api/replies/${latestReply.id}`, { method: 'PATCH', body: JSON.stringify({ action: 'retry' }) })
-      }
-      if (latestReply && latestReply.status !== 'APPROVED') {
-        await request(`/api/replies/${latestReply.id}`, { method: 'PATCH', body: JSON.stringify({ action: 'approve', reply_text: replyText }) })
-      }
       await request(`/api/comments/${id}/reply`, { method: 'POST', body: JSON.stringify({ reply_text: replyText, confirm: true }) }); await reload(); await refreshDetail(id)
     } catch (err) { setDetailError(errorText(err)) } finally { setBusy(null) }
   }
@@ -363,10 +483,10 @@ function CommentsView({ project }: RecordShape) {
     const matchesFilter = filter === 'all' || (filter === 'unanalysed' && !item.intent_level && !item.lead_id) || (filter === 'lead' && item.lead_id) || (filter === 's' && item.lead_level === 'S') || (filter === 'a' && item.lead_level === 'A') || (filter === 'b' && item.lead_level === 'B') || (filter === 'c' && item.lead_level === 'C') || (filter === 'pending' && ['DRAFT', 'WAITING_REVIEW', 'APPROVED'].includes(replyStatus)) || (filter === 'waiting' && replyStatus === 'WAITING_REVIEW') || (filter === 'failed' && replyStatus === 'FAILED') || (filter === 'sent' && ['SENT', 'VERIFIED', 'SENT_UNVERIFIED'].includes(replyStatus))
     return (!query.trim() || haystack.includes(query.trim().toLowerCase())) && (coverage === 'all' || item.coverage_status === coverage) && matchesFilter
   })
-  return <div className="page"><PageHeader eyebrow="PUBLIC COMMENTS" title="评论池" description="只展示真实同步的公开评论；先查看上下文，再执行 AI 分析或人工确认发送。" actions={<Button icon={RefreshCw} onClick={() => void reload()} disabled={loading}>{loading ? '加载中…' : '刷新'}</Button>} />{error && <div className="error-banner"><X size={15} /><span>{error}</span><button onClick={() => setError('')} aria-label="关闭错误">关闭</button></div>}<div className="comments-toolbar"><label className="table-search"><Search size={14} /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索评论、用户或视频 ID" aria-label="搜索评论" /></label><div className="filter-tabs" role="tablist" aria-label="评论状态筛选">{[['all', '全部'], ['unanalysed', '未分析'], ['lead', '潜客'], ['s', 'S 级'], ['a', 'A 级'], ['b', 'B 级'], ['c', 'C 级'], ['pending', '待回复'], ['waiting', '待审核'], ['failed', '失败'], ['sent', '已回复']].map(([key, label]) => <button key={key} className={filter === key ? 'selected' : ''} onClick={() => setFilter(key)}>{label}</button>)}</div><div className="filter-tabs" role="tablist" aria-label="评论覆盖范围筛选">{[['all', '全部覆盖'], ['complete', '完整'], ['partial', '部分'], ['unknown', '待确认']].map(([key, label]) => <button key={key} className={coverage === key ? 'selected' : ''} onClick={() => setCoverage(key)}>{label}</button>)}</div><span className="toolbar-meta">{rows.length} / {items.length} 条评论</span></div><section className="panel data-panel comments-data">{loading ? <TableSkeleton rows={5} /> : rows.length ? <div className="table-scroll"><table><thead><tr><th>用户</th><th>评论</th><th>来源视频</th><th>AI 意图</th><th>潜客分数</th><th>回复状态</th><th>时间</th><th>操作</th></tr></thead><tbody>{rows.map((item: RecordShape) => <tr key={item.id}><td><button className="table-link" onClick={() => void openDetail(item.id)}>{item.nickname || '未知用户'}<small>{item.platform_user_id || '未提供用户标识'}</small></button></td><td className="comment-content"><button className="table-link" onClick={() => void openDetail(item.id)}>{item.content || '无文本内容'}<small><StatusPill tone={commentCoverageTone(item.coverage_status)}>{commentCoverageLabel(item.coverage_status)}</StatusPill></small></button></td><td><span>{item.video_title || `视频 #${item.video_id}`}</span>{item.video_url && <a className="drawer-source-link" href={item.video_url} target="_blank" rel="noreferrer" aria-label="打开来源视频"><ArrowUpRight size={12} /></a>}</td><td>{item.intent_level ? <StatusPill tone={item.lead_level === 'S' ? 'accent' : 'neutral'}>{item.intent_level}</StatusPill> : <span className="muted">未分析</span>}</td><td>{item.lead_score != null ? <b className="lead-score">{Math.round(item.lead_score)}<small>{item.lead_level || '—'}</small></b> : <span className="muted">—</span>}</td><td><StatusPill tone={item.reply_status === 'VERIFIED' ? 'green' : item.reply_status === 'WAITING_REVIEW' ? 'amber' : item.reply_status === 'FAILED' ? 'red' : 'neutral'}>{replyStatusLabel(item.reply_status || '未生成')}</StatusPill></td><td className="muted">{formatDateTime(item.created_at_platform)}</td><td><div className="toolbar-actions"><Button onClick={() => void openDetail(item.id)}>详情</Button><Button onClick={() => void analyze(item.id)} disabled={busy === item.id}>{busy === item.id ? '分析中…' : '分析'}</Button><Button variant="accent" onClick={() => void generate(item.id)} disabled={busy === item.id}>生成回复</Button></div></td></tr>)}</tbody></table></div> : <EmptyState icon={MessageCircle} text={error ? '无法加载真实评论。' : items.length ? '当前筛选没有匹配评论。' : '暂无真实评论，请先连接抖音并同步评论。'} action={error ? { label: '重试', onClick: () => void reload() } : undefined} />}</section>{selectedId && <CommentDrawer detail={detail} loading={detailLoading} error={detailError} close={() => { setSelectedId(null); setDetail(undefined) }} busy={busy === selectedId} onRetry={() => void refreshDetail(selectedId)} onAnalyze={() => void analyze(selectedId)} onGenerate={() => void generate(selectedId)} onSend={(text: string) => void send(selectedId, text)} />}</div>
+  return <div className="page"><PageHeader eyebrow="PUBLIC COMMENTS" title="评论池" description="只展示真实同步的公开评论；先查看上下文，再执行 AI 分析或人工确认发送。" actions={<Button icon={RefreshCw} onClick={() => void reload()} disabled={loading || busy !== null}>{loading ? '加载中…' : '刷新'}</Button>} />{error && <div className="error-banner" role="alert"><X size={15} /><span>{error}</span><button onClick={() => setError('')} aria-label="关闭错误">关闭</button></div>}<ProviderCapabilityNotice context={providerContext} requirements={replyRequirements} /><div className="comments-toolbar"><label className="table-search"><Search size={14} /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索评论、用户或视频 ID" aria-label="搜索评论" /></label><div className="filter-tabs" role="tablist" aria-label="评论状态筛选">{[['all', '全部'], ['unanalysed', '未分析'], ['lead', '潜客'], ['s', 'S 级'], ['a', 'A 级'], ['b', 'B 级'], ['c', 'C 级'], ['pending', '待回复'], ['waiting', '待审核'], ['failed', '失败'], ['sent', '已回复']].map(([key, label]) => <button key={key} className={filter === key ? 'selected' : ''} onClick={() => setFilter(key)}>{label}</button>)}</div><div className="filter-tabs" role="tablist" aria-label="评论覆盖范围筛选">{[['all', '全部覆盖'], ['complete', '完整'], ['partial', '部分'], ['unknown', '待确认']].map(([key, label]) => <button key={key} className={coverage === key ? 'selected' : ''} onClick={() => setCoverage(key)}>{label}</button>)}</div><span className="toolbar-meta">{rows.length} / {items.length} 条评论</span></div><section className="panel data-panel comments-data">{loading ? <TableSkeleton rows={5} /> : rows.length ? <div className="table-scroll"><table><thead><tr><th>用户</th><th>评论</th><th>关键词</th><th>来源视频</th><th>AI 意图</th><th>潜客分数</th><th>回复状态</th><th>时间</th><th>操作</th></tr></thead><tbody>{rows.map((item: RecordShape) => <tr key={item.id}><td><button className="table-link" onClick={() => void openDetail(item.id)}>{item.nickname || '未知用户'}<small>{item.platform_user_id || '未提供用户标识'}</small></button></td><td className="comment-content"><button className="table-link" onClick={() => void openDetail(item.id)}>{item.content || '无文本内容'}<small><StatusPill tone={commentCoverageTone(item.coverage_status)}>{commentCoverageLabel(item.coverage_status)}</StatusPill></small></button></td><td><span className="comment-keyword">{item.keyword || '未关联关键词'}</span></td><td><span>{item.video_title || `视频 #${item.video_id}`}</span>{item.video_url && <a className="drawer-source-link" href={item.video_url} target="_blank" rel="noreferrer" aria-label="打开来源视频"><ArrowUpRight size={12} /></a>}</td><td>{item.intent_level ? <StatusPill tone={item.lead_level === 'S' ? 'accent' : 'neutral'}>{item.intent_level}</StatusPill> : <span className="muted">未分析</span>}</td><td>{item.lead_score != null ? <b className="lead-score">{Math.round(item.lead_score)}<small>{item.lead_level || '—'}</small></b> : <span className="muted">—</span>}</td><td><StatusPill tone={item.reply_status === 'VERIFIED' ? 'green' : item.reply_status === 'WAITING_REVIEW' ? 'amber' : item.reply_status === 'FAILED' ? 'red' : 'neutral'}>{replyStatusLabel(item.reply_status || '未生成')}</StatusPill></td><td className="muted">{formatDateTime(item.created_at_platform)}</td><td><div className="toolbar-actions"><Button onClick={() => void openDetail(item.id)}>详情</Button><Button onClick={() => void analyze(item.id)} disabled={busy !== null}>{busy === item.id ? '分析中…' : '分析'}</Button><Button variant="accent" onClick={() => void generate(item.id)} disabled={busy !== null}>生成回复</Button></div></td></tr>)}</tbody></table></div> : <EmptyState icon={MessageCircle} text={error ? '无法加载真实评论。' : items.length ? '当前筛选没有匹配评论。' : '暂无真实评论，请先连接抖音并同步评论。'} action={error ? { label: '重试', onClick: () => void reload() } : undefined} />}</section>{selectedId && <CommentDrawer detail={detail} loading={detailLoading} error={detailError} close={() => { if (busy === null) { setSelectedId(null); setDetail(undefined) } }} busy={busy === selectedId} canReply={canReply} replyBlockMessage={replyCapabilityMessage} onRetry={() => void refreshDetail(selectedId)} onAnalyze={() => void analyze(selectedId)} onGenerate={() => void generate(selectedId)} onApprove={(text: string) => void approve(selectedId, text)} onSend={(text: string) => void send(selectedId, text)} />}</div>
 }
 
-function CommentDrawer({ detail, loading, error, close, onRetry, onAnalyze, onGenerate, onSend, busy }: RecordShape) {
+function CommentDrawer({ detail, loading, error, close, onRetry, onAnalyze, onGenerate, onApprove, onSend, busy, canReply = false, replyBlockMessage = '当前数据源不支持真实评论回复。' }: RecordShape) {
   const [replyText, setReplyText] = useState('')
   const comment = detail?.comment || {}
   const video = detail?.video || {}
@@ -375,10 +495,13 @@ function CommentDrawer({ detail, loading, error, close, onRetry, onAnalyze, onGe
   useEffect(() => { if (detail?.comment?.id) setReplyText(replies[0]?.reply_text || '') }, [detail?.comment?.id, replies])
   const latestReply = replies[0]
   const reviewableReply = latestReply && ['DRAFT', 'WAITING_REVIEW', 'APPROVED', 'FAILED'].includes(String(latestReply.status))
-  return <div className="drawer-backdrop" onClick={close}><aside className="comment-drawer lead-drawer" onClick={(event) => event.stopPropagation()} aria-label="评论详情"><div className="drawer-head"><span className="eyebrow">COMMENT DETAIL</span><button className="icon-button" onClick={close} aria-label="关闭评论详情"><X size={17} /></button></div>{loading ? <div className="drawer-loading"><LoaderCircle size={20} className="loading-spin" /><span>正在读取评论上下文…</span></div> : error && !detail ? <div className="drawer-error"><X size={18} /><p>{error}</p><Button variant="accent" icon={RefreshCw} onClick={onRetry}>重试</Button></div> : <><div className="comment-identity"><span className="drawer-avatar">{(comment.nickname || '客')[0]}</span><div><h2>{comment.nickname || '未提供昵称'}</h2><span>{comment.platform_user_id || '未提供用户标识'} · {formatDateTime(comment.created_at_platform)}</span></div></div>{error && <div className="error-inline"><X size={14} />{error}</div>}<div className="drawer-comment-quote"><SectionLabel>PUBLIC TEXT</SectionLabel><p>{comment.content || '无文本内容'}</p>{comment.is_reply && <StatusPill tone="neutral">二级回复</StatusPill>}</div>{lead.id ? <div className="drawer-section"><SectionLabel>AI LEAD JUDGEMENT</SectionLabel><div className="drawer-facts"><div><span>潜客评分</span><b>{Math.round(lead.lead_score || 0)} · {lead.lead_level || '—'} 级</b></div><div><span>意向等级</span><b>{lead.intent_level || '—'}</b></div><div><span>需求</span><b>{lead.need || '—'}</b></div><div><span>预算</span><b>{lead.budget || '—'}</b></div><div><span>时间要求</span><b>{lead.time_requirement || '—'}</b></div><div><span>购买阶段</span><b>{lead.purchase_stage || '—'}</b></div></div><p>{lead.reason || lead.summary || '暂无 AI 判断原因'}</p></div> : <div className="drawer-section"><SectionLabel>AI LEAD JUDGEMENT</SectionLabel><p>尚未形成潜客判断，点击“重新分析”开始。</p></div>}<div className="drawer-facts"><div><span>覆盖范围</span><b><StatusPill tone={commentCoverageTone(comment.coverage_status)}>{commentCoverageLabel(comment.coverage_status)}</StatusPill></b></div><div><span>评论赞</span><b>{Number(comment.like_count || 0).toLocaleString()}</b></div><div><span>来源视频</span><b>#{comment.video_id}</b></div><div><span>评论 ID 来源</span><b>{comment.id_source || '—'}</b></div></div><div className="drawer-section"><SectionLabel>THREAD CONTEXT</SectionLabel>{detail.history_text?.length ? <div className="history-list">{detail.history_text.map((text: string, index: number) => <div key={`${index}-${text}`}><time>{index === 0 ? '上下文' : `历史 ${index}`}</time><p>{text}</p></div>)}</div> : <p>暂无同用户或同线程的其他评论。</p>}</div><div className="drawer-section"><SectionLabel>SOURCE VIDEO</SectionLabel><p>{video.title || '无标题视频'}</p><small className="drawer-meta-line">{video.creator || '未知作者'} · 关键词 {video.keyword || '未关联'}</small>{video.url && <a className="drawer-source-link" href={video.url} target="_blank" rel="noreferrer">打开真实视频页面 <ArrowUpRight size={12} /></a>}</div><div className="drawer-section"><SectionLabel>AI / REPLY STATUS</SectionLabel>{replies.length ? <div className="reply-history">{replies.map((reply: RecordShape) => <div key={reply.id}><div><StatusPill tone={reply.status === 'VERIFIED' ? 'green' : reply.status === 'FAILED' ? 'red' : reply.status === 'WAITING_REVIEW' ? 'amber' : 'neutral'}>{replyStatusLabel(reply.status)}</StatusPill><time>{formatDateTime(reply.created_at)}</time></div><p>{reply.reply_text || reply.error_message || '无回复文本'}</p></div>)}</div> : <p>暂无回复记录，可先让文本模型生成草稿。</p>}{!replies.length || ['FAILED', 'SKIPPED'].includes(replies[0]?.status) ? <div className="drawer-actions"><Button onClick={onAnalyze} disabled={busy}>重新分析</Button><Button variant="accent" onClick={onGenerate} disabled={busy}>{busy ? '生成中…' : '生成回复草稿'}</Button></div> : null}</div>{reviewableReply && <div className="drawer-send"><SectionLabel>HUMAN REVIEW</SectionLabel><textarea className="reply-editor" value={replyText} onChange={(event) => setReplyText(event.target.value)} rows={3} aria-label="编辑待发送回复" placeholder="AI 没有生成安全文本，请人工填写后发送" /><div className="drawer-actions"><Button variant="accent" onClick={() => onSend(replyText)} disabled={busy || !replyText.trim()}>{busy ? '发送中…' : '确认并发送'}</Button></div><small>发送会操作真实抖音页面，必须经过确认；不会使用视觉模型。</small></div>}</>}</aside></div>
+  const reviewStatus = String(latestReply?.status || '')
+  const needsApproval = ['DRAFT', 'WAITING_REVIEW', 'FAILED'].includes(reviewStatus)
+  const approved = reviewStatus === 'APPROVED'
+  return <div className="drawer-backdrop" onClick={busy ? undefined : close}><aside className="comment-drawer lead-drawer" role="dialog" aria-modal="true" aria-label="评论详情" onClick={(event) => event.stopPropagation()}><div className="drawer-head"><span className="eyebrow">COMMENT DETAIL</span><button className="icon-button" onClick={close} aria-label="关闭评论详情" disabled={busy}><X size={17} /></button></div>{loading ? <div className="drawer-loading"><LoaderCircle size={20} className="loading-spin" /><span>正在读取评论上下文…</span></div> : error && !detail ? <div className="drawer-error"><X size={18} /><p>{error}</p><Button variant="accent" icon={RefreshCw} onClick={onRetry}>重试</Button></div> : <><div className="comment-identity"><span className="drawer-avatar">{(comment.nickname || '客')[0]}</span><div><h2>{comment.nickname || '未提供昵称'}</h2><span>{comment.platform_user_id || '未提供用户标识'} · {formatDateTime(comment.created_at_platform)}</span></div></div>{error && <div className="error-inline" role="alert"><X size={14} /><span>{error}</span><Button icon={RefreshCw} onClick={onRetry} disabled={loading || busy}>重试</Button></div>}<div className="drawer-comment-quote"><SectionLabel>PUBLIC TEXT</SectionLabel><p>{comment.content || '无文本内容'}</p>{comment.is_reply && <StatusPill tone="neutral">二级回复</StatusPill>}</div>{lead.id ? <div className="drawer-section"><SectionLabel>AI LEAD JUDGEMENT</SectionLabel><div className="drawer-facts"><div><span>潜客评分</span><b>{Math.round(lead.lead_score || 0)} · {lead.lead_level || '—'} 级</b></div><div><span>意向等级</span><b>{lead.intent_level || '—'}</b></div><div><span>需求</span><b>{lead.need || '—'}</b></div><div><span>预算</span><b>{lead.budget || '—'}</b></div><div><span>时间要求</span><b>{lead.time_requirement || '—'}</b></div><div><span>购买阶段</span><b>{lead.purchase_stage || '—'}</b></div></div><p>{lead.reason || lead.summary || '暂无 AI 判断原因'}</p></div> : <div className="drawer-section"><SectionLabel>AI LEAD JUDGEMENT</SectionLabel><p>尚未形成潜客判断，点击“重新分析”开始。</p></div>}<div className="drawer-facts"><div><span>覆盖范围</span><b><StatusPill tone={commentCoverageTone(comment.coverage_status)}>{commentCoverageLabel(comment.coverage_status)}</StatusPill></b></div><div><span>评论赞</span><b>{Number(comment.like_count || 0).toLocaleString()}</b></div><div><span>来源视频</span><b>#{comment.video_id}</b></div><div><span>评论 ID 来源</span><b>{comment.id_source || '—'}</b></div></div><div className="drawer-section"><SectionLabel>THREAD CONTEXT</SectionLabel>{detail.history_text?.length ? <div className="history-list">{detail.history_text.map((text: string, index: number) => <div key={`${index}-${text}`}><time>{index === 0 ? '上下文' : `历史 ${index}`}</time><p>{text}</p></div>)}</div> : <p>暂无同用户或同线程的其他评论。</p>}</div><div className="drawer-section"><SectionLabel>SOURCE VIDEO</SectionLabel><p>{video.title || '无标题视频'}</p><small className="drawer-meta-line">{video.creator || '未知作者'} · 关键词 {video.keyword || '未关联'}</small>{video.url && <a className="drawer-source-link" href={video.url} target="_blank" rel="noreferrer">打开真实视频页面 <ArrowUpRight size={12} /></a>}</div><div className="drawer-section"><SectionLabel>AI / REPLY STATUS</SectionLabel>{replies.length ? <div className="reply-history">{replies.map((reply: RecordShape) => <div key={reply.id}><div><StatusPill tone={reply.status === 'VERIFIED' ? 'green' : reply.status === 'FAILED' ? 'red' : reply.status === 'WAITING_REVIEW' ? 'amber' : 'neutral'}>{replyStatusLabel(reply.status)}</StatusPill><time>{formatDateTime(reply.created_at)}</time></div><p>{reply.reply_text || reply.error_message || '无回复文本'}</p></div>)}</div> : <p>暂无回复记录，可先让文本模型生成草稿。</p>}{!replies.length || ['FAILED', 'SKIPPED'].includes(replies[0]?.status) ? <div className="drawer-actions"><Button onClick={onAnalyze} disabled={busy}>重新分析</Button><Button variant="accent" onClick={onGenerate} disabled={busy}>{busy ? '生成中…' : '生成回复草稿'}</Button></div> : null}</div>{reviewableReply && <div className="drawer-send"><SectionLabel>HUMAN REVIEW</SectionLabel>{needsApproval && <p className="drawer-detail-muted">通过审核只保存审核结果，不会发送到抖音。</p>}{approved && !canReply && <div className="error-inline" role="alert"><X size={14} /><span>{replyBlockMessage}</span></div>}{approved && <p className="drawer-detail-muted">已通过审核的文本已锁定；如需修改，请重新生成草稿后再审核。</p>}<textarea className="reply-editor" value={replyText} onChange={(event) => setReplyText(event.target.value)} rows={3} aria-label="编辑待发送回复" placeholder="AI 没有生成安全文本，请人工填写后发送" disabled={approved || (!needsApproval && (!canReply || busy))} readOnly={approved} /><div className="drawer-actions">{needsApproval && <Button onClick={() => onApprove(replyText)} disabled={busy || !replyText.trim()}>{busy ? '审核中…' : '通过'}</Button>}{approved && <Button variant="accent" onClick={() => onSend(replyText)} disabled={busy || !replyText.trim() || !canReply}>{busy ? '发送中…' : '发送'}</Button>}</div><small>“通过”不会触发平台操作；“发送”才会操作真实抖音页面，并且需要明确确认。</small></div>}</>}</aside></div>
 }
 
-function RepliesView({ project }: RecordShape) {
+function RepliesView({ project, providerContext }: RecordShape) {
   const [items, setItems] = useState<RecordShape[]>([])
   const [comments, setComments] = useState<RecordShape[]>([])
   const [error, setError] = useState('')
@@ -388,32 +511,41 @@ function RepliesView({ project }: RecordShape) {
   const [drafts, setDrafts] = useState<Record<number, string>>({})
   const [selectedIds, setSelectedIds] = useState<number[]>([])
   const [notice, setNotice] = useState('')
-  const reload = async () => { setLoading(true); try { const [replyRows, commentRows] = await Promise.all([request(`/api/replies?project_id=${project.id}`), request(`/api/comments?project_id=${project.id}&limit=500`)]); setItems(replyRows); setComments(commentRows); setError('') } catch (err: any) { setError(err.message) } finally { setLoading(false) } }
+  const replyRequirements = [{ key: 'reply_comment', label: '真实评论回复' }]
+  const canReply = providerSupports(providerContext, 'reply_comment')
+  const replyCapabilityMessage = providerCapabilityMessage(providerContext, replyRequirements)
+  const reload = async () => { setLoading(true); try { const [replyRows, commentRows] = await Promise.all([request(`/api/replies?project_id=${project.id}`), request(`/api/comments?project_id=${project.id}&limit=500`)]); setItems(replyRows); setComments(commentRows); setError('') } catch (err) { setError(errorText(err)) } finally { setLoading(false) } }
   useEffect(() => { void reload() }, [project.id])
   const beginEdit = (item: RecordShape) => { setEditingId(item.id); setDrafts((current) => ({ ...current, [item.id]: item.reply_text || '' })); setNotice('') }
-  const send = async (item: RecordShape) => {
+  const approve = async (item: RecordShape) => {
     const replyText = String(drafts[item.id] ?? item.reply_text ?? '').trim()
+    if (!replyText) { setError('通过前必须填写回复文本'); return }
+    setBusy(item.id); setError(''); setNotice('')
+    try { await request(`/api/replies/${item.id}`, { method: 'PATCH', body: JSON.stringify({ action: 'approve', reply_text: replyText }) }); setEditingId(null); setDrafts((current) => { const next = { ...current }; delete next[item.id]; return next }); setNotice('回复已通过人工审核，尚未发送'); await reload() } catch (err: any) { setError(errorText(err)) } finally { setBusy(null) }
+  }
+  const send = async (item: RecordShape) => {
+    if (!canReply) { setError(replyCapabilityMessage); return }
+    const replyText = String(item.reply_text ?? '').trim()
     if (!replyText) { setError('回复文本不能为空'); return }
-    if (!window.confirm('确认批准并在真实抖音页面发送这条回复？')) return
+    if (String(item.status) !== 'APPROVED') { setError('请先通过人工审核，再发送回复'); return }
+    if (!window.confirm('确认在真实抖音页面发送这条回复？')) return
     setBusy(item.id); setError(''); setNotice('')
     try {
-      const currentStatus = String(item.status || 'DRAFT')
-      if (currentStatus === 'FAILED') await request(`/api/replies/${item.id}`, { method: 'PATCH', body: JSON.stringify({ action: 'retry' }) })
-      if (currentStatus !== 'APPROVED') await request(`/api/replies/${item.id}`, { method: 'PATCH', body: JSON.stringify({ action: 'approve', reply_text: replyText }) })
       const result = await request(`/api/comments/${item.comment_id}/reply`, { method: 'POST', body: JSON.stringify({ reply_text: replyText, confirm: true }) })
       setEditingId(null)
       setNotice(result.reply?.status === 'VERIFIED' ? '回复已发送并完成页面验证' : '回复已发送，但尚未完成页面验证')
       await reload()
     } catch (err: any) { setError(err.message); await reload() } finally { setBusy(null) }
   }
-  const batchCandidates = items.filter((item) => ['DRAFT', 'WAITING_REVIEW', 'APPROVED'].includes(String(item.status || 'DRAFT')) && String(drafts[item.id] ?? item.reply_text ?? '').trim())
+  const batchCandidates = items.filter((item) => String(item.status) === 'APPROVED' && String(item.reply_text ?? '').trim())
   const sendBatch = async () => {
+    if (!canReply) { setError(replyCapabilityMessage); return }
     const selected = batchCandidates.filter((item) => selectedIds.includes(item.id))
-    if (!selected.length) { setError('请先选择有回复文本的待审核记录'); return }
+     if (!selected.length) { setError('请先选择已通过审核且有回复文本的记录'); return }
     if (!window.confirm(`确认在真实抖音页面依次发送 ${selected.length} 条回复？`)) return
     setBusy(-1); setError(''); setNotice('')
     try {
-      const result = await request('/api/comments/reply-batch', { method: 'POST', body: JSON.stringify({ items: selected.map((item) => ({ comment_id: item.comment_id, reply_text: String(drafts[item.id] ?? item.reply_text).trim() })), confirm: true }) })
+      const result = await request('/api/comments/reply-batch', { method: 'POST', body: JSON.stringify({ items: selected.map((item) => ({ comment_id: item.comment_id, reply_text: String(item.reply_text ?? '').trim() })), confirm: true }) })
       setSelectedIds([])
       setNotice(`批量发送完成：成功 ${result.success_count || 0} 条，失败 ${result.failed_count || 0} 条`)
       await reload()
@@ -425,6 +557,7 @@ function RepliesView({ project }: RecordShape) {
     try { await request(`/api/replies/${item.id}`, { method: 'PATCH', body: JSON.stringify({ action: 'skip' }) }); setNotice('已跳过这条回复'); await reload() } catch (err: any) { setError(err.message) } finally { setBusy(null) }
   }
   const verify = async (item: RecordShape) => {
+    if (!canReply) { setError(replyCapabilityMessage); return }
     if (!window.confirm('重新读取真实抖音页面，核验这条回复是否已经出现？不会再次发送。')) return
     setBusy(item.id); setError(''); setNotice('')
     try {
@@ -434,7 +567,8 @@ function RepliesView({ project }: RecordShape) {
     } catch (err: any) { setError(err.message); await reload() } finally { setBusy(null) }
   }
   const statusLabel: Record<string, string> = { DRAFT: '草稿', WAITING_REVIEW: '待审核', APPROVED: '已批准', SENDING: '发送中', SENT: '已发送', SENT_UNVERIFIED: '已发送待验证', VERIFIED: '已验证', FAILED: '发送失败', SKIPPED: '已跳过' }
-  const canSend = (status: string) => ['DRAFT', 'WAITING_REVIEW', 'APPROVED', 'FAILED'].includes(status)
+  const canReview = (status: string) => ['DRAFT', 'WAITING_REVIEW', 'FAILED'].includes(status)
+  const canSend = (status: string) => status === 'APPROVED'
   const sentStatuses = ['SENT', 'VERIFIED', 'SENT_UNVERIFIED']
   const commentById = new Map(comments.map((comment) => [comment.id, comment]))
   const selectedCandidateCount = batchCandidates.filter((item) => selectedIds.includes(item.id)).length
@@ -446,7 +580,7 @@ function RepliesView({ project }: RecordShape) {
   const successfulReplies = items.filter((item) => ['SENT', 'VERIFIED'].includes(String(item.status))).length
   const pendingVerification = items.filter((item) => String(item.status) === 'SENT_UNVERIFIED').length
   const failedReplies = items.filter((item) => String(item.status) === 'FAILED').length
-  return <div className="page"><PageHeader eyebrow="REPLY QUEUE" title="AI 回复" description="回复默认进入人工审核队列；批准发送前可编辑文本，发送必须经过明确确认。" actions={<div className="header-actions"><Button icon={RefreshCw} onClick={reload} disabled={loading || busy !== null}>{loading ? '加载中…' : '刷新队列'}</Button>{selectedCandidateCount > 0 && <Button variant="accent" icon={Check} onClick={() => void sendBatch()} disabled={busy !== null}>{busy === -1 ? '批量发送中…' : `批量发送 ${selectedCandidateCount} 条`}</Button>}</div>} />{error && <div className="error-banner"><X size={15} />{error}</div>}{notice && <div className="success-banner"><Check size={15} />{notice}</div>}<div className="reply-stat-grid"><div className="reply-stat"><span>今日评论</span><b>{todayComments}</b><small>公开文本</small></div><div className="reply-stat"><span>AI 已分析</span><b>{analysedComments}</b><small>已完成判断</small></div><div className="reply-stat"><span>潜在线索</span><b>{leadComments}</b><small>已进入潜客池</small></div><div className="reply-stat"><span>待审核</span><b>{items.filter((item) => String(item.status) === 'WAITING_REVIEW').length}</b><small>等待人工确认</small></div><div className="reply-stat"><span>今日回复</span><b>{todayReplies}</b><small>真实发送记录</small></div><div className="reply-stat"><span>发送成功</span><b>{successfulReplies}</b><small>{pendingVerification ? `${pendingVerification} 条待核验` : '页面已确认或已发送'}</small></div><div className="reply-stat"><span>失败</span><b>{failedReplies}</b><small>可重试审核</small></div></div><section className="panel data-panel">{loading ? <TableSkeleton rows={4} /> : items.length ? <div className="table-scroll"><table><thead><tr><th><input type="checkbox" aria-label="选择全部可批量发送回复" checked={batchCandidates.length > 0 && selectedCandidateCount === batchCandidates.length} onChange={(event) => setSelectedIds(event.target.checked ? batchCandidates.map((item) => item.id) : [])} /></th><th>来源评论</th><th>回复文本</th><th>来源</th><th>状态</th><th>时间</th><th>操作</th></tr></thead><tbody>{items.map((item: RecordShape) => { const status = String(item.status || 'DRAFT'); const isEditing = editingId === item.id; const sourceComment = commentById.get(item.comment_id); const canBatchSelect = batchCandidates.some((candidate) => candidate.id === item.id); return <tr key={item.id}><td><input type="checkbox" aria-label={`选择评论 ${item.comment_id} 的回复`} checked={selectedIds.includes(item.id)} disabled={!canBatchSelect || busy !== null} onChange={(event) => setSelectedIds((current) => event.target.checked ? [...current, item.id] : current.filter((id) => id !== item.id))} /></td><td><b>{sourceComment?.content || `评论 #${item.comment_id}`}</b><small>{sourceComment?.nickname || '未知用户'} · {sourceComment?.video_title || `视频 #${sourceComment?.video_id || '—'}`}</small></td><td>{isEditing ? <textarea className="reply-editor" value={drafts[item.id] ?? ''} onChange={(event) => setDrafts((current) => ({ ...current, [item.id]: event.target.value }))} rows={3} aria-label={`编辑评论 ${item.comment_id} 的回复`} /> : <span>{item.reply_text || item.error_message || '暂无回复文本，请编辑后人工填写'}</span>}{status === 'FAILED' && <small className="reply-error">{item.error_code || 'REPLY_FAILED'} · {item.error_message || '真实回复失败'}</small>}</td><td>{item.reply_source || 'AI'}</td><td><StatusPill tone={status === 'VERIFIED' ? 'green' : status === 'FAILED' ? 'red' : status === 'WAITING_REVIEW' || status === 'SENT_UNVERIFIED' ? 'amber' : 'neutral'}>{statusLabel[status] || status}</StatusPill></td><td>{formatDateTime(item.created_at)}</td><td><div className="toolbar-actions">{canSend(status) && (isEditing ? <><Button onClick={() => setEditingId(null)}>取消</Button><Button variant="accent" onClick={() => void send(item)} disabled={busy === item.id}>{busy === item.id ? '发送中…' : '批准并发送'}</Button></> : <><Button onClick={() => beginEdit(item)} disabled={busy !== null}>编辑</Button><Button variant="accent" onClick={() => void send(item)} disabled={busy !== null}>{status === 'FAILED' ? '重试发送' : '批准并发送'}</Button><Button onClick={() => void skip(item)} disabled={busy !== null}>跳过</Button></>)}{['SENT_UNVERIFIED', 'SENT'].includes(status) && <Button onClick={() => void verify(item)} disabled={busy !== null}>{busy === item.id ? '核验中…' : '重新核验'}</Button>}</div></td></tr> })}</tbody></table></div> : <EmptyState icon={MessageCircle} text={error ? '无法加载真实回复队列。' : '暂无回复记录。'} action={error ? { label: '重试', onClick: reload } : undefined} />}</section></div>
+  return <div className="page"><PageHeader eyebrow="REPLY QUEUE" title="AI 回复" description="回复默认进入人工审核队列；先通过审核，再发送到真实抖音页面。" actions={<div className="header-actions"><Button icon={RefreshCw} onClick={reload} disabled={loading || busy !== null}>{loading ? '加载中…' : '刷新队列'}</Button>{selectedCandidateCount > 0 && <Button variant="accent" icon={Check} onClick={() => void sendBatch()} disabled={busy !== null || !canReply}>{busy === -1 ? '批量发送中…' : `批量发送 ${selectedCandidateCount} 条`}</Button>}</div>} />{error && <div className="error-banner"><X size={15} />{error}</div>}{notice && <div className="success-banner"><Check size={15} />{notice}</div>}<ProviderCapabilityNotice context={providerContext} requirements={replyRequirements} /><div className="reply-stat-grid"><div className="reply-stat"><span>今日评论</span><b>{todayComments}</b><small>公开文本</small></div><div className="reply-stat"><span>AI 已分析</span><b>{analysedComments}</b><small>已完成判断</small></div><div className="reply-stat"><span>潜在线索</span><b>{leadComments}</b><small>已进入潜客池</small></div><div className="reply-stat"><span>待审核</span><b>{items.filter((item) => String(item.status) === 'WAITING_REVIEW').length}</b><small>等待人工确认</small></div><div className="reply-stat"><span>今日回复</span><b>{todayReplies}</b><small>真实发送记录</small></div><div className="reply-stat"><span>发送成功</span><b>{successfulReplies}</b><small>{pendingVerification ? `${pendingVerification} 条待核验` : '页面已确认或已发送'}</small></div><div className="reply-stat"><span>失败</span><b>{failedReplies}</b><small>可重试审核</small></div></div><section className="panel data-panel">{loading ? <TableSkeleton rows={4} /> : items.length ? <div className="table-scroll"><table><thead><tr><th><input type="checkbox" aria-label="选择全部已审核回复" checked={batchCandidates.length > 0 && selectedCandidateCount === batchCandidates.length} onChange={(event) => setSelectedIds(event.target.checked ? batchCandidates.map((item) => item.id) : [])} /></th><th>来源评论</th><th>回复文本</th><th>来源</th><th>状态</th><th>时间</th><th>操作</th></tr></thead><tbody>{items.map((item: RecordShape) => { const status = String(item.status || 'DRAFT'); const isEditing = editingId === item.id; const sourceComment = commentById.get(item.comment_id); const canBatchSelect = batchCandidates.some((candidate) => candidate.id === item.id); return <tr key={item.id}><td><input type="checkbox" aria-label={`选择评论 ${item.comment_id} 的回复`} checked={selectedIds.includes(item.id)} disabled={!canBatchSelect || busy !== null} onChange={(event) => setSelectedIds((current) => event.target.checked ? [...current, item.id] : current.filter((id) => id !== item.id))} /></td><td><b>{sourceComment?.content || `评论 #${item.comment_id}`}</b><small>{sourceComment?.nickname || '未知用户'} · {sourceComment?.video_title || `视频 #${sourceComment?.video_id || '—'}`}</small></td><td>{isEditing ? <textarea className="reply-editor" value={drafts[item.id] ?? ''} onChange={(event) => setDrafts((current) => ({ ...current, [item.id]: event.target.value }))} rows={3} aria-label={`编辑评论 ${item.comment_id} 的回复`} disabled={busy !== null} /> : <span>{item.reply_text || item.error_message || '暂无回复文本，请编辑后人工填写'}</span>}{status === 'FAILED' && <small className="reply-error">{item.error_code || 'REPLY_FAILED'} · {item.error_message || '真实回复失败'}</small>}</td><td>{item.reply_source || 'AI'}</td><td><StatusPill tone={status === 'VERIFIED' ? 'green' : status === 'FAILED' ? 'red' : status === 'WAITING_REVIEW' || status === 'SENT_UNVERIFIED' ? 'amber' : 'neutral'}>{statusLabel[status] || status}</StatusPill></td><td>{formatDateTime(item.created_at)}</td><td><div className="toolbar-actions">{canReview(status) && (isEditing ? <><Button onClick={() => setEditingId(null)} disabled={busy !== null}>取消</Button><Button variant="accent" onClick={() => void approve(item)} disabled={busy === item.id}>{busy === item.id ? '审核中…' : '通过'}</Button></> : <><Button onClick={() => beginEdit(item)} disabled={busy !== null}>编辑</Button><Button variant="accent" onClick={() => void approve(item)} disabled={busy !== null}>{status === 'FAILED' ? '重新通过' : '通过'}</Button><Button onClick={() => void skip(item)} disabled={busy !== null}>跳过</Button></>)}{canSend(status) && <><Button variant="accent" onClick={() => void send(item)} disabled={busy !== null || !canReply}>{busy === item.id ? '发送中…' : '发送'}</Button><Button onClick={() => void skip(item)} disabled={busy !== null}>跳过</Button></>}{['SENT_UNVERIFIED', 'SENT'].includes(status) && <Button onClick={() => void verify(item)} disabled={busy !== null || !canReply}>{busy === item.id ? '核验中…' : '重新核验'}</Button>}</div></td></tr> })}</tbody></table></div> : <EmptyState icon={MessageCircle} text={error ? '无法加载真实回复队列。' : '暂无回复记录。'} action={error ? { label: '重试', onClick: reload } : undefined} />}</section></div>
 }
 
 function LegacyKnowledgeView({ project }: RecordShape) {
@@ -511,7 +645,7 @@ function PersonaView({ project }: RecordShape) {
   return <div className="page"><PageHeader eyebrow="TEXT PERSONA" title="人设配置" description="定义回复 Agent 的身份、语气和边界；只用于生成供人工审核的文本建议。" actions={<><Button icon={RefreshCw} onClick={() => void reload()} disabled={loading || busy}>{loading ? '加载中…' : '刷新'}</Button><Button variant="accent" icon={Check} onClick={() => void save()} disabled={loading || busy}>{busy ? '保存中…' : '保存人设'}</Button></>} />{error && <div className="error-banner"><X size={15} /><span>{error}</span><button onClick={() => setError('')} aria-label="关闭错误">关闭</button></div>}{notice && <div className="success-banner"><Check size={15} /><span>{notice}</span><button onClick={() => setNotice('')} aria-label="关闭提示">关闭</button></div>}<section className="panel text-model-settings"><div className="settings-heading"><div><SectionLabel>PERSONA AGENT · TEXT ONLY</SectionLabel><h2>跟进人设</h2><p>不要填写密码、联系方式或无法兑现的承诺；系统不会读取图片或视频画面。</p></div><StatusPill tone="green">人工审核</StatusPill></div>{loading ? <div className="form-loading"><LoaderCircle size={18} className="loading-spin" />正在读取当前人设…</div> : <div className="settings-form-grid"><Field label="名称" required value={form.name || ''} onChange={(value: string) => set('name', value)} placeholder="行业顾问" disabled={busy} /><Field label="身份" value={form.identity || ''} onChange={(value: string) => set('identity', value)} placeholder="本地装修顾问" disabled={busy} /><Field label="经验" value={form.experience || ''} onChange={(value: string) => set('experience', value)} placeholder="从业年限与擅长领域" disabled={busy} /><Field label="地区" value={form.location || ''} onChange={(value: string) => set('location', value)} placeholder="长沙" disabled={busy} /><Field label="语气" value={form.tone || ''} onChange={(value: string) => set('tone', value)} placeholder="专业但不推销" disabled={busy} /><Field label="优势" value={form.strengths || ''} onChange={(value: string) => set('strengths', value)} placeholder="擅长解决什么问题" disabled={busy} /><Field label="禁用词 / 禁止承诺" area value={form.forbidden_words || ''} onChange={(value: string) => set('forbidden_words', value)} placeholder="例如：绝对、全网最低" disabled={busy} /><Field label="示例回复" area value={form.sample_reply || ''} onChange={(value: string) => set('sample_reply', value)} placeholder="一条符合人设的示例文本" disabled={busy} /></div>}</section></div>
 }
 
-function TasksView({ project }: RecordShape) {
+function TasksView({ project, providerContext }: RecordShape) {
   const [tasks, setTasks] = useState<RecordShape[]>([])
   const [schedule, setSchedule] = useState<RecordShape>({ enabled: false, interval_minutes: 30, full: false })
   const [scheduleLoaded, setScheduleLoaded] = useState(false)
@@ -529,6 +663,8 @@ function TasksView({ project }: RecordShape) {
   const [eventStatus, setEventStatus] = useState('SSE 连接中…')
   const scheduleDirtyRef = useRef(false)
   const scheduleRevisionRef = useRef(0)
+  const collectionRequirements = [{ key: 'keyword_search', label: '真实视频搜索' }, { key: 'comments', label: '公开评论采集' }]
+  const canCollect = collectionRequirements.every((requirement) => providerSupports(providerContext, requirement.key))
   const updateSchedule = (patch: RecordShape) => { scheduleDirtyRef.current = true; scheduleRevisionRef.current += 1; setScheduleDirty(true); setSchedule((current) => ({ ...current, ...patch })); setScheduleStatus(''); setScheduleStatusError(false) }
   const refresh = async (showLoading = true) => {
     if (showLoading) setLoading(true)
@@ -588,9 +724,13 @@ function TasksView({ project }: RecordShape) {
     const timer = window.setInterval(() => { void load() }, 5000)
     return () => { stopped = true; window.clearInterval(timer) }
   }, [selectedTaskId])
-  const start = async () => { setBusy(true); setTaskNotice(''); try { const result = await request(`/api/projects/${project.id}/scan`, { method: 'POST' }); setTaskNotice(result.task_id ? `扫描已排队，任务 #${result.task_id} 将在任务列表中更新` : '扫描已排队'); await refresh(false) } catch (err) { setError(errorText(err)) } finally { setBusy(false) } }
-  const taskAction = async (task: RecordShape, action: 'pause' | 'resume' | 'retry') => { setBusy(true); setTaskNotice(''); try { await request(`/api/tasks/${task.id}/${action}`, { method: 'POST' }); setTaskNotice(action === 'retry' ? '任务已重新排队，将从 checkpoint 继续' : action === 'pause' ? '任务已暂停' : '任务已恢复'); await refresh(false) } catch (err) { setError(errorText(err)) } finally { setBusy(false) } }
+  const start = async () => { const collectionMessage = providerCapabilityMessage(providerContext, collectionRequirements); if (collectionMessage) { setError(collectionMessage); return } setBusy(true); setTaskNotice(''); try { const result = await request(`/api/projects/${project.id}/scan`, { method: 'POST' }); setTaskNotice(result.task_id ? `扫描已排队，任务 #${result.task_id} 将在任务列表中更新` : '扫描已排队'); await refresh(false) } catch (err) { setError(errorText(err)) } finally { setBusy(false) } }
+  const taskAction = async (task: RecordShape, action: 'pause' | 'resume' | 'retry') => { if (['resume', 'retry'].includes(action)) { const collectionMessage = providerCapabilityMessage(providerContext, collectionRequirements); if (collectionMessage) { setError(collectionMessage); return } } setBusy(true); setTaskNotice(''); try { await request(`/api/tasks/${task.id}/${action}`, { method: 'POST' }); setTaskNotice(action === 'retry' ? '任务已重新排队，将从 checkpoint 继续' : action === 'pause' ? '任务已暂停' : '任务已恢复'); await refresh(false) } catch (err) { setError(errorText(err)) } finally { setBusy(false) } }
   const saveSchedule = async () => {
+    if (Boolean(schedule.enabled)) {
+      const collectionMessage = providerCapabilityMessage(providerContext, collectionRequirements)
+      if (collectionMessage) { setScheduleStatusError(true); setScheduleStatus(collectionMessage); return }
+    }
     const interval = Number(schedule.interval_minutes)
     if (!SCHEDULE_INTERVALS.includes(interval as (typeof SCHEDULE_INTERVALS)[number])) { setScheduleStatusError(true); setScheduleStatus('采集频率只能选择 10、15、20、25 或 30 分钟'); return }
     setScheduleBusy(true); setScheduleStatusError(false); setScheduleStatus(''); scheduleRevisionRef.current += 1
@@ -605,8 +745,8 @@ function TasksView({ project }: RecordShape) {
   const scheduleStateTone = scheduleDirty ? 'amber' : schedule.enabled ? 'green' : 'neutral'
   return (
     <div className="page">
-      <PageHeader eyebrow="ORCHESTRATION" title="任务中心" description="每次扫描都能暂停、恢复、重试，并从 checkpoint 继续。" actions={<Button variant="accent" icon={Plus} onClick={start} disabled={busy}>{busy ? '提交中…' : '新建扫描'}</Button>} />
-      {error && <div className="error-banner" role="alert"><X size={15} /><span>{error}</span><button onClick={() => setError('')} aria-label="关闭错误">关闭</button></div>}{taskNotice && <div className="success-banner" role="status"><Check size={15} /><span>{taskNotice}</span><button onClick={() => setTaskNotice('')} aria-label="关闭提示">关闭</button></div>}
+      <PageHeader eyebrow="ORCHESTRATION" title="任务中心" description="每次扫描都能暂停、恢复、重试，并从 checkpoint 继续。" actions={<Button variant="accent" icon={Plus} onClick={() => void start()} disabled={busy || !canCollect}>{busy ? '提交中…' : '新建扫描'}</Button>} />
+      {error && <div className="error-banner" role="alert"><X size={15} /><span>{error}</span><button onClick={() => setError('')} aria-label="关闭错误">关闭</button></div>}{taskNotice && <div className="success-banner" role="status"><Check size={15} /><span>{taskNotice}</span><button onClick={() => setTaskNotice('')} aria-label="关闭提示">关闭</button></div>}<ProviderCapabilityNotice context={providerContext} requirements={collectionRequirements} />
       <div className="task-grid">
         <section className="panel data-panel task-panel">
           <div className="data-toolbar"><div><SectionLabel>SCAN TASKS</SectionLabel><h2>扫描任务</h2></div><StatusPill tone={eventStatus === 'SSE 已连接' ? 'green' : 'neutral'}>{tasks.length} 个任务 · {eventStatus}</StatusPill></div>
@@ -616,8 +756,8 @@ function TasksView({ project }: RecordShape) {
               <div className="task-copy"><b>{task.name}</b><small title={task.error || undefined}>10 步 · 当前：{task.current_step || '等待启动'}{task.error ? ` · ${task.error}` : ''}</small></div>
               <StatusPill tone={taskStatusTone(task.status)}>{taskStatusLabel(task.status)}</StatusPill>
               {task.status === 'running' && <button className="icon-button" title="暂停" aria-label={`暂停任务 ${task.id}`} disabled={busy} onClick={(event) => { event.stopPropagation(); void taskAction(task, 'pause') }}><Pause size={16} /></button>}
-              {task.status === 'paused' && <button className="icon-button" title="恢复" aria-label={`恢复任务 ${task.id}`} disabled={busy} onClick={(event) => { event.stopPropagation(); void taskAction(task, 'resume') }}><Play size={16} /></button>}
-              {task.status === 'failed' && <button className="icon-button" title="重试" aria-label={`重试任务 ${task.id}`} disabled={busy} onClick={(event) => { event.stopPropagation(); void taskAction(task, 'retry') }}><RefreshCw size={16} /></button>}
+              {task.status === 'paused' && <button className="icon-button" title="恢复" aria-label={`恢复任务 ${task.id}`} disabled={busy || !canCollect} onClick={(event) => { event.stopPropagation(); void taskAction(task, 'resume') }}><Play size={16} /></button>}
+              {task.status === 'failed' && <button className="icon-button" title="重试" aria-label={`重试任务 ${task.id}`} disabled={busy || !canCollect} onClick={(event) => { event.stopPropagation(); void taskAction(task, 'retry') }}><RefreshCw size={16} /></button>}
             </div>
           )) : <EmptyState icon={ListChecks} text="还没有扫描任务，先创建一次扫描。" action={{ label: '创建扫描', onClick: start }} />}
         </section>
@@ -625,7 +765,7 @@ function TasksView({ project }: RecordShape) {
           <div className="checkpoint-heading"><div><SectionLabel>COMMENT COLLECTION</SectionLabel><h2>自动采集</h2></div><StatusPill tone={scheduleStateTone}>{scheduleStateLabel}</StatusPill></div>
           <p>按项目定期扫描关键词并同步公开评论，频率限制为 10～30 分钟。</p>
           <div className="settings-policy-toggles">
-            <label className="schedule-toggle"><input type="checkbox" checked={Boolean(schedule.enabled)} disabled={scheduleControlsDisabled} onChange={(event) => updateSchedule({ enabled: event.target.checked })} />启用自动采集</label>
+            <label className="schedule-toggle"><input type="checkbox" checked={Boolean(schedule.enabled)} disabled={scheduleControlsDisabled || (!canCollect && !schedule.enabled)} onChange={(event) => updateSchedule({ enabled: event.target.checked })} />启用自动采集</label>
             <label className="schedule-toggle"><input type="checkbox" checked={Boolean(schedule.full)} disabled={scheduleControlsDisabled} onChange={(event) => updateSchedule({ full: event.target.checked })} />扫描全部启用关键词</label>
           </div>
           <div className="settings-form-grid"><label className="field"><span>采集频率</span><select aria-label="采集频率" value={Number(schedule.interval_minutes || 30)} disabled={scheduleControlsDisabled} onChange={(event) => updateSchedule({ interval_minutes: Number(event.target.value) })}><option value={10}>每 10 分钟</option><option value={15}>每 15 分钟</option><option value={20}>每 20 分钟</option><option value={25}>每 25 分钟</option><option value={30}>每 30 分钟</option></select></label></div>
@@ -712,7 +852,7 @@ function LeadsView({ project }: RecordShape) {
   return <div className="page"><PageHeader eyebrow="CUSTOMER SIGNALS" title="潜客池" description="把真实购买信号排成一条可以跟进的清晰队列。" actions={<><Button icon={RefreshCw} onClick={() => void reload()} disabled={loading}>{loading ? '加载中…' : '刷新'}</Button><Button icon={ArrowDownRight} onClick={() => downloadJson(`leads-${project.id}.json`, items)}>导出列表</Button></>} />{error && <div className="error-banner"><X size={15} /><span>{error}</span><button onClick={() => setError('')} aria-label="关闭错误">关闭</button></div>}<div className="lead-tabs">{tabs.map((tab) => <button key={tab.key} className={filter === tab.key ? 'active' : ''} onClick={() => setFilter(tab.key)}>{tab.label} <b>{counts[tab.key]}</b></button>)}<label className="table-search"><Search size={14} /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索用户、需求或地区" aria-label="搜索潜客" /></label></div><section className="panel data-panel lead-data">{loading ? <TableSkeleton rows={5} /> : rows.length ? <div className="table-scroll"><table><thead><tr><th>潜客</th><th>评分</th><th>需求</th><th>位置 / 预算</th><th>摘要</th><th>出现</th><th>状态</th></tr></thead><tbody>{rows.map((lead: RecordShape, index) => <tr key={lead.id} onClick={() => void openLead(lead)}><td><div className="lead-person"><span className={`lead-avatar lead-${index % 4}`}>{(lead.nickname || '客')[0]}</span><span><b>{lead.nickname || '未提供昵称'}</b><small>抖音 · {lead.platform_user_id || '未知用户'}</small></span></div></td><td><span className={`lead-score score-${(lead.lead_level || 'A').toLowerCase()}`}>{Math.round(lead.lead_score || 0)} <small>{lead.lead_level || 'C'}</small></span></td><td><b>{lead.need || '待补充'}</b><small>{lead.pain_point || '暂无痛点'}</small></td><td><b>{lead.location || '待确认'}</b><small>{lead.budget || '预算待确认'}</small></td><td className="quote">{lead.summary || '暂无摘要'}</td><td><span className="occurrence">{lead.occurrence_count || 1} 次</span></td><td><StatusPill tone={lead.status === 'CONTACTED' ? 'blue' : lead.status === 'NEW' ? 'amber' : 'green'}>{statusLabels[lead.status] || lead.status || '待跟进'}</StatusPill></td></tr>)}</tbody></table></div> : <EmptyState icon={Target} text={error ? '无法加载真实潜客数据。' : items.length ? '当前筛选没有匹配的潜客。' : '当前还没有潜客，完成一次扫描后会显示。'} action={error ? { label: '重试', onClick: () => void reload() } : undefined} />}</section>{selected && <LeadDrawer lead={selected} close={() => setSelected(undefined)} project={project} onUpdated={updateSelected} />}</div>
 }
 
-function ProvidersRegistryView() {
+function ProvidersRegistryView({ onProviderChanged }: RecordShape) {
   const [items, setItems] = useState<RecordShape[]>([])
   const [activeProvider, setActiveProvider] = useState('')
   const [error, setError] = useState('')
@@ -731,20 +871,38 @@ function ProvidersRegistryView() {
   }
   useEffect(() => { void refresh() }, [])
   const health = async (provider: RecordShape) => { setBusy(true); try { const updated = await request(`/api/providers/${provider.id}/health`, { method: 'POST' }); setItems((current) => current.map((item) => item.id === updated.id ? updated : item)); setError(''); setNotice(`${provider.name} 连接状态已更新`) } catch (err: any) { setError(errorText(err)) } finally { setBusy(false) } }
-  const activate = async (provider: RecordShape) => { setBusy(true); setError(''); setNotice(''); try { const result = await request(`/api/providers/${provider.id}/activate`, { method: 'POST' }); setActiveProvider(result.active || provider.name); setNotice(`已切换到 ${result.active || provider.name}`) } catch (err: any) { setError(errorText(err)) } finally { setBusy(false) } }
+  const activate = async (provider: RecordShape) => { setBusy(true); setError(''); setNotice(''); try { const result = await request(`/api/providers/${provider.id}/activate`, { method: 'POST' }); setActiveProvider(result.active || provider.name); onProviderChanged?.(); setNotice(`已切换到 ${result.active || provider.name}`) } catch (err: any) { setError(errorText(err)) } finally { setBusy(false) } }
   const isActive = (provider: RecordShape) => provider.name === activeProvider || provider.name?.toLowerCase().replace(/\s+/g, '-') === String(activeProvider).toLowerCase()
   return <div className="page"><PageHeader eyebrow="PROVIDER REGISTRY" title="数据源" description="当前版本启用抖音 Playwright；采集来自真实 DOM 和公开文本。" actions={<Button icon={RefreshCw} onClick={() => void refresh()} disabled={busy}>{busy ? '检查中…' : '刷新状态'}</Button>} />{error && <div className="error-banner" role="alert"><X size={15} /><span>{error}</span><Button onClick={() => void refresh()}>重试</Button></div>}{notice && <div className="success-banner" role="status"><Check size={15} /><span>{notice}</span><button onClick={() => setNotice('')} aria-label="关闭提示">关闭</button></div>}{loading ? <div className="panel form-loading"><LoaderCircle size={18} className="loading-spin" /><span>正在读取数据源状态…</span></div> : <>{items.length ? <div className="provider-grid">{items.map((provider: RecordShape, index) => { const active = isActive(provider); return <section className="panel provider-card" key={provider.id || provider.name}><div className="provider-card-head"><span className={`provider-mark provider-${index}`}><Database size={18} /></span><div className="toolbar-actions"><StatusPill tone={active ? 'accent' : provider.status === 'connected' ? 'green' : 'neutral'}>{active ? '当前使用' : provider.status || 'unknown'}</StatusPill>{active && provider.status && <StatusPill tone={provider.status === 'connected' ? 'green' : 'neutral'}>{provider.status}</StatusPill>}</div></div><h2>{provider.name}</h2><p>{provider.note}</p>{provider.endpoint && <code>{provider.endpoint}</code>}<div className="capability-list">{Object.entries(provider.capabilities || {}).map(([key, value]) => <span className={value ? 'on' : ''} key={key}><i />{key.replace(/_/g, ' ')}</span>)}</div><div className="provider-actions"><Button variant="secondary" icon={Wifi} onClick={() => void health(provider)} disabled={busy}>{busy ? '检查中…' : '检查真实连接'}</Button>{!active && <Button variant="accent" onClick={() => void activate(provider)} disabled={busy}>切换为当前源</Button>}</div></section>})}</div> : <EmptyState icon={Database} text="暂无已注册数据源。" action={{ label: '重试', onClick: () => void refresh() }} />}</>}<div className="compliance-bar"><Check size={15} /><span><b>边界声明：</b>抖音采集仍不使用视觉模型；系统不接入视觉模型，不做 OCR、视频帧分析、图片理解或风控绕过。</span></div></div>
 }
 
-function DouyinConnectionView() {
+function DouyinConnectionView({ providerContext }: RecordShape) {
   const [state, setState] = useState<RecordShape>({ browser: 'stopped', login: 'NOT_STARTED' })
   const [error, setError] = useState('')
   const [checking, setChecking] = useState(true)
   const [statusLoaded, setStatusLoaded] = useState(false)
-  const refresh = async () => { setChecking(true); try { setState(await requestWithRetry('/api/douyin/status')); setStatusLoaded(true); setError('') } catch (err: any) { setError(err.message) } finally { setChecking(false) } }
-  useEffect(() => { void refresh() }, [])
-  const start = async () => { setChecking(true); try { setState(await request('/api/douyin/browser/start', { method: 'POST' })); setStatusLoaded(true); setError('') } catch (err: any) { setError(err.message) } finally { setChecking(false) } }
-  const close = async () => { setChecking(true); try { setState(await request('/api/douyin/browser/close', { method: 'POST' })); setStatusLoaded(true); setError('') } catch (err: any) { setError(err.message) } finally { setChecking(false) } }
+  const statusCheckInFlight = useRef(false)
+  const loginRequirements = [{ key: 'login', label: '真实浏览器登录' }]
+  const canLogin = providerSupports(providerContext, 'login')
+  const loginCapabilityMessage = providerCapabilityMessage(providerContext, loginRequirements)
+  const refresh = async () => {
+    if (statusCheckInFlight.current) return
+    statusCheckInFlight.current = true
+    const capabilityMessage = providerCapabilityMessage(providerContext, loginRequirements)
+    if (capabilityMessage) { setError(capabilityMessage); setChecking(false); statusCheckInFlight.current = false; return }
+    setChecking(true)
+    try { setState(await requestWithRetry('/api/douyin/status')); setStatusLoaded(true); setError('') }
+    catch (err: any) { setError(err.message) }
+    finally { setChecking(false); statusCheckInFlight.current = false }
+  }
+  useEffect(() => { void refresh() }, [providerContext?.loading, providerContext?.name, providerContext?.error])
+  useEffect(() => {
+    if (!canLogin) return
+    const intervalId = window.setInterval(() => { void refresh() }, 10000)
+    return () => window.clearInterval(intervalId)
+  }, [canLogin, providerContext?.name])
+  const start = async () => { if (statusCheckInFlight.current) return; if (!canLogin) { setError(loginCapabilityMessage); return } statusCheckInFlight.current = true; setChecking(true); try { setState(await request('/api/douyin/browser/start', { method: 'POST' })); setStatusLoaded(true); setError('') } catch (err: any) { setError(err.message) } finally { setChecking(false); statusCheckInFlight.current = false } }
+  const close = async () => { if (statusCheckInFlight.current) return; if (!canLogin) { setError(loginCapabilityMessage); return } statusCheckInFlight.current = true; setChecking(true); try { setState(await request('/api/douyin/browser/close', { method: 'POST' })); setStatusLoaded(true); setError('') } catch (err: any) { setError(err.message) } finally { setChecking(false); statusCheckInFlight.current = false } }
   const loggedIn = state.login === 'LOGGED_IN'
   const needsVerification = state.login === 'VERIFICATION_REQUIRED'
   const statusUnavailable = !checking && !statusLoaded
@@ -752,34 +910,96 @@ function DouyinConnectionView() {
   const actionLabel = checking ? '读取持久化会话…' : statusUnavailable ? '重试检查' : loggedIn ? '复用已保存会话' : needsVerification ? '打开抖音完成验证' : '打开抖音登录'
   const detailLabel = checking && !statusLoaded ? '正在读取持久化会话' : statusUnavailable ? '状态读取失败' : loggedIn ? '已登录（持久化会话）' : needsVerification ? '已检测到平台验证页' : state.login
   const helperText = checking && !statusLoaded ? '正在检查本地持久化 Profile；暂时不会要求重新登录。' : statusUnavailable ? '暂时无法读取后端登录状态；系统没有清除 Cookie，请点击“重试检查”。' : loggedIn ? '已检测到本地持久化会话。重启服务或关闭浏览器后，系统会继续使用同一 Profile，不会主动清除登录态。' : needsVerification ? '抖音当前要求人工完成安全验证。请在打开的真实浏览器中操作；系统不会绕过验证码，验证完成后点击“检查状态”。' : '需要登录时请在打开的真实抖音浏览器中扫码或人工完成验证；系统不会保存明文密码，也不会绕过验证码。'
-  return <div className="page"><PageHeader eyebrow="DOUYIN CONNECTION" title="抖音账号" description="通过真实可见浏览器登录；采集只读取 DOM 文本和公开视频元数据。" actions={<Button icon={RefreshCw} onClick={refresh} disabled={checking}>检查状态</Button>} />{error && <div className="error-banner"><X size={15} />{error}</div>}<section className="panel provider-card"><div className="provider-card-head"><span className="provider-mark provider-0"><Database size={18} /></span><StatusPill tone={loggedIn ? 'green' : 'neutral'}>{statusLabel}</StatusPill></div><h2>Douyin Playwright</h2><p>浏览器：{state.browser} · 登录：{detailLabel}</p><div className="drawer-facts"><div><span>当前账号</span><b>{state.account_nickname || state.account_name || '默认抖音账号'}</b></div><div><span>抖音用户 ID</span><b>{state.douyin_user_id || '登录后由页面提供'}</b></div><div><span>最近登录</span><b>{formatDateTime(state.last_login_at)}</b></div><div><span>最近检查</span><b>{formatDateTime(state.last_checked_at)}</b></div></div><code>{state.profile_dir || '本地持久化浏览器 Profile'}</code><div className="provider-actions"><Button variant="accent" icon={Wifi} onClick={start} disabled={checking}>{actionLabel}</Button><Button icon={X} onClick={close} disabled={checking}>关闭浏览器</Button></div><div className="compliance-bar"><Check size={15} /><span>{helperText}</span></div></section></div>
+  return <div className="page"><PageHeader eyebrow="DOUYIN CONNECTION" title="抖音账号" description="通过真实可见浏览器登录；采集只读取 DOM 文本和公开视频元数据。" actions={<Button icon={RefreshCw} onClick={() => void refresh()} disabled={checking || !canLogin}>检查状态</Button>} />{error && <div className="error-banner"><X size={15} />{error}</div>}<ProviderCapabilityNotice context={providerContext} requirements={loginRequirements} /><section className="panel provider-card"><div className="provider-card-head"><span className="provider-mark provider-0"><Database size={18} /></span><StatusPill tone={loggedIn ? 'green' : 'neutral'}>{statusLabel}</StatusPill></div><h2>Douyin Playwright</h2><p>浏览器：{state.browser} · 登录：{detailLabel}</p><div className="drawer-facts"><div><span>当前账号</span><b>{state.account_nickname || state.account_name || '默认抖音账号'}</b></div><div><span>抖音用户 ID</span><b>{state.douyin_user_id || '登录后由页面提供'}</b></div><div><span>浏览器会话</span><b>{state.browser_session_status || '未记录'}</b></div><div><span>最近登录</span><b>{formatDateTime(state.last_login_at)}</b></div><div><span>最近检查</span><b>{formatDateTime(state.last_checked_at)}</b></div></div><code>{state.profile_dir || '本地持久化浏览器 Profile'}</code><div className="provider-actions"><Button variant="accent" icon={Wifi} onClick={() => void start()} disabled={checking || !canLogin}>{actionLabel}</Button><Button icon={X} onClick={() => void close()} disabled={checking || !canLogin}>关闭浏览器</Button></div><div className="compliance-bar"><Check size={15} /><span>{helperText}</span></div></section></div>
 }
 
 function SettingsViewLive({ project }: RecordShape) {
   const [form, setForm] = useState<RecordShape>({ llm_base_url: '', llm_api_key: '', llm_model: 'deepseek-chat', llm_temperature: '0.2', llm_timeout: '45' })
   const [status, setStatus] = useState('')
+  const [settingsLoading, setSettingsLoading] = useState(true)
+  const [settingsLoaded, setSettingsLoaded] = useState(false)
+  const [settingsError, setSettingsError] = useState('')
   const [testing, setTesting] = useState(false)
   const [policy, setPolicy] = useState<RecordShape>({ enabled: true, auto_reply_enabled: false, minimum_confidence: 0.8, minimum_lead_score: 70, allowed_intents: [], blocked_intents: [], max_replies_per_hour: 10, max_replies_per_day: 50, minimum_interval_seconds: 30, auto_reply_own_content_only: false })
   const [policyStatus, setPolicyStatus] = useState('')
+  const [policyLoading, setPolicyLoading] = useState(Boolean(project?.id))
+  const [policyLoadedForProject, setPolicyLoadedForProject] = useState<number | string | null>(null)
+  const [policyError, setPolicyError] = useState('')
   const [policyBusy, setPolicyBusy] = useState(false)
-  useEffect(() => { request('/api/settings').then((settings) => setForm((current) => ({ ...current, ...settings, llm_api_key: '' }))).catch((err: any) => setStatus(err.message)) }, [])
-  useEffect(() => { if (!project?.id) return; request(`/api/projects/${project.id}/reply-policy`).then(setPolicy).catch((err: any) => setPolicyStatus(err.message)) }, [project?.id])
+  const settingsLoadVersion = useRef(0)
+  const policyLoadVersion = useRef(0)
+  const loadSettings = async () => {
+    const version = settingsLoadVersion.current + 1
+    settingsLoadVersion.current = version
+    setSettingsLoading(true)
+    setSettingsLoaded(false)
+    setSettingsError('')
+    try {
+      const settings = await request('/api/settings')
+      if (settingsLoadVersion.current !== version) return
+      setForm((current) => ({ ...current, ...settings, llm_api_key: '' }))
+      setSettingsLoaded(true)
+    } catch (err) {
+      if (settingsLoadVersion.current !== version) return
+      setSettingsError(errorText(err))
+      setStatus('')
+    } finally {
+      if (settingsLoadVersion.current === version) setSettingsLoading(false)
+    }
+  }
+  const loadPolicy = async () => {
+    const projectId = project?.id as number | string | undefined
+    const version = policyLoadVersion.current + 1
+    policyLoadVersion.current = version
+    setPolicyError('')
+    setPolicyStatus('')
+    setPolicyLoadedForProject(null)
+    if (!projectId) {
+      setPolicyLoading(false)
+      return
+    }
+    setPolicyLoading(true)
+    try {
+      const value = await request(`/api/projects/${projectId}/reply-policy`)
+      if (policyLoadVersion.current !== version) return
+      setPolicy(value)
+      setPolicyLoadedForProject(projectId)
+    } catch (err) {
+      if (policyLoadVersion.current !== version) return
+      setPolicyError(errorText(err))
+    } finally {
+      if (policyLoadVersion.current === version) setPolicyLoading(false)
+    }
+  }
+  useEffect(() => { void loadSettings() }, [])
+  useEffect(() => { void loadPolicy() }, [project?.id])
   const set = (key: string, value: string) => setForm((current) => ({ ...current, [key]: value }))
   const setPolicyValue = (key: string, value: string | boolean) => setPolicy((current) => ({ ...current, [key]: value }))
-  const save = async () => { try { await request('/api/settings', { method: 'PUT', body: JSON.stringify(form) }); setStatus('已保存文本 LLM 配置') } catch (err: any) { setStatus(err.message) } }
-  const test = async () => { setTesting(true); setStatus('测试连接中…'); try { const result = await request('/api/settings/test-llm', { method: 'POST', body: JSON.stringify(form) }); setStatus(result.message || result.code) } catch (err: any) { setStatus(err.message) } finally { setTesting(false) } }
+  const settingsControlsDisabled = settingsLoading || !settingsLoaded || Boolean(settingsError) || testing
+  const policyControlsDisabled = !project?.id || policyLoading || policyLoadedForProject !== project.id || Boolean(policyError) || policyBusy
+  const save = async () => {
+    if (settingsControlsDisabled) return
+    try { await request('/api/settings', { method: 'PUT', body: JSON.stringify(form) }); setStatus('已保存文本 LLM 配置') } catch (err) { setStatus(errorText(err)) }
+  }
+  const test = async () => {
+    if (settingsControlsDisabled) return
+    setTesting(true)
+    setStatus('测试连接中…')
+    try { const result = await request('/api/settings/test-llm', { method: 'POST', body: JSON.stringify(form) }); setStatus(result.message || result.code) } catch (err) { setStatus(errorText(err)) } finally { setTesting(false) }
+  }
   const savePolicy = async () => {
     if (!project?.id) { setPolicyStatus('请先创建或选择项目'); return }
+    if (policyControlsDisabled) return
     setPolicyBusy(true)
     try {
       const payload = { ...policy, minimum_confidence: Number(policy.minimum_confidence), minimum_lead_score: Number(policy.minimum_lead_score), max_replies_per_hour: Number(policy.max_replies_per_hour), max_replies_per_day: Number(policy.max_replies_per_day), minimum_interval_seconds: Number(policy.minimum_interval_seconds), allowed_intents: String(policy.allowed_intents || '').split(',').map((item: string) => item.trim()).filter(Boolean), blocked_intents: String(policy.blocked_intents || '').split(',').map((item: string) => item.trim()).filter(Boolean) }
       setPolicy(await request(`/api/projects/${project.id}/reply-policy`, { method: 'PUT', body: JSON.stringify(payload) }))
-      setPolicyStatus(policy.auto_reply_enabled ? '已保存回复策略；满足全部安全条件后将按策略真实发送' : '已保存回复策略；当前为人工审核草稿模式')
-    } catch (err: any) { setPolicyStatus(err.message) } finally { setPolicyBusy(false) }
+      setPolicyStatus(policy.auto_reply_enabled ? '已保存回复策略；仅生成候选草稿，仍需人工审核并确认发送' : '已保存回复策略；当前为人工审核草稿模式')
+    } catch (err) { setPolicyStatus(errorText(err)) } finally { setPolicyBusy(false) }
   }
   const allowedIntents = Array.isArray(policy.allowed_intents) ? policy.allowed_intents.join(', ') : String(policy.allowed_intents || '')
   const blockedIntents = Array.isArray(policy.blocked_intents) ? policy.blocked_intents.join(', ') : String(policy.blocked_intents || '')
-  return <div className="page"><PageHeader eyebrow="WORKSPACE SETTINGS" title="系统设置" description="当前版本只接入文本模型；行业理解、关键词、机会评分、潜客判断和回复建议都基于文字与结构化字段。" actions={<Button variant="accent" onClick={save}>保存更改</Button>} /><section className="panel text-model-settings"><div className="settings-heading"><div><SectionLabel>OPENAI COMPATIBLE · TEXT ONLY</SectionLabel><h2>文本模型配置</h2><p>只需配置 Base URL、API Key、Model、Temperature 和 Timeout。DeepSeek、Qwen、GPT 及其他 OpenAI Compatible 文本模型均可接入。</p></div><StatusPill tone="neutral">{form.llm_api_key_configured ? '已配置' : '未配置'}</StatusPill></div><div className="settings-form-grid"><Field label="Base URL" value={form.llm_base_url || ''} onChange={(value: string) => set('llm_base_url', value)} placeholder="https://api.deepseek.com" /><Field label="API Key" type="password" value={form.llm_api_key || ''} onChange={(value: string) => set('llm_api_key', value)} placeholder={form.llm_api_key_configured ? '已保存，留空保持不变' : '仅发送到后端'} /><Field label="Text Model" list="text-models" value={form.llm_model || ''} onChange={(value: string) => set('llm_model', value)} placeholder="deepseek-chat" /><Field label="Temperature" value={String(form.llm_temperature ?? '')} onChange={(value: string) => set('llm_temperature', value)} placeholder="0.2" /><Field label="Timeout (seconds)" value={String(form.llm_timeout ?? '')} onChange={(value: string) => set('llm_timeout', value)} placeholder="45" /></div><div className="settings-actions"><Button icon={Wifi} onClick={test} disabled={testing}>{testing ? '测试中…' : '测试文本连接'}</Button>{status && <span className="settings-status"><span className="status-dot" />{status}</span>}</div></section><section className="panel text-model-settings"><div className="settings-heading"><div><SectionLabel>REPLY SAFETY · HUMAN REVIEW</SectionLabel><h2>回复策略</h2><p>默认人工审核；开启自动回复后，仅在模型判断安全、知识可核验、阈值和限速均通过时，通过真实抖音页面发送。</p></div><StatusPill tone={policy.auto_reply_enabled ? 'amber' : 'green'}>{policy.auto_reply_enabled ? '自动发送已开启' : '人工审核模式'}</StatusPill></div>{!project?.id && <div className="error-inline">请先创建或选择项目后配置项目级回复策略。</div>}<div className="settings-policy-toggles"><label className="schedule-toggle"><input type="checkbox" checked={Boolean(policy.enabled)} onChange={(event) => setPolicyValue('enabled', event.target.checked)} disabled={!project?.id} />启用回复策略</label><label className="schedule-toggle"><input type="checkbox" checked={Boolean(policy.auto_reply_enabled)} onChange={(event) => setPolicyValue('auto_reply_enabled', event.target.checked)} disabled={!project?.id} />启用自动回复模式（满足策略后真实发送）</label><label className="schedule-toggle"><input type="checkbox" checked={Boolean(policy.auto_reply_own_content_only)} onChange={(event) => setPolicyValue('auto_reply_own_content_only', event.target.checked)} disabled={!project?.id} />仅处理自有内容（需平台所有权证据）</label></div><div className="settings-form-grid"><Field label="最低置信度（0-1）" type="number" value={String(policy.minimum_confidence ?? '')} onChange={(value: string) => setPolicyValue('minimum_confidence', value)} placeholder="0.8" /><Field label="最低潜客分数（0-100）" type="number" value={String(policy.minimum_lead_score ?? '')} onChange={(value: string) => setPolicyValue('minimum_lead_score', value)} placeholder="70" /><Field label="每小时最多回复" type="number" value={String(policy.max_replies_per_hour ?? '')} onChange={(value: string) => setPolicyValue('max_replies_per_hour', value)} placeholder="10" /><Field label="每天最多回复" type="number" value={String(policy.max_replies_per_day ?? '')} onChange={(value: string) => setPolicyValue('max_replies_per_day', value)} placeholder="50" /><Field label="最小回复间隔（秒）" type="number" value={String(policy.minimum_interval_seconds ?? '')} onChange={(value: string) => setPolicyValue('minimum_interval_seconds', value)} placeholder="30" /><Field label="允许的意图（逗号分隔）" value={allowedIntents} onChange={(value: string) => setPolicyValue('allowed_intents', value)} placeholder="high, medium" /><Field label="屏蔽的意图（逗号分隔）" value={String(policy.blocked_intents || '')} onChange={(value: string) => setPolicyValue('blocked_intents', value)} placeholder="low, spam" /></div><div className="settings-actions"><Button variant="accent" onClick={savePolicy} disabled={policyBusy || !project?.id}>{policyBusy ? '保存中…' : '保存回复策略'}</Button>{policyStatus && <span className="settings-status"><span className="status-dot" />{policyStatus}</span>}</div></section><datalist id="text-models"><option value="deepseek-chat" /><option value="deepseek-v4-flash" /><option value="deepseek-v4-pro" /><option value="gpt-4o-mini" /><option value="qwen-plus" /></datalist></div>
+  return <div className="page"><PageHeader eyebrow="WORKSPACE SETTINGS" title="系统设置" description="当前版本只接入文本模型；行业理解、关键词、机会评分、潜客判断和回复建议都基于文字和结构化字段。" actions={<Button variant="accent" onClick={() => void save()} disabled={settingsControlsDisabled}>{settingsLoading ? '读取配置…' : '保存更改'}</Button>} /><section className="panel text-model-settings"><div className="settings-heading"><div><SectionLabel>OPENAI COMPATIBLE · TEXT ONLY</SectionLabel><h2>文本模型配置</h2><p>只需配置 Base URL、API Key、Model、Temperature 和 Timeout。DeepSeek、Qwen、GPT 及其他 OpenAI Compatible 文本模型均可接入。</p></div><StatusPill tone="neutral">{form.llm_api_key_configured ? '已配置' : '未配置'}</StatusPill></div>{settingsError && <div className="error-inline" role="alert"><X size={15} /><span>文本模型配置加载失败：{settingsError}</span><Button icon={RefreshCw} onClick={() => void loadSettings()} disabled={settingsLoading}>重试</Button></div>}{settingsLoading && <div className="form-loading"><LoaderCircle size={18} className="loading-spin" /><span>正在读取文本模型配置…</span></div>}<div className="settings-form-grid"><Field label="Base URL" value={form.llm_base_url || ''} onChange={(value: string) => set('llm_base_url', value)} placeholder="https://api.deepseek.com" disabled={settingsControlsDisabled} /><Field label="API Key" type="password" value={form.llm_api_key || ''} onChange={(value: string) => set('llm_api_key', value)} placeholder={form.llm_api_key_configured ? '已保存，留空保持不变' : '仅发送到后端'} disabled={settingsControlsDisabled} /><Field label="Text Model" list="text-models" value={form.llm_model || ''} onChange={(value: string) => set('llm_model', value)} placeholder="deepseek-chat" disabled={settingsControlsDisabled} /><Field label="Temperature" value={String(form.llm_temperature ?? '')} onChange={(value: string) => set('llm_temperature', value)} placeholder="0.2" disabled={settingsControlsDisabled} /><Field label="Timeout (seconds)" value={String(form.llm_timeout ?? '')} onChange={(value: string) => set('llm_timeout', value)} placeholder="45" disabled={settingsControlsDisabled} /></div><div className="settings-actions"><Button icon={Wifi} onClick={() => void test()} disabled={settingsControlsDisabled}>{testing ? '测试中…' : '测试文本连接'}</Button>{status && <span className="settings-status" role="status" aria-live="polite"><span className="status-dot" />{status}</span>}</div></section><section className="panel text-model-settings"><div className="settings-heading"><div><SectionLabel>REPLY SAFETY · HUMAN REVIEW</SectionLabel><h2>回复策略</h2><p>默认人工审核；该开关仅控制是否生成候选回复草稿，任何真实发送都必须由人工审核、编辑并明确确认。</p></div><StatusPill tone={policy.auto_reply_enabled ? 'amber' : 'green'}>{policy.auto_reply_enabled ? '候选草稿已开启' : '人工审核模式'}</StatusPill></div>{!project?.id && <div className="error-inline">请先创建或选择项目后配置项目级回复策略。</div>}{policyError && <div className="error-inline" role="alert"><X size={15} /><span>回复策略加载失败：{policyError}</span><Button icon={RefreshCw} onClick={() => void loadPolicy()} disabled={policyLoading}>重试</Button></div>}{policyLoading && <div className="form-loading"><LoaderCircle size={18} className="loading-spin" /><span>正在读取当前项目的回复策略…</span></div>}<div className="settings-policy-toggles"><label className="schedule-toggle"><input type="checkbox" checked={Boolean(policy.enabled)} onChange={(event) => setPolicyValue('enabled', event.target.checked)} disabled={policyControlsDisabled} />启用回复策略</label><label className="schedule-toggle"><input type="checkbox" checked={Boolean(policy.auto_reply_enabled)} onChange={(event) => setPolicyValue('auto_reply_enabled', event.target.checked)} disabled={policyControlsDisabled} />生成 AI 回复候选草稿（不会自动发送）</label><label className="schedule-toggle"><input type="checkbox" checked={Boolean(policy.auto_reply_own_content_only)} onChange={(event) => setPolicyValue('auto_reply_own_content_only', event.target.checked)} disabled={policyControlsDisabled} />仅处理自有内容（需平台所有权证据）</label></div><div className="settings-form-grid"><Field label="最低置信度（0-1）" type="number" value={String(policy.minimum_confidence ?? '')} onChange={(value: string) => setPolicyValue('minimum_confidence', value)} placeholder="0.8" disabled={policyControlsDisabled} /><Field label="最低潜客分数（0-100）" type="number" value={String(policy.minimum_lead_score ?? '')} onChange={(value: string) => setPolicyValue('minimum_lead_score', value)} placeholder="70" disabled={policyControlsDisabled} /><Field label="每小时最多回复" type="number" value={String(policy.max_replies_per_hour ?? '')} onChange={(value: string) => setPolicyValue('max_replies_per_hour', value)} placeholder="10" disabled={policyControlsDisabled} /><Field label="每天最多回复" type="number" value={String(policy.max_replies_per_day ?? '')} onChange={(value: string) => setPolicyValue('max_replies_per_day', value)} placeholder="50" disabled={policyControlsDisabled} /><Field label="最小回复间隔（秒）" type="number" value={String(policy.minimum_interval_seconds ?? '')} onChange={(value: string) => setPolicyValue('minimum_interval_seconds', value)} placeholder="30" disabled={policyControlsDisabled} /><Field label="允许的意图（逗号分隔）" value={allowedIntents} onChange={(value: string) => setPolicyValue('allowed_intents', value)} placeholder="high, medium" disabled={policyControlsDisabled} /><Field label="屏蔽的意图（逗号分隔）" value={blockedIntents} onChange={(value: string) => setPolicyValue('blocked_intents', value)} placeholder="low, spam" disabled={policyControlsDisabled} /></div><div className="settings-actions"><Button variant="accent" onClick={() => void savePolicy()} disabled={policyControlsDisabled}>{policyBusy ? '保存中…' : '保存回复策略'}</Button>{policyStatus && <span className="settings-status" role="status" aria-live="polite"><span className="status-dot" />{policyStatus}</span>}</div></section><datalist id="text-models"><option value="deepseek-chat" /><option value="deepseek-v4-flash" /><option value="deepseek-v4-pro" /><option value="gpt-4o-mini" /><option value="qwen-plus" /></datalist></div>
 }
 
 function SettingRow({ title, desc, action }: RecordShape) { return <div className="panel setting-row"><div><h2>{title}</h2><p>{desc}</p></div>{action}</div> }
@@ -799,7 +1019,7 @@ function KeywordsViewLive({ project }: RecordShape) {
   return <div className="page"><PageHeader eyebrow="OPPORTUNITY ENGINE" title="关键词雷达" description="让购买意图决定扫描优先级，而不是让关键词数量制造噪音。" actions={<span className="provider-chip">{items.length} 个文本关键词</span>} />{error && <div className="error-banner"><X size={15} />{error}</div>}<div className="kpi-strip"><div><b>{items.length}</b><span>关键词总数</span></div><div><b>{items.filter((item) => Number(item.opportunity_score) >= 90).length}</b><span>高机会词</span></div><div><b>{items.length ? Math.round(items.reduce((sum, item) => sum + Number(item.commercial_score || 0), 0) / items.length) : 0}</b><span>平均商业价值</span></div><div className="kpi-note"><Zap size={15} /><span>数据来自当前项目，不使用演示回退</span></div></div><section className="panel data-panel"><div className="data-toolbar"><div className="filter-tabs">{categories.map((item) => <button key={item} className={category === item ? 'selected' : ''} onClick={() => setCategory(item)}>{item}</button>)}</div><input className="table-search" value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索关键词" /></div>{loading ? <TableSkeleton rows={5} /> : rows.length ? <table><thead><tr><th>关键词</th><th>类型</th><th>商业价值</th><th>机会评分</th><th>视频</th><th>评论</th><th>潜客</th><th>状态</th></tr></thead><tbody>{rows.map((item: RecordShape, index) => <tr key={item.id}><td><b>{item.keyword}</b><small>{item.reason || '文本模型推荐'}</small></td><td><StatusPill tone={item.category === '购买意向' ? 'accent' : 'neutral'}>{item.category}</StatusPill></td><td><div className="mini-meter"><i style={{ width: `${item.commercial_score || 0}%` }} /></div><span className="meter-number">{Math.round(item.commercial_score || 0)}</span></td><td><span className={`score-value ${Number(item.opportunity_score) > 90 ? 'hot' : ''}`}>{Math.round(item.opportunity_score || 0)}</span></td><td>{item.video_count || 0}</td><td>{item.comment_count || 0}</td><td><b className="accent-text">{item.lead_count || 0}</b></td><td><button className="enabled" onClick={() => toggle(item)}><i />{item.enabled ? '已启用' : '已停用'}</button></td></tr>)}</tbody></table> : <EmptyState icon={Radar} text={error ? '无法加载真实关键词。' : '当前项目还没有关键词，请先运行智能截流。'} />}</section></div>
 }
 
-function VideosViewLive({ project }: RecordShape) {
+function VideosViewLive({ project, providerContext }: RecordShape) {
   const [items, setItems] = useState<RecordShape[]>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
@@ -812,12 +1032,20 @@ function VideosViewLive({ project }: RecordShape) {
   const [detail, setDetail] = useState<RecordShape>()
   const [detailLoading, setDetailLoading] = useState(false)
   const [syncBusy, setSyncBusy] = useState(false)
+  const searchRequirements = [{ key: 'keyword_search', label: '真实视频搜索' }]
+  const commentRequirements = [{ key: 'comments', label: '公开评论采集' }]
+  const collectionRequirements = [...searchRequirements, ...commentRequirements]
+  const canSearch = providerSupports(providerContext, 'keyword_search')
+  const canComments = providerSupports(providerContext, 'comments')
+  const canCollect = canSearch && canComments
   const reload = async () => { setLoading(true); try { setItems(await request(`/api/videos?project_id=${project.id}`)); setError('') } catch (err: any) { setError(err.message) } finally { setLoading(false) } }
   useEffect(() => { void reload() }, [project.id])
   useEffect(() => { setSelected(undefined); setDetail(undefined); setError('') }, [project.id])
   const search = async () => {
     const keyword = searchKeyword.trim()
     if (!keyword) { setError('请输入要在抖音搜索的真实关键词'); return }
+    const capabilityMessage = providerCapabilityMessage(providerContext, searchRequirements)
+    if (capabilityMessage) { setError(capabilityMessage); return }
     setSearchBusy(true); setError(''); setNotice('')
     try {
       const result = await request('/api/douyin/search', { method: 'POST', body: JSON.stringify({ project_id: project.id, keyword, limit: 20 }) })
@@ -825,9 +1053,9 @@ function VideosViewLive({ project }: RecordShape) {
       setNotice(`真实搜索完成：返回 ${Array.isArray(result) ? result.length : 0} 个视频并已写入当前项目`)
     } catch (err) { setError(errorText(err)) } finally { setSearchBusy(false) }
   }
-  const scan = async () => { setBusy(true); setError(''); try { await request(`/api/projects/${project.id}/scan?full=true`, { method: 'POST' }); await reload() } catch (err: any) { setError(errorText(err)) } finally { setBusy(false) } }
+  const scan = async () => { const capabilityMessage = providerCapabilityMessage(providerContext, collectionRequirements); if (capabilityMessage) { setError(capabilityMessage); return } setBusy(true); setError(''); try { await request(`/api/projects/${project.id}/scan?full=true`, { method: 'POST' }); await reload() } catch (err: any) { setError(errorText(err)) } finally { setBusy(false) } }
   const openDetails = async (item: RecordShape) => { setSelected(item); setDetail(undefined); setDetailLoading(true); try { const [video, comments] = await Promise.all([request(`/api/videos/${item.id}`), request(`/api/comments?project_id=${project.id}&limit=500`)]); setDetail({ video, comments: comments.filter((comment: RecordShape) => comment.video_id === item.id) }); setError('') } catch (err) { setError(errorText(err)) } finally { setDetailLoading(false) } }
-  const syncComments = async () => { if (!selected?.id) return; setSyncBusy(true); setError(''); try { await request(`/api/douyin/videos/${selected.id}/comments/sync`, { method: 'POST' }); await openDetails(selected); } catch (err) { setError(errorText(err)) } finally { setSyncBusy(false) } }
+  const syncComments = async () => { if (!selected?.id) return; const capabilityMessage = providerCapabilityMessage(providerContext, commentRequirements); if (capabilityMessage) { setError(capabilityMessage); return } setSyncBusy(true); setError(''); try { await request(`/api/douyin/videos/${selected.id}/comments/sync`, { method: 'POST' }); await openDetails(selected); } catch (err) { setError(errorText(err)) } finally { setSyncBusy(false) } }
   const rows = [...items].sort((a, b) => sort === '最新发现' ? String(b.discovered_at || '').localeCompare(String(a.discovered_at || '')) : sort === '评论密度' ? Number(b.comments || 0) - Number(a.comments || 0) : Number(b.opportunity_score || 0) - Number(a.opportunity_score || 0))
-  return <div className="page"><PageHeader eyebrow="CONTENT RADAR" title="热门视频" description="只依据标题、描述、作者和公开互动数据判断机会，不读取画面。" actions={<div className="video-header-actions"><label className="video-search"><Search size={14} /><input value={searchKeyword} onChange={(event) => setSearchKeyword(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter') void search() }} placeholder="搜索真实关键词" aria-label="搜索真实关键词" /><button type="button" onClick={() => void search()} disabled={searchBusy}>{searchBusy ? '搜索中…' : '搜索'}</button></label><Button variant="accent" icon={RefreshCw} onClick={scan} disabled={busy}>{busy ? '扫描排队中…' : '扫描全部'}</Button></div>} />{error && <div className="error-banner"><X size={15} /><span>{error}</span><button onClick={() => setError('')} aria-label="关闭错误">关闭</button></div>}{notice && <div className="success-banner"><Check size={15} /><span>{notice}</span><button onClick={() => setNotice('')} aria-label="关闭提示">关闭</button></div>}<div className="video-toolbar"><div className="filter-tabs">{['机会排序', '最新发现', '评论密度'].map((item) => <button key={item} className={sort === item ? 'selected' : ''} onClick={() => setSort(item)}>{item}</button>)}</div><span className="toolbar-meta"><span className="status-dot" />{items.length} 个真实视频记录</span></div>{loading ? <TableSkeleton rows={6} /> : rows.length ? <div className="video-list">{rows.map((item: RecordShape, index) => <article className="video-row" key={item.id} role="button" tabIndex={0} onClick={() => void openDetails(item)} onKeyDown={(event) => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); void openDetails(item) } }}><div className={`video-thumb thumb-${index % 4}`}><span>TEXT / META</span><b>{item.level || 'C'}<br /><em>机会记录</em></b><i aria-hidden="true">↗</i></div><div className="video-info"><div className="video-title-row"><h3>{item.title || '无标题视频'}</h3><StatusPill tone={item.level === 'A' || item.level === 'S' ? 'accent' : 'neutral'}>{item.level || 'C'} 级机会</StatusPill></div><div className="video-source"><span className="creator-dot">{(item.creator || '匿')[0]}</span>{item.creator || '未知作者'}<span>·</span><span>{item.keyword || '未关联关键词'}</span></div><div className="video-stats"><span>赞 {Number(item.likes || 0).toLocaleString()}</span><span>评论 {Number(item.comments || 0).toLocaleString()}</span><span>收藏 {Number(item.collects || 0).toLocaleString()}</span></div></div><div className="video-score"><span>机会评分</span><b>{Math.round(item.opportunity_score || 0)}</b><small>行业相关度 {Math.round(item.industry_relevance_score || 0)}%</small></div></article>)}</div> : <EmptyState icon={Video} text={error ? '无法加载真实视频。' : '当前还没有视频记录，请先执行扫描。'} />}{selected && <div className="drawer-backdrop" onClick={() => setSelected(undefined)}><aside className="comment-drawer lead-drawer" onClick={(event) => event.stopPropagation()} aria-label="视频详情"><div className="drawer-head"><span className="eyebrow">VIDEO DETAIL</span><button className="icon-button" onClick={() => setSelected(undefined)} aria-label="关闭视频详情"><X size={17} /></button></div>{detailLoading ? <div className="drawer-loading"><LoaderCircle size={20} className="loading-spin" /><span>正在读取视频详情…</span></div> : detail ? <><div className="drawer-section"><SectionLabel>PUBLIC METADATA</SectionLabel><h2>{detail.video.title || '无标题视频'}</h2><p>{detail.video.description || '暂无公开描述'}</p><small className="drawer-meta-line">作者：{detail.video.creator || '未知作者'} · 关键词：{detail.video.keyword || '未关联'}</small><small className="drawer-meta-line">发布时间：{formatDateTime(detail.video.publish_time)} · 赞：{Number(detail.video.likes || 0).toLocaleString()} · 评论：{Number(detail.video.comments || 0).toLocaleString()} · 分享：{Number(detail.video.shares || 0).toLocaleString()} · 收藏：{Number(detail.video.collects || 0).toLocaleString()}</small>{detail.video.url && <a className="drawer-source-link" href={detail.video.url} target="_blank" rel="noreferrer">打开真实视频页面 <ArrowUpRight size={12} /></a>}</div><div className="drawer-facts"><div><span>机会评分</span><b>{Math.round(detail.video.opportunity_score || 0)}</b></div><div><span>行业相关度</span><b>{Math.round(detail.video.industry_relevance_score || 0)}%</b></div><div><span>已入库评论</span><b>{detail.comments.length}</b></div><div><span>潜客机会</span><b>{Math.round(detail.video.lead_opportunity_score || 0)}</b></div></div><div className="drawer-section"><SectionLabel>COMMENT COLLECTION</SectionLabel><p>只同步公开评论文本和结构化字段，覆盖范围以真实 Provider 返回为准。</p><Button variant="accent" onClick={() => void syncComments()} disabled={syncBusy}>{syncBusy ? '同步中…' : '同步此视频评论'}</Button></div></> : <div className="drawer-error"><X size={18} /><p>视频详情读取失败，请关闭后重试。</p></div>}</aside></div>}</div>
+  return <div className="page"><PageHeader eyebrow="CONTENT RADAR" title="热门视频" description="只依据标题、描述、作者和公开互动数据判断机会，不读取画面。" actions={<div className="video-header-actions"><label className="video-search"><Search size={14} /><input value={searchKeyword} onChange={(event) => setSearchKeyword(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter') void search() }} placeholder="搜索真实关键词" aria-label="搜索真实关键词" disabled={searchBusy || !canSearch} /><button type="button" onClick={() => void search()} disabled={searchBusy || !canSearch}>{searchBusy ? '搜索中…' : '搜索'}</button></label><Button variant="accent" icon={RefreshCw} onClick={() => void scan()} disabled={busy || !canCollect}>{busy ? '扫描排队中…' : '扫描全部'}</Button></div>} />{error && <div className="error-banner"><X size={15} /><span>{error}</span><button onClick={() => setError('')} aria-label="关闭错误">关闭</button></div>}{notice && <div className="success-banner"><Check size={15} /><span>{notice}</span><button onClick={() => setNotice('')} aria-label="关闭提示">关闭</button></div>}<ProviderCapabilityNotice context={providerContext} requirements={collectionRequirements} /><div className="video-toolbar"><div className="filter-tabs">{['机会排序', '最新发现', '评论密度'].map((item) => <button key={item} className={sort === item ? 'selected' : ''} onClick={() => setSort(item)}>{item}</button>)}</div><span className="toolbar-meta"><span className="status-dot" />{items.length} 个真实视频记录</span></div>{loading ? <TableSkeleton rows={6} /> : rows.length ? <div className="video-list">{rows.map((item: RecordShape, index) => <article className="video-row" key={item.id} role="button" tabIndex={0} onClick={() => void openDetails(item)} onKeyDown={(event) => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); void openDetails(item) } }}><div className={`video-thumb thumb-${index % 4}`}><span>TEXT / META</span><b>{item.level || 'C'}<br /><em>机会记录</em></b><i aria-hidden="true">↗</i></div><div className="video-info"><div className="video-title-row"><h3>{item.title || '无标题视频'}</h3><StatusPill tone={item.level === 'A' || item.level === 'S' ? 'accent' : 'neutral'}>{item.level || 'C'} 级机会</StatusPill></div><div className="video-source"><span className="creator-dot">{(item.creator || '匿')[0]}</span>{item.creator || '未知作者'}<span>·</span><span>{item.keyword || '未关联关键词'}</span></div><div className="video-stats"><span>赞 {Number(item.likes || 0).toLocaleString()}</span><span>评论 {Number(item.comments || 0).toLocaleString()}</span><span>收藏 {Number(item.collects || 0).toLocaleString()}</span></div></div><div className="video-score"><span>机会评分</span><b>{Math.round(item.opportunity_score || 0)}</b><small>行业相关度 {Math.round(item.industry_relevance_score || 0)}%</small></div></article>)}</div> : <EmptyState icon={Video} text={error ? '无法加载真实视频。' : '当前还没有视频记录，请先执行扫描。'} />}{selected && <div className="drawer-backdrop" onClick={() => setSelected(undefined)}><aside className="comment-drawer lead-drawer" role="dialog" aria-modal="true" aria-label="视频详情" onClick={(event) => event.stopPropagation()}><div className="drawer-head"><span className="eyebrow">VIDEO DETAIL</span><button className="icon-button" onClick={() => setSelected(undefined)} aria-label="关闭视频详情"><X size={17} /></button></div>{detailLoading ? <div className="drawer-loading"><LoaderCircle size={20} className="loading-spin" /><span>正在读取视频详情…</span></div> : detail ? <><div className="drawer-section"><SectionLabel>PUBLIC METADATA</SectionLabel><h2>{detail.video.title || '无标题视频'}</h2><p>{detail.video.description || '暂无公开描述'}</p><small className="drawer-meta-line">作者：{detail.video.creator || '未知作者'} · 关键词：{detail.video.keyword || '未关联'}</small><small className="drawer-meta-line">发布时间：{formatDateTime(detail.video.publish_time)} · 赞：{Number(detail.video.likes || 0).toLocaleString()} · 评论：{Number(detail.video.comments || 0).toLocaleString()} · 分享：{Number(detail.video.shares || 0).toLocaleString()} · 收藏：{Number(detail.video.collects || 0).toLocaleString()}</small>{detail.video.url && <a className="drawer-source-link" href={detail.video.url} target="_blank" rel="noreferrer">打开真实视频页面 <ArrowUpRight size={12} /></a>}</div><div className="drawer-facts"><div><span>机会评分</span><b>{Math.round(detail.video.opportunity_score || 0)}</b></div><div><span>行业相关度</span><b>{Math.round(detail.video.industry_relevance_score || 0)}%</b></div><div><span>已入库评论</span><b>{detail.comments.length}</b></div><div><span>潜客机会</span><b>{Math.round(detail.video.lead_opportunity_score || 0)}</b></div></div><div className="drawer-section"><SectionLabel>COMMENT COLLECTION</SectionLabel><p>只同步公开评论文本和结构化字段，覆盖范围以真实 Provider 返回为准。</p><ProviderCapabilityNotice context={providerContext} requirements={commentRequirements} /><Button variant="accent" onClick={() => void syncComments()} disabled={syncBusy || !canComments}>{syncBusy ? '同步中…' : '同步此视频评论'}</Button></div></> : <div className="drawer-error"><X size={18} /><p>视频详情读取失败，请关闭后重试。</p></div>}</aside></div>}</div>
 }
