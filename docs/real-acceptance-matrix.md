@@ -2,12 +2,12 @@
 
 本文只判断第一版能否进入真实试用，不等同于单元测试、接口联通或前端页面验收。任何一项“未通过”都不能标记为“可真实运行”，也不能用 Mock、Demo、fixture 或合成数据补齐结果。
 
-## 当前结论（2026-09-04）
+## 当前结论（2026-09-17）
 
 | 硬门槛 | 当前状态 | 已知证据 | 尚缺证据 |
 | --- | --- | --- | --- |
-| `douyin-comments-crawler`：关键词 → 视频 → 评论 | 核心链路通过，证据包待补齐 | `data/acceptance/douyin-crawler-smoke-20260904-runtime-trace.json`：健康检查 `connected`，关键词“长沙装修”返回 2 个真实视频 URL，并取得 3/7 条带真实评论 ID 与文本的评论，`coverage=partial`，记录真实任务 ID、轮询次数、未发送回复 | 补齐系统入库关联、页面形态/selector 和人工复核字段 |
-| Playwright：真实登录 → 搜索 → 评论 | 核心链路通过，证据包待补齐 | `data/acceptance/douyin-playwright-smoke-20260904-runtime-trace.json`：`LOGGED_IN`、2 个真实视频 URL、5/9 条带真实评论 ID 与文本的评论、实际 DOM selector、`coverage=partial`、`reply_sent=false` | 补齐系统入库关联和人工复核字段 |
+| `douyin-comments-crawler`：关键词 → 视频 → 评论 | 未通过（服务未启动） | `data/acceptance/douyin-crawler-smoke-20260917-all-tests-rerun.json`：健康检查 `disconnected`，`http://127.0.0.1:8000` 不可达，未生成替代数据 | 启动真实 crawler 后重新完成任务、视频、评论和系统入库关联验收 |
+| Playwright：真实登录 → 搜索 → 评论 | 未通过（需人工安全验证） | `data/acceptance/douyin-playwright-smoke-20260917-all-tests-standalone.json`：登录态 `LOGGED_IN`，搜索阶段返回 `DOUYIN_VERIFICATION_REQUIRED`；历史真实部分链路证据仍保留在 2026-09-04 报告 | 用户在可见浏览器完成平台安全验证后，重新取得视频/评论 DOM、系统入库关联和人工复核字段 |
 
 “服务层可连接”与“真实链路通过”是不同状态。当前不能据此宣称商业化验收完成。
 
@@ -63,7 +63,7 @@
 1. 打开系统“抖音账号”页面，启动可见 Playwright 浏览器。
 2. 在浏览器内人工扫码登录并完成所有平台要求的验证；不要提供或记录 Cookie、密码、验证码。
 3. 在数据源页面执行 Provider 健康检查并激活 `douyin-playwright`。
-4. 使用固定关键词运行真实 smoke 流程，例如：
+4. 使用固定关键词运行真实 smoke 流程，例如。该脚本会独占持久化 Profile；如果 API 8689 正在运行，请先用系统“热门视频”页面搜索，或先执行 `stop.ps1` 再运行脚本，不能让两个进程同时打开同一 Profile：
 
    ```powershell
    .\.venv\Scripts\python.exe scripts\douyin_smoke_test.py --keyword "长沙装修" --limit 2 --report data\acceptance\douyin-playwright-smoke-YYYYMMDD.json

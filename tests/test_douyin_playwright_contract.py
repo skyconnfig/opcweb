@@ -12,6 +12,7 @@ import pytest
 from app.providers.base import CommentDTO
 from app.core.config import PROJECT_ROOT
 from app.providers.douyin.browser_manager import DouyinBrowserManager
+from app.providers.douyin.exceptions import DouyinVerificationRequired
 from app.providers.douyin.playwright_provider import DouyinPlaywrightProvider
 
 
@@ -519,6 +520,29 @@ async def test_login_detection_keeps_visible_security_challenge_as_verification_
     provider = DouyinPlaywrightProvider(browser_manager=browser)
 
     assert await provider._detect_login_status(page) == "VERIFICATION_REQUIRED"
+
+
+@pytest.mark.asyncio
+async def test_login_detection_treats_verification_interstitial_title_as_challenge():
+    page = PageDouble({"body": LocatorDouble(text="")})
+    page.url = "https://www.douyin.com/search/长沙装修?type=video"
+    page.title = lambda: _async_value("验证码中间页")
+    browser = BrowserDouble(page)
+    browser.valid_session_cookie_names = lambda *_args, **_kwargs: _async_value({"sessionid_ss", "uid_tt_ss"})
+    provider = DouyinPlaywrightProvider(browser_manager=browser)
+
+    assert await provider._detect_login_status(page) == "VERIFICATION_REQUIRED"
+
+
+@pytest.mark.asyncio
+async def test_missing_required_selector_on_verification_interstitial_is_not_selector_drift():
+    page = PageDouble({"body": LocatorDouble(text="")})
+    page.url = "https://www.douyin.com/search/长沙装修?type=video"
+    page.title = lambda: _async_value("验证码中间页")
+    provider = DouyinPlaywrightProvider(browser_manager=BrowserDouble(page))
+
+    with pytest.raises(DouyinVerificationRequired):
+        await provider._find(page, "search.input", page=page)
 
 
 async def _async_value(value):

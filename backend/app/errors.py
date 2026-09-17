@@ -13,6 +13,10 @@ class LLMNotConfiguredError(LLMError):
     code = "LLM_NOT_CONFIGURED"
 
 
+class LLMTextOnlyModelError(LLMError):
+    code = "LLM_TEXT_ONLY_MODEL_REQUIRED"
+
+
 class LLMRequestError(LLMError):
     code = "LLM_REQUEST_FAILED"
 

@@ -1,5 +1,6 @@
 import hashlib
 import json
+import re
 import time
 from copy import deepcopy
 from dataclasses import dataclass
@@ -8,7 +9,7 @@ from typing import Any
 import httpx
 
 from app.core.config import Settings
-from app.errors import LLMError, LLMInvalidResponseError, LLMNotConfiguredError, LLMRequestError
+from app.errors import LLMError, LLMInvalidResponseError, LLMNotConfiguredError, LLMRequestError, LLMTextOnlyModelError
 
 
 @dataclass
@@ -44,11 +45,16 @@ class OpenAICompatibleProvider(BaseLLMProvider):
         super().__init__()
         self.settings = settings
         self.model = settings.llm_model
-        self.configured = bool(settings.llm_base_url and settings.llm_api_key and settings.llm_model)
+        self.text_only_model = is_text_only_model(self.model)
+        self.configured = bool(settings.llm_base_url and settings.llm_api_key and settings.llm_model and self.text_only_model)
         self.transport = transport
 
     async def structured_output(self, system: str, user: str, schema: dict[str, Any]) -> dict[str, Any]:
         input_text = f"{system}\n\n{user}"
+        if not self.text_only_model:
+            error = LLMTextOnlyModelError(f"当前版本只支持文本模型，禁止配置视觉或多模态模型：{self.model}")
+            self.last_call = LLMCall(self.model, input_text, {}, 0, 0, False, str(error))
+            raise error
         if not self.configured:
             error = LLMNotConfiguredError("请配置 LLM_BASE_URL、LLM_API_KEY 和 LLM_MODEL")
             self.last_call = LLMCall(self.model, input_text, {}, 0, 0, False, str(error))
@@ -198,6 +204,9 @@ class OpenAICompatibleProvider(BaseLLMProvider):
         )
 
     async def test_connection(self) -> dict[str, Any]:
+        if not self.text_only_model:
+            error = LLMTextOnlyModelError(f"当前版本只支持文本模型，禁止配置视觉或多模态模型：{self.model}")
+            return {"ok": False, "code": error.code, "message": error.message}
         if not self.configured:
             error = LLMNotConfiguredError("请先填写 Base URL、API Key 和 Model")
             return {"ok": False, "code": error.code, "message": error.message}
@@ -238,6 +247,15 @@ def settings_with_db(settings: Settings, values: dict[str, str]) -> Settings:
             value = float(value)
         updates[key] = value
     return settings.model_copy(update=updates)
+
+
+def is_text_only_model(model: str) -> bool:
+    """Reject well-known vision/multimodal model naming without adding a vision provider."""
+
+    normalized = model.strip().lower()
+    if any(marker in normalized for marker in ("vision", "multimodal", "image", "ocr", "video")):
+        return False
+    return re.search(r"(?:^|[-_.])vl(?:$|[-_.])", normalized) is None
 
 
 def input_hash(value: Any) -> str:

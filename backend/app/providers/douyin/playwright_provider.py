@@ -608,6 +608,10 @@ class DouyinPlaywrightProvider(BaseContentProvider):
         try:
             body = await _body_text(page)
             valid_cookies = await self.browser.valid_session_cookie_names(self.home_url)
+            try:
+                page_title = await page.title()
+            except Exception:
+                page_title = ""
             # The login dialog can remain mounted but hidden after a session
             # is restored.  Prefer visible account/session evidence before
             # interpreting that dialog as logged out.  In particular, do not
@@ -616,6 +620,12 @@ class DouyinPlaywrightProvider(BaseContentProvider):
             has_session = bool({"sessionid", "sessionid_ss"} & valid_cookies) and bool(
                 {"sid_guard", "uid_tt", "uid_tt_ss"} & valid_cookies
             )
+            # A security interstitial can expose no useful body text or
+            # visible challenge selector.  Its title/URL are still
+            # text-based page metadata and must take precedence over saved
+            # session cookies for the current action.
+            if _is_verification_interstitial(str(getattr(page, "url", "")), str(page_title)):
+                return LoginStatus.VERIFICATION_REQUIRED
             if not body:
                 await self.browser.capture_debug(
                     page,
@@ -723,6 +733,18 @@ class DouyinPlaywrightProvider(BaseContentProvider):
         if not required:
             return None
         url, title, dom_summary = await _page_info(page)
+        if _is_verification_interstitial(url, title):
+            await self.browser.capture_debug(page, action=name, selector="verification.page", error="verification interstitial")
+            raise DouyinVerificationRequired(
+                "抖音页面需要人工完成安全验证",
+                detail={
+                    "selector_name": name,
+                    "url": url,
+                    "title": title,
+                    "dom_summary": dom_summary,
+                    "verification_source": "page_title_or_url",
+                },
+            )
         await self.browser.capture_debug(page, action=name, selector="; ".join(selector_descriptions(name)), error="selector not found")
         raise DouyinSelectorNotFound(
             name,
@@ -742,6 +764,18 @@ class DouyinPlaywrightProvider(BaseContentProvider):
             except Exception:
                 continue
         url, title, dom_summary = await _page_info(page)
+        if _is_verification_interstitial(url, title):
+            await self.browser.capture_debug(page, action=name, selector="verification.page", error="verification interstitial")
+            raise DouyinVerificationRequired(
+                "抖音页面需要人工完成安全验证",
+                detail={
+                    "selector_name": name,
+                    "url": url,
+                    "title": title,
+                    "dom_summary": dom_summary,
+                    "verification_source": "page_title_or_url",
+                },
+            )
         await self.browser.capture_debug(page, action=name, selector="; ".join(selector_descriptions(name)), error="collection selector not found")
         raise DouyinSelectorNotFound(
             name,
@@ -1198,3 +1232,15 @@ def _parse_dom_cursor(value: str | None) -> int:
 
 def _contains_any(value: str, needles: Iterable[str]) -> bool:
     return any(needle.lower() in value for needle in needles)
+
+
+def _is_verification_interstitial(url: str, title: str) -> bool:
+    """Detect an explicit security page from text metadata only.
+
+    This deliberately does not inspect screenshots, canvas pixels, or
+    challenge geometry; it only improves the error classification for a page
+    that has already identified itself as a verification interstitial.
+    """
+
+    metadata = f"{url} {title}".lower()
+    return _contains_any(metadata, ("验证码", "安全验证", "滑动验证", "验证身份", "captcha", "verification"))

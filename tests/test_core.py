@@ -15,7 +15,7 @@ from app.agents.keyword_agent import keyword_opportunity_score
 from app.agents.industry_agent import IndustryAgent
 from app.agents.keyword_agent import KeywordAgent
 from app.agents.lead_judge_agent import LeadJudgeAgent, RulePreFilter
-from app.agents.llm import BaseLLMProvider, LLMCall, OpenAICompatibleProvider
+from app.agents.llm import BaseLLMProvider, LLMCall, OpenAICompatibleProvider, is_text_only_model
 from app.agents.reply_agent import ReplyAgent
 from app.agents.persona_agent import PersonaAgent
 from app.errors import LLMNotConfiguredError
@@ -23,7 +23,7 @@ from app.agents.radar_agent import RadarAgent
 from app.core.config import Settings
 from app.db import Base
 from app.main import ReplyActionIn, ReplyBatchIn, ReplyPolicyIn, ScheduleIn, send_comment_reply
-from app.models import BrowserProfile, Comment, CommentReply, DouyinAccount, Lead, Project, ReplyPolicy, ScanSchedule, ScanTask, TaskCheckpoint, Video, now_utc
+from app.models import AgentRun, BrowserProfile, Comment, CommentReply, DouyinAccount, Lead, Project, ReplyPolicy, ScanSchedule, ScanTask, TaskCheckpoint, Video, now_utc
 from app.providers.external.douyin_comments_crawler import DouyinCommentsCrawlerExternalProvider
 from app.providers.external.social_harvest import SocialHarvestExternalProvider
 from app.providers.douyin.dto import ReplyResult, ReplyStatus
@@ -644,6 +644,23 @@ async def test_llm_connection_does_not_request_when_unconfigured():
     }
 
 
+@pytest.mark.asyncio
+async def test_llm_rejects_vision_and_multimodal_model_names_without_requesting():
+    def handler(request: httpx.Request):
+        raise AssertionError("a non-text model must never be requested")
+
+    assert is_text_only_model("deepseek-v4-flash")
+    assert not is_text_only_model("DeepSeek-V4-Flash-Vision-Exp")
+    assert not is_text_only_model("qwen-vl-max")
+    provider = OpenAICompatibleProvider(
+        Settings(llm_base_url="https://text.example/v1", llm_api_key="test", llm_model="qwen-vl-max"),
+        transport=httpx.MockTransport(handler),
+    )
+    result = await provider.test_connection()
+    assert result["ok"] is False
+    assert result["code"] == "LLM_TEXT_ONLY_MODEL_REQUIRED"
+
+
 
 def test_llm_api_key_is_encrypted_at_rest():
     key = Fernet.generate_key().decode()
@@ -920,6 +937,34 @@ def _reply_test_comment(db):
     db.add(comment)
     db.commit()
     return comment
+
+
+def test_direct_agent_run_failure_is_not_recorded_as_success_without_llm_call():
+    from app import main
+
+    db = _reply_test_session()
+    project = Project(name="Agent 失败审计项目", industry="装修")
+    db.add(project)
+    db.commit()
+    llm = OpenAICompatibleProvider(Settings(llm_base_url="", llm_api_key="", llm_model="text-model"))
+
+    main._agent_run_from_call(
+        db,
+        project.id,
+        "LeadJudgeAgent",
+        "lead_judge_text_v1",
+        {"comment": "测试"},
+        {},
+        llm,
+        success=False,
+        error="LLM_NOT_CONFIGURED",
+    )
+    db.commit()
+
+    run = db.scalar(select(AgentRun).where(AgentRun.project_id == project.id))
+    assert run is not None
+    assert run.success is False
+    assert run.error == "LLM_NOT_CONFIGURED"
 
 
 def test_analytics_reports_partial_comment_coverage_without_claiming_complete():

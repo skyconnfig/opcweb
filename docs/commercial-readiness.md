@@ -46,19 +46,20 @@ API 使用 `Authorization: Bearer <API_AUTH_TOKEN>`。前端容器在构建时�
 
 健康检查失败、搜索任务失败、没有视频 URL 或评论接口失败都会中止；不会生成合成视频、合成评论或自动切换 Mock。
 
-**当前状态：核心链路通过，证据包待补齐。** 2026-09-04 的真实复测报告 `data/acceptance/douyin-crawler-smoke-20260904-runtime-trace.json` 显示服务健康检查为 `connected`，关键词“长沙装修”返回 2 个真实视频 URL，并分别取得 3 条和 7 条带平台评论 ID 与文本的评论，覆盖状态为 `partial`，记录了真实任务 ID与轮询次数，未发送回复。仍需补齐系统入库关联、页面形态/selector 和人工复核字段，不能仅凭 smoke 报告宣称商业化验收完成。
+**当前状态：待重新验收。** 历史报告 `data/acceptance/douyin-crawler-smoke-20260904-runtime-trace.json` 曾记录真实部分链路，但 2026-09-17 复测时默认地址 `http://127.0.0.1:8000` 为 `disconnected`；最新报告为 `data/acceptance/douyin-crawler-smoke-20260917-all-tests-rerun.json`。启动真实 crawler 后仍需补齐系统入库关联、页面形态/selector 和人工复核字段，不能仅凭 smoke 报告宣称商业化验收完成。
 
 ### 2. 真实登录抖音 E2E
 
 Playwright 验收必须由用户在可见浏览器中人工扫码并完成平台要求的验证，然后执行：
 
 ```powershell
+# 独立 smoke 会独占持久化 Profile；API 8689 运行时请改用网页搜索，或先执行 stop.ps1
 .\.venv\Scripts\python.exe scripts\douyin_smoke_test.py --keyword "长沙装修" --limit 2
 ```
 
 该脚本必须打印真实视频 URL、真实评论 ID/文本和 `coverage=partial`。未登录、需要验证、选择器变更或没有可解析内容均为失败，不使用假数据兜底。
 
-**当前状态：核心链路已通过，证据包待补齐。** `data/acceptance/douyin-playwright-smoke-20260904-runtime-trace.json` 已记录真实账号 `LOGGED_IN`、关键词“长沙装修”、2 个真实视频 URL、5/9 条带真实评论 ID 与文本的评论、实际 DOM selector，覆盖状态为 `partial`，且 `reply_sent=false`。仍需补齐系统入库关联和人工复核字段；两条链路都完成证据包后，才可进入小规模真实试用。
+**当前状态：待人工安全验证。** 历史报告 `data/acceptance/douyin-playwright-smoke-20260904-runtime-trace.json` 曾记录真实账号 `LOGGED_IN`、视频和评论样本；2026-09-17 独立复测仍在登录态下被 `DOUYIN_VERIFICATION_REQUIRED` 拦截，最新报告为 `data/acceptance/douyin-playwright-smoke-20260917-all-tests-standalone.json`。完成平台验证后还需补齐系统入库关联和人工复核字段；两条链路都完成证据包后，才可进入小规模真实试用。
 
 ### 两个门槛的上线判定
 

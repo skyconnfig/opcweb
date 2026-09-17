@@ -14,7 +14,7 @@
 
 ## Provider 边界
 
-代码只提供 `BaseLLMProvider` 与 `OpenAICompatibleProvider`，只发送字符串消息到 `/chat/completions`。支持 DeepSeek、Qwen、GPT 及其他 OpenAI Compatible 文本模型。只需配置 `LLM_BASE_URL`、`LLM_API_KEY`、`LLM_MODEL`，另有温度和超时配置。
+代码只提供 `BaseLLMProvider` 与 `OpenAICompatibleProvider`，只发送文本消息到 `/chat/completions`。支持 DeepSeek、Qwen、GPT 及其他 OpenAI Compatible 文本模型；模型名称包含 `vision`、`vl`、`multimodal`、`image`、`ocr` 或 `video` 时会被拒绝。只需配置 `LLM_BASE_URL`、`LLM_API_KEY`、`LLM_MODEL`，另有温度和超时配置。
 
 未配置或调用失败时返回明确的 `LLM_NOT_CONFIGURED` / `LLM_REQUEST_FAILED` / `LLM_INVALID_RESPONSE`，不生成 Mock、Demo 或合成结果。
 

@@ -64,7 +64,7 @@ KeywordAgent 根据行业、地区、业务、客户画像、痛点和客户语�
 - 使用用户登录后的持久化 Chromium Profile，不把 Cookie 写入代码或数据库。
 - 真实链路为“关键词 → 搜索结果视频 → 视频详情 → 公开评论”。
 - 采集视频标题、description、作者、发布时间、点赞、评论、分享、收藏等公开元数据。
-- 采集一级评论、作者回复和可见二级回复，并保存来源视频链接与采集覆盖状态。
+- 采集页面当前已加载的公开评论文本、作者回复（若页面提供）和来源视频链接，并保存真实覆盖状态；二级回复当前不作为已验证的稳定能力承诺。
 - 支持 10、15、20、25、30 分钟自动采集计划；任务、checkpoint、事件日志和下次运行时间持久化。
 - 支持 douyin-comments-crawler 外部服务适配，但 Playwright Provider 可以直接完成主链路。
 - 采集失败、未登录、风控验证或 DOM 结构变化时，任务会记录明确错误，不伪造成功数据。
@@ -117,6 +117,8 @@ KeywordAgent 根据行业、地区、业务、客户画像、痛点和客户语�
 - 封面视觉判断、多模态模型、Vision API
 - 图像 embedding、视频内容识别
 - VisionProvider、ImageProvider、MultimodalProvider、VideoProvider
+
+模型配置也会拒绝常见视觉/多模态模型名称（如包含 `vision`、`vl` 或 `multimodal`），避免误接入非文本模型。
 
 评论链路按“规则预筛 → 候选评论 → 文本 LLM → Lead Score”分层，大量评论优先使用低延迟文本模型；行业理解、关键词和人设使用中等能力文本模型。
 
@@ -204,6 +206,8 @@ npm run build
 ```
 
 本地开发阶段已覆盖后端全量测试、前端类型检查和 Next.js 生产构建。真实抖音 E2E 仍依赖用户自己的登录态、平台页面状态和合规使用环境，验收记录见 [docs/real-acceptance-matrix.md](docs/real-acceptance-matrix.md)。
+
+2026-09-17 最新复核：后端 `131 passed`，前端 lint/build 通过，桌面端 15 个页面和移动端冒烟通过；当前真实抖音搜索仍被平台安全验证拦截，外部 `douyin-comments-crawler` 未启动，不能据此宣称真实商业化 E2E 已通过。
 
 ## 数据与合规边界
 

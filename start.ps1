@@ -1,4 +1,4 @@
-$ErrorActionPreference = 'Stop'
+﻿$ErrorActionPreference = 'Stop'
 $reload = $args -contains '--reload'
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $root
@@ -40,7 +40,7 @@ if (-not (Get-Command npm -ErrorAction SilentlyContinue)) { throw 'npm is requir
 uv pip install -e ".[test]" --python .venv\Scripts\python.exe
 if (-not (Test-Path -LiteralPath '.env')) {
   Copy-Item -LiteralPath '.env.example' -Destination '.env'
-  $encryptionKey = & '.venv\Scripts\python.exe' -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+  $encryptionKey = & $python -c 'from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())'
   Add-Content -LiteralPath '.env' -Value "SETTINGS_ENCRYPTION_KEY=$encryptionKey"
   Write-Host 'Created local .env and generated the API-key encryption key. Enter a new DeepSeek API key in Settings.' -ForegroundColor Yellow
 }
@@ -53,7 +53,8 @@ if (-not (Get-ChildItem -LiteralPath $browserRoot -Directory -Filter 'chromium-*
 if (-not (Test-Path -LiteralPath 'web\node_modules')) { Set-Location web; npm install; Set-Location $root }
 $reloadArg = if ($reload) { ' --reload' } else { '' }
 if (-not (Test-ProjectPort 8689)) {
-  Start-Process powershell -ArgumentList '-NoExit','-Command',"Set-Location '$root'; .\.venv\Scripts\python.exe -m uvicorn app.main:app --app-dir backend$reloadArg --loop app.uvicorn_loop:create_loop --port 8689" -WindowStyle Hidden
+  $serverCommand = "Set-Location '$root'; & '$python' -m uvicorn app.main:app --app-dir backend$reloadArg --loop app.uvicorn_loop:create_loop --port 8689"
+  Start-Process -FilePath 'powershell' -ArgumentList @('-NoExit', '-Command', $serverCommand) -WindowStyle Hidden
 }
 Set-Location web
 if (-not (Test-ProjectPort 5173)) {

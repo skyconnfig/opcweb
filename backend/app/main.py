@@ -13,7 +13,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from sqlalchemy import desc, func, or_, select, text, update
 from sqlalchemy.orm import Session, aliased
 
-from app.agents.llm import OpenAICompatibleProvider, input_hash, settings_with_db
+from app.agents.llm import OpenAICompatibleProvider, input_hash, is_text_only_model, settings_with_db
 from app.errors import LLMError
 from app.agents.persona_agent import PersonaAgent
 from app.agents.lead_judge_agent import LeadJudgeAgent, RulePreFilter
@@ -422,7 +422,7 @@ async def douyin_status(db: Session = Depends(get_db)):
     await provider.ensure_browser_started()
     status = await provider.get_login_status()
     account = _sync_douyin_account(db, provider, status)
-    return {"provider": provider.name, "browser": "running" if provider.browser.is_running else "stopped", "login": status.value, "profile_dir": str(provider.browser.profile_dir), "headless": provider.browser.headless, "account_id": account.id, "account_status": account.status, "last_checked_at": account.last_checked_at}
+    return {"provider": provider.name, "browser": "running" if provider.browser.is_running else "stopped", "login": status.value, "profile_dir": str(provider.browser.profile_dir), "headless": provider.browser.headless, "account_id": account.id, "account_name": account.name, "account_nickname": account.nickname, "douyin_user_id": account.douyin_user_id, "last_login_at": account.last_login_at, "account_status": account.status, "last_checked_at": account.last_checked_at}
 
 
 @app.post("/api/douyin/browser/start")
@@ -431,7 +431,7 @@ async def douyin_browser_start(db: Session = Depends(get_db)):
     await provider.start_browser()
     status = await provider.get_login_status()
     account = _sync_douyin_account(db, provider, status)
-    return {"provider": provider.name, "browser": "running", "login": status.value, "account_id": account.id, "message": "请在打开的真实抖音浏览器中完成扫码登录" if status is not LoginStatus.LOGGED_IN else "抖音登录状态已确认"}
+    return {"provider": provider.name, "browser": "running", "login": status.value, "account_id": account.id, "account_name": account.name, "account_nickname": account.nickname, "douyin_user_id": account.douyin_user_id, "last_login_at": account.last_login_at, "account_status": account.status, "message": "请在打开的真实抖音浏览器中完成扫码登录" if status is not LoginStatus.LOGGED_IN else "抖音登录状态已确认"}
 
 
 @app.post("/api/douyin/browser/close")
@@ -439,7 +439,7 @@ async def douyin_browser_close(db: Session = Depends(get_db)):
     provider = _require_playwright_provider(active_provider(db))
     await provider.close_browser()
     account = _sync_douyin_account(db, provider, None)
-    return {"provider": provider.name, "browser": "stopped", "account_id": account.id, "account_status": account.status}
+    return {"provider": provider.name, "browser": "stopped", "login": LoginStatus.ERROR.value, "account_id": account.id, "account_name": account.name, "account_status": account.status}
 
 
 @app.get("/api/douyin/login/status")
@@ -775,10 +775,12 @@ def _comment_context(db: Session, comment: Comment) -> tuple[Project, Video, Lea
     return project, video, lead, [row.content for row in history]
 
 
-def _agent_run_from_call(db: Session, project_id: int, agent: str, prompt_version: str, input_payload: dict, output: dict, llm: OpenAICompatibleProvider):
+def _agent_run_from_call(db: Session, project_id: int, agent: str, prompt_version: str, input_payload: dict, output: dict, llm: OpenAICompatibleProvider, *, success: bool | None = None, error: str | None = None):
     call = llm.last_call
     input_text = call.input_text if call else json.dumps(input_payload, ensure_ascii=False, default=str)
-    db.add(AgentRun(project_id=project_id, agent=agent, model=call.model if call else llm.model, prompt_version=prompt_version, input_hash=input_hash(input_payload), input_text=input_text, output=output, latency_ms=call.latency_ms if call else 0, token_usage=call.tokens if call else 0, success=call.success if call else True, error=call.error if call else ""))
+    recorded_success = call.success if call and success is None else (True if success is None else success)
+    recorded_error = call.error if call and error is None else (error or "")
+    db.add(AgentRun(project_id=project_id, agent=agent, model=call.model if call else llm.model, prompt_version=prompt_version, input_hash=input_hash(input_payload), input_text=input_text, output=output, latency_ms=call.latency_ms if call else 0, token_usage=call.tokens if call else 0, success=recorded_success, error=recorded_error))
 
 
 @app.get("/api/comments/{comment_id}")
@@ -802,8 +804,8 @@ async def analyze_comment(comment_id: int, db: Session = Depends(get_db)):
     llm.clear_last_call()
     try:
         judgment = await LeadJudgeAgent(llm).run(project_data, comment_data)
-    except Exception:
-        _agent_run_from_call(db, project.id, "LeadJudgeAgent", LeadJudgeAgent.prompt_version, {"project": project_data, "comment": comment_data}, {}, llm)
+    except Exception as exc:
+        _agent_run_from_call(db, project.id, "LeadJudgeAgent", LeadJudgeAgent.prompt_version, {"project": project_data, "comment": comment_data}, {}, llm, success=False, error=str(exc))
         db.commit()
         raise
     _agent_run_from_call(db, project.id, "LeadJudgeAgent", LeadJudgeAgent.prompt_version, {"project": project_data, "comment": comment_data}, judgment, llm)
@@ -837,8 +839,8 @@ async def generate_reply(comment_id: int, payload: GenerateReplyIn | None = None
     llm.clear_last_call()
     try:
         decision = await agent.run(project_data, comment_data, lead_data, persona_data, [{"title": item.title, "content": item.content, "tags": item.tags, "enabled": item.enabled} for item in knowledge], [{"reply_text": item.reply_text, "status": item.status} for item in previous])
-    except Exception:
-        _agent_run_from_call(db, project.id, "ReplyAgent", agent.prompt_version, {"project": project_data, "comment": comment_data}, {}, llm)
+    except Exception as exc:
+        _agent_run_from_call(db, project.id, "ReplyAgent", agent.prompt_version, {"project": project_data, "comment": comment_data}, {}, llm, success=False, error=str(exc))
         db.commit()
         raise
     decision_data = decision.model_dump()
@@ -1384,6 +1386,8 @@ def update_settings(payload: SettingsInput, db: Session = Depends(get_db)):
             continue
         if key == "llm_api_key" and not value:
             continue
+        if key == "llm_model" and value and not is_text_only_model(str(value)):
+            raise HTTPException(422, "当前版本只支持文本模型，禁止配置视觉或多模态模型")
         if key == "llm_api_key":
             try:
                 value = encrypt_secret(value, get_settings())
