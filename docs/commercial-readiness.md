@@ -76,7 +76,7 @@ Playwright 验收必须由用户在可见浏览器中人工扫码并完成平台
 - 在任务中心按项目启用自动扫描，频率可选 10～30 分钟；默认关闭。
 - API 会将到期计划排入持久化任务队列；已有 queued/running 任务时跳过重复入队。
 - 计划的 `next_run_at` / `last_run_at` 会写入数据库，API 重启后由 APScheduler 继续检查。
-- SQLite 本地开发和 PostgreSQL/Docker 都使用 Alembic `upgrade head`；当前 head 为 `b8c9d0e1f2a3`，包含评论来源、回复恢复、采集任务来源、旧表空值规范化、浏览器会话和潜客跟进任务等迁移。
+- SQLite 本地开发和 PostgreSQL/Docker 都使用 Alembic `upgrade head`；当前 head 为 `c9d0e1f2a3b4`，包含评论来源、回复恢复、采集任务来源、旧表空值规范化、浏览器会话、潜客跟进任务和站内逾期提醒等迁移。
 
 ## 仍需独立完成的商业规模能力
 

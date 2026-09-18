@@ -183,7 +183,7 @@ docker compose up --build
 .venv\Scripts\python.exe -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
 ```
 
-生产编排使用 /ready 作为就绪探针。数据库迁移由 Alembic 管理，当前迁移 head 为 b8c9d0e1f2a3，包含浏览器会话与潜客跟进任务表。
+生产编排使用 /ready 作为就绪探针。数据库迁移由 Alembic 管理，当前迁移 head 为 c9d0e1f2a3b4，包含浏览器会话、潜客跟进任务和站内逾期提醒表。
 
 ## 项目结构
 
