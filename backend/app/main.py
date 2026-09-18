@@ -905,10 +905,38 @@ def update_project(project_id: int, payload: ProjectUpdate, db: Session = Depend
 
 
 @app.delete("/api/projects/{project_id}")
-def delete_project(project_id: int, db: Session = Depends(get_db)):
+async def delete_project(project_id: int, db: Session = Depends(get_db)):
     project = db.get(Project, project_id)
     if not project:
         raise HTTPException(404, "项目不存在")
+
+    active_task = db.scalar(
+        select(ScanTask)
+        .where(ScanTask.project_id == project_id, ScanTask.status.in_(("queued", "running", "verification_required")))
+        .order_by(ScanTask.id)
+        .limit(1)
+    )
+    if active_task is not None:
+        raise HTTPException(
+            409,
+            {
+                "code": "PROJECT_HAS_ACTIVE_TASK",
+                "message": "项目仍有采集任务运行或等待人工验证，请先暂停或等待任务结束",
+                "detail": {"project_id": project_id, "task_id": active_task.id, "status": active_task.status},
+            },
+        )
+
+    project_sessions = db.scalars(select(BrowserSession).where(BrowserSession.project_id == project_id)).all()
+    cached_providers: list[tuple[str, DouyinPlaywrightProvider]] = []
+    for session in project_sessions:
+        profile_prefix = f"{Path(session.profile_path).resolve()}|"
+        cached_providers.extend((key, provider) for key, provider in _project_douyin_providers.items() if key.startswith(profile_prefix))
+    for key, provider in dict(cached_providers).items():
+        try:
+            await provider.close()
+        except Exception as exc:
+            raise HTTPException(502, {"code": "PROJECT_BROWSER_CLOSE_FAILED", "message": "无法安全关闭项目浏览器，请稍后重试", "detail": {"error": str(exc)}}) from exc
+        _project_douyin_providers.pop(key, None)
 
     # Project data spans several tables and the local SQLite database does
     # not consistently have database-level ON DELETE CASCADE constraints.

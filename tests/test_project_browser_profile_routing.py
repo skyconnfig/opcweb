@@ -1,5 +1,7 @@
 from datetime import timedelta
 
+import pytest
+from fastapi import HTTPException
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
@@ -47,7 +49,8 @@ def test_existing_legacy_profile_is_adopted_only_by_latest_project(tmp_path):
     assert latest_session.id != older_session.id
 
 
-def test_project_can_be_renamed_and_deleted_without_orphaned_records():
+@pytest.mark.asyncio
+async def test_project_can_be_renamed_and_deleted_without_orphaned_records():
     db = _session()
     project = Project(name="待管理项目", industry="装修")
     other = Project(name="保留项目", industry="教育")
@@ -58,7 +61,7 @@ def test_project_can_be_renamed_and_deleted_without_orphaned_records():
     video = Video(project_id=project.id, platform_video_id="video-1", title="真实视频", keyword="长沙装修")
     comment = Comment(project_id=project.id, video_id=video.id, platform_comment_id="comment-1", content="120平多少钱？", content_hash="hash-1")
     lead = Lead(project_id=project.id, nickname="真实用户")
-    task = ScanTask(project_id=project.id, name="真实扫描")
+    task = ScanTask(project_id=project.id, name="真实扫描", status="completed")
     db.add_all([keyword, video, lead, task])
     db.flush()
     comment.video_id = video.id
@@ -83,9 +86,26 @@ def test_project_can_be_renamed_and_deleted_without_orphaned_records():
     renamed = main.update_project(project.id, main.ProjectUpdate(name="已重命名项目"), db)
     assert renamed.name == "已重命名项目"
 
-    result = main.delete_project(project.id, db)
+    result = await main.delete_project(project.id, db)
     assert result == {"id": project.id, "deleted": True}
     assert db.get(Project, project.id) is None
     assert db.get(Project, other.id) is not None
     for model in (Keyword, Video, Comment, CommentReply, Lead, FollowTask, ScanTask, TaskStep, TaskEvent, TaskCheckpoint, TaskReport, TaskArtifact, AgentRun, BrowserSession):
         assert db.query(model).filter_by(project_id=project.id).count() == 0 if "project_id" in model.__table__.columns else db.query(model).count() == 0
+
+
+@pytest.mark.asyncio
+async def test_project_delete_rejects_active_collection_task():
+    db = _session()
+    project = Project(name="运行中项目", industry="装修")
+    db.add(project)
+    db.flush()
+    db.add(ScanTask(project_id=project.id, name="真实采集", status="running"))
+    db.commit()
+
+    with pytest.raises(HTTPException) as caught:
+        await main.delete_project(project.id, db)
+
+    assert caught.value.status_code == 409
+    assert caught.value.detail["code"] == "PROJECT_HAS_ACTIVE_TASK"
+    assert db.get(Project, project.id) is not None
