@@ -1280,6 +1280,57 @@ async def test_manual_comment_sync_reconciles_existing_dom_record(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_manual_comment_sync_can_consume_all_comment_pages(monkeypatch):
+    from app import main
+    from app.providers.base import CommentScanResult
+    from app.providers.douyin.dto import DouyinCommentDTO
+
+    db = _reply_test_session()
+    comment = _reply_test_comment(db)
+
+    class Provider:
+        capabilities = {"comments": True}
+
+        def __init__(self):
+            self.cursors = []
+
+        async def get_comments(self, video_id, cursor=None):
+            self.cursors.append(cursor)
+            if cursor is None:
+                return CommentScanResult(
+                    items=[DouyinCommentDTO("douyin", "comment-page-1", "user-2", "客户2", "", "第一页")],
+                    coverage_status="partial",
+                    items_received=1,
+                    next_cursor="page-2",
+                    has_more=True,
+                )
+            return CommentScanResult(
+                items=[DouyinCommentDTO("douyin", "comment-page-2", "user-3", "客户3", "", "第二页")],
+                coverage_status="complete",
+                items_received=1,
+            )
+
+    provider = Provider()
+    monkeypatch.setattr(main, "active_provider", lambda _db: provider)
+
+    async def analyze(self, db, video, comments):
+        return {"status": "SUCCESS", "analyzed": len(comments)}
+
+    monkeypatch.setattr(main.RadarService, "analyze_video_comments", analyze)
+    result = await main.sync_douyin_comments(comment.video_id, all_pages=True, db=db)
+
+    assert provider.cursors == [None, "page-2"]
+    assert result["pages"] == 2
+    assert result["received"] == 2
+    assert result["created"] == 2
+    assert result["coverage_status"] == "partial"
+    assert result["next_cursor"] is None
+    assert result["has_more"] is False
+    assert result["analysis"] == {"status": "SUCCESS", "analyzed": 2}
+    assert db.scalar(select(Comment).where(Comment.platform_comment_id == "comment-page-2")) is not None
+
+
+@pytest.mark.asyncio
 async def test_manual_comment_sync_runs_text_lead_pipeline(monkeypatch):
     from app import main
     from app.providers.base import CommentScanResult
@@ -1338,15 +1389,16 @@ async def test_video_scan_route_is_scoped_to_one_video(monkeypatch):
     comment = _reply_test_comment(db)
     called = {}
 
-    async def sync(video_id, limit, cursor, db):
+    async def sync(video_id, limit, cursor, all_pages, db):
         called.update(video_id=video_id, limit=limit, cursor=cursor, session=db)
+        called["all_pages"] = all_pages
         return {"video_id": video_id, "analysis": {"status": "SUCCESS"}}
 
     monkeypatch.setattr(main, "sync_douyin_comments", sync)
     result = await main.scan_video(comment.video_id, db)
 
     assert result["video_id"] == comment.video_id
-    assert called == {"video_id": comment.video_id, "limit": None, "cursor": None, "session": db}
+    assert called == {"video_id": comment.video_id, "limit": None, "cursor": None, "session": db, "all_pages": True}
 
 
 def test_lead_follow_task_and_note_are_durable():

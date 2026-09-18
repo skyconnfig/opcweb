@@ -224,6 +224,7 @@ _douyin_provider: DouyinPlaywrightProvider | None = None
 _crawler_provider: DouyinCommentsCrawlerExternalProvider | None = None
 _project_douyin_providers: dict[str, DouyinPlaywrightProvider] = {}
 _reply_send_locks: dict[int, asyncio.Lock] = {}
+MAX_MANUAL_COMMENT_PAGES = 100
 
 
 def provider_registry(settings=None):
@@ -786,42 +787,71 @@ async def douyin_search(payload: DouyinSearchIn, db: Session = Depends(get_db)):
 
 
 @app.post("/api/douyin/videos/{video_id}/comments/sync")
-async def sync_douyin_comments(video_id: int, limit: int | None = Query(None, ge=1, le=500), cursor: str | None = None, db: Session = Depends(get_db)):
+async def sync_douyin_comments(
+    video_id: int,
+    limit: int | None = Query(None, ge=1, le=500),
+    cursor: str | None = None,
+    all_pages: bool = Query(False),
+    db: Session = Depends(get_db),
+):
     video = db.get(Video, video_id)
     if not video:
         raise HTTPException(404, "视频不存在")
     provider = _require_provider_capability(active_provider_for_project(db, video.project_id), "comments", "公开评论采集")
-    result = await provider.get_comments(video.platform_video_id, cursor=cursor)
+    page_cursor = cursor
+    page_limit = limit if isinstance(limit, int) else get_settings().douyin_default_comment_limit
+    paginate_all = all_pages if isinstance(all_pages, bool) else False
+    page_count = 0
+    cursor_history: set[str | None] = set()
+    coverage_statuses: set[str] = set()
     created = 0
     updated = 0
     synced_platform_ids: list[str] = []
-    for dto in result.items[: limit or get_settings().douyin_default_comment_limit]:
-        synced_platform_ids.append(dto.comment_id)
-        existing = db.scalar(select(Comment).where(Comment.project_id == video.project_id, Comment.platform == dto.platform, Comment.platform_comment_id == dto.comment_id))
-        if existing:
-            # Repeated manual/scheduled syncs must reconcile mutable public
-            # fields instead of treating the first observation as permanent.
-            # Keep the latest task provenance untouched: this endpoint does
-            # not create a ScanTask, while the resumable scan service owns
-            # task/checkpoint associations.
-            existing.video_id = video.id
-            existing.platform_user_id = dto.user_id
-            existing.id_source = getattr(dto, "id_source", existing.id_source)
-            existing.nickname = dto.nickname
-            existing.profile_url = dto.profile_url
-            existing.comment_url = getattr(dto, "comment_url", existing.comment_url)
-            existing.content = dto.content
-            existing.content_hash = input_hash(dto.content)
-            existing.parent_comment_id = dto.parent_comment_id
-            existing.is_reply = getattr(dto, "is_reply", existing.is_reply)
-            existing.like_count = getattr(dto, "like_count", existing.like_count)
-            existing.created_at_platform = dto.created_at
-            existing.coverage_status = result.coverage_status
-            updated += 1
-            continue
-        db.add(Comment(project_id=video.project_id, video_id=video.id, platform=dto.platform, platform_comment_id=dto.comment_id, platform_user_id=dto.user_id, id_source=getattr(dto, "id_source", "dom_attribute"), nickname=dto.nickname, profile_url=dto.profile_url, comment_url=getattr(dto, "comment_url", ""), content=dto.content, content_hash=input_hash(dto.content), parent_comment_id=dto.parent_comment_id, is_reply=getattr(dto, "is_reply", False), like_count=getattr(dto, "like_count", 0), created_at_platform=dto.created_at, coverage_status=result.coverage_status))
-        created += 1
-    db.commit()
+    total_received = 0
+    has_more = False
+    next_cursor = None
+    while True:
+        if page_cursor in cursor_history:
+            raise HTTPException(502, {"code": "COMMENT_CURSOR_DID_NOT_ADVANCE", "message": "评论分页游标未前进"})
+        cursor_history.add(page_cursor)
+        result = await provider.get_comments(video.platform_video_id, cursor=page_cursor)
+        page_count += 1
+        total_received += result.items_received or len(result.items)
+        coverage_statuses.add(str(result.coverage_status or "unknown").lower())
+        for dto in result.items[:page_limit]:
+            synced_platform_ids.append(dto.comment_id)
+            existing = db.scalar(select(Comment).where(Comment.project_id == video.project_id, Comment.platform == dto.platform, Comment.platform_comment_id == dto.comment_id))
+            if existing:
+                # Repeated manual/scheduled syncs must reconcile mutable public
+                # fields instead of treating the first observation as permanent.
+                # Keep the latest task provenance untouched: this endpoint does
+                # not create a ScanTask, while the resumable scan service owns
+                # task/checkpoint associations.
+                existing.video_id = video.id
+                existing.platform_user_id = dto.user_id
+                existing.id_source = getattr(dto, "id_source", existing.id_source)
+                existing.nickname = dto.nickname
+                existing.profile_url = dto.profile_url
+                existing.comment_url = getattr(dto, "comment_url", existing.comment_url)
+                existing.content = dto.content
+                existing.content_hash = input_hash(dto.content)
+                existing.parent_comment_id = dto.parent_comment_id
+                existing.is_reply = getattr(dto, "is_reply", existing.is_reply)
+                existing.like_count = getattr(dto, "like_count", existing.like_count)
+                existing.created_at_platform = dto.created_at
+                existing.coverage_status = result.coverage_status
+                updated += 1
+                continue
+            db.add(Comment(project_id=video.project_id, video_id=video.id, platform=dto.platform, platform_comment_id=dto.comment_id, platform_user_id=dto.user_id, id_source=getattr(dto, "id_source", "dom_attribute"), nickname=dto.nickname, profile_url=dto.profile_url, comment_url=getattr(dto, "comment_url", ""), content=dto.content, content_hash=input_hash(dto.content), parent_comment_id=dto.parent_comment_id, is_reply=getattr(dto, "is_reply", False), like_count=getattr(dto, "like_count", 0), created_at_platform=dto.created_at, coverage_status=result.coverage_status))
+            created += 1
+        db.commit()
+        has_more = bool(result.has_more)
+        next_cursor = result.next_cursor
+        if not paginate_all or not has_more or not next_cursor or page_count >= MAX_MANUAL_COMMENT_PAGES:
+            break
+        if next_cursor == page_cursor:
+            raise HTTPException(502, {"code": "COMMENT_CURSOR_DID_NOT_ADVANCE", "message": "评论分页游标未前进"})
+        page_cursor = next_cursor
     synced_comments = db.scalars(
         select(Comment).where(
             Comment.video_id == video.id,
@@ -829,7 +859,7 @@ async def sync_douyin_comments(video_id: int, limit: int | None = Query(None, ge
         )
     ).all() if synced_platform_ids else []
     analysis = await RadarService(provider, active_llm(db)).analyze_video_comments(db, video, synced_comments)
-    return {"video_id": video.id, "received": result.items_received, "created": created, "updated": updated, "coverage_status": result.coverage_status, "next_cursor": result.next_cursor, "has_more": result.has_more, "analysis": analysis}
+    return {"video_id": video.id, "received": total_received, "created": created, "updated": updated, "pages": page_count, "coverage_status": _aggregate_coverage_status(coverage_statuses), "next_cursor": next_cursor, "has_more": has_more, "analysis": analysis}
 
 
 @app.get("/api/projects", response_model=list[ProjectOut])
@@ -1126,7 +1156,7 @@ async def scan_video(video_id: int, db: Session = Depends(get_db)):
     # This endpoint is intentionally video-scoped. Project-wide resumable
     # scans belong to /api/projects/{project_id}/scan; do not silently start
     # unrelated keyword work when a caller asks for one video.
-    return await sync_douyin_comments(video_id, limit=None, cursor=None, db=db)
+    return await sync_douyin_comments(video_id, limit=None, cursor=None, all_pages=True, db=db)
 
 
 @app.get("/api/comments")
