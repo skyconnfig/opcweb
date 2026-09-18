@@ -45,6 +45,7 @@ async def process_due_follow_task_reminders() -> int:
 async def enqueue_due_schedules(
     provider: BaseContentProvider | None = None,
     provider_resolver: Callable[[], BaseContentProvider] | None = None,
+    project_provider_resolver: Callable[[int], BaseContentProvider] | None = None,
 ) -> int:
     """Enqueue due plans only when the real content source is healthy.
 
@@ -62,14 +63,14 @@ async def enqueue_due_schedules(
         if recovered:
             db.commit()
 
-    if provider is None and provider_resolver is not None:
+    if project_provider_resolver is None and provider is None and provider_resolver is not None:
         try:
             provider = provider_resolver()
         except Exception:
             return 0
         if provider is None:
             return 0
-    if provider is not None:
+    if project_provider_resolver is None and provider is not None:
         try:
             health = await provider.health_check()
         except Exception:
@@ -89,6 +90,13 @@ async def enqueue_due_schedules(
             due_at = schedule.next_run_at.replace(tzinfo=timezone.utc) if schedule.next_run_at and schedule.next_run_at.tzinfo is None else schedule.next_run_at
             if due_at is not None and due_at > now:
                 continue
+            if project_provider_resolver is not None:
+                try:
+                    project_provider = project_provider_resolver(schedule.project_id)
+                    if project_provider is None or (await project_provider.health_check()).status != "connected":
+                        continue
+                except Exception:
+                    continue
             if not has_active_scan(db, schedule.project_id):
                 # Keep task creation and schedule advancement in one
                 # transaction. A process exit between two commits otherwise

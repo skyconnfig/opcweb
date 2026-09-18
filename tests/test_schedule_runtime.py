@@ -88,6 +88,34 @@ async def test_unhealthy_provider_does_not_enqueue_or_advance_schedule(monkeypat
 
 
 @pytest.mark.asyncio
+async def test_project_provider_resolver_checks_each_schedule_independently(monkeypatch, session_factory):
+    healthy_id = _project(session_factory, "健康 Profile 项目")
+    blocked_id = _project(session_factory, "需登录 Profile 项目")
+    _due_schedule(session_factory, healthy_id)
+    _due_schedule(session_factory, blocked_id)
+    monkeypatch.setattr(scheduler, "SessionLocal", session_factory)
+
+    before = {}
+    with session_factory() as db:
+        for project_id in (healthy_id, blocked_id):
+            before[project_id] = db.scalar(select(ScanSchedule).where(ScanSchedule.project_id == project_id)).next_run_at
+
+    def resolve(project_id):
+        return HealthyProvider() if project_id == healthy_id else UnhealthyProvider()
+
+    assert await scheduler.enqueue_due_schedules(project_provider_resolver=resolve) == 1
+
+    with session_factory() as db:
+        assert db.scalar(select(ScanTask).where(ScanTask.project_id == healthy_id)) is not None
+        assert db.scalar(select(ScanTask).where(ScanTask.project_id == blocked_id)) is None
+        healthy_schedule = db.scalar(select(ScanSchedule).where(ScanSchedule.project_id == healthy_id))
+        blocked_schedule = db.scalar(select(ScanSchedule).where(ScanSchedule.project_id == blocked_id))
+        assert healthy_schedule.last_run_at is not None
+        assert blocked_schedule.last_run_at is None
+        assert blocked_schedule.next_run_at == before[blocked_id]
+
+
+@pytest.mark.asyncio
 async def test_provider_resolver_initialization_failure_is_safe(monkeypatch, session_factory):
     project_id = _project(session_factory)
     _due_schedule(session_factory, project_id)

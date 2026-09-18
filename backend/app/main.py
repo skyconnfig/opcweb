@@ -592,15 +592,15 @@ async def lifespan(app: FastAPI):
                 record.note = provider_note
         db.commit()
     scheduler = create_scheduler()
-    def resolve_scheduled_provider():
+    def resolve_scheduled_project_provider(project_id: int):
         with SessionLocal() as db:
-            return active_provider(db)
+            return active_provider_for_project(db, project_id)
 
     scheduler.add_job(
         enqueue_due_schedules,
         "interval",
         minutes=1,
-        kwargs={"provider_resolver": resolve_scheduled_provider},
+        kwargs={"project_provider_resolver": resolve_scheduled_project_provider},
         id="scan-schedules",
         max_instances=1,
         coalesce=True,
