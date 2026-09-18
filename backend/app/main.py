@@ -529,6 +529,11 @@ async def _resume_verification_tasks() -> None:
                 task.status = "queued"
                 task.error = ""
                 task.finished_at = None
+                browser_session = db.scalar(select(BrowserSession).where(BrowserSession.project_id == project_id))
+                if browser_session is not None:
+                    browser_session.status = "READY"
+                    browser_session.last_check_time = now_utc()
+                    browser_session.last_error = ""
                 db.commit()
                 resumed = True
 

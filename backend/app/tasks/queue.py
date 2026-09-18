@@ -23,6 +23,7 @@ MIN_SCHEDULE_INTERVAL_MINUTES = 10
 MAX_SCHEDULE_INTERVAL_MINUTES = 30
 TASK_RUNTIME_INITIALIZING = "initializing_runtime"
 TASK_RUNTIME_INIT_TIMEOUT_SECONDS = 60
+ACTIVE_SCAN_STATUSES = ("queued", "running", "verification_required")
 
 
 def enqueue_scan(db: Session, project_id: int, full: bool = False, *, commit: bool = True) -> ScanTask:
@@ -48,7 +49,7 @@ def claim_next_task(db: Session) -> tuple[int, bool] | None:
         select(queued)
         .where(
             queued.status == "queued",
-            ~exists(select(running.id).where(running.project_id == queued.project_id, running.status == "running")),
+                ~exists(select(running.id).where(running.project_id == queued.project_id, running.status.in_(("running", "verification_required")))),
         )
         .order_by(queued.created_at, queued.id)
         .limit(1)
@@ -80,7 +81,7 @@ def claim_next_task(db: Session) -> tuple[int, bool] | None:
 
 
 def has_active_scan(db: Session, project_id: int) -> bool:
-    return bool(db.scalar(select(ScanTask.id).where(ScanTask.project_id == project_id, ScanTask.status.in_(["queued", "running"])).limit(1)))
+    return bool(db.scalar(select(ScanTask.id).where(ScanTask.project_id == project_id, ScanTask.status.in_(ACTIVE_SCAN_STATUSES)).limit(1)))
 
 
 def advance_schedule(schedule, now):

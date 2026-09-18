@@ -25,7 +25,7 @@ from app.agents.radar_agent import RadarAgent
 from app.core.config import Settings
 from app.db import Base
 from app.main import ReplyActionIn, ReplyBatchIn, ReplyPolicyIn, ScheduleIn, _require_provider_capability, send_comment_reply
-from app.models import AgentRun, BrowserProfile, Comment, CommentReply, DouyinAccount, KnowledgeEntry, Lead, Project, ReplyPolicy, ScanSchedule, ScanTask, TaskCheckpoint, Video, now_utc
+from app.models import AgentRun, BrowserProfile, BrowserSession, Comment, CommentReply, DouyinAccount, KnowledgeEntry, Lead, Project, ReplyPolicy, ScanSchedule, ScanTask, TaskCheckpoint, Video, now_utc
 from app.providers.external.douyin_comments_crawler import DouyinCommentsCrawlerExternalProvider
 from app.providers.external.social_harvest import SocialHarvestExternalProvider
 from app.providers.douyin.dto import ReplyResult, ReplyStatus
@@ -50,7 +50,7 @@ def test_api_provider_capability_guard_rejects_explicitly_unsupported_action():
     assert caught.value.detail["detail"] == {"provider": "Text-only adapter", "capability": "comments"}
 from app.settings_store import decrypt_secret, encrypt_secret
 from app.tasks.checkpoint import checkpoint_snapshot
-from app.tasks.queue import advance_schedule, claim_next_task, enqueue_scan
+from app.tasks.queue import advance_schedule, claim_next_task, enqueue_scan, has_active_scan
 from app.tasks.scheduler import enqueue_due_schedules
 from app.security import is_authorized
 from starlette.requests import Request
@@ -213,6 +213,21 @@ async def test_due_schedule_does_not_enqueue_while_project_has_active_scan(monke
     assert schedule.next_run_at is not None
 
 
+def test_verification_required_scan_blocks_duplicate_project_work():
+    db = _reply_test_session()
+    project = Project(name="验证中项目", industry="装修")
+    db.add(project)
+    db.commit()
+    waiting = enqueue_scan(db, project.id)
+    waiting.status = "verification_required"
+    db.commit()
+
+    assert has_active_scan(db, project.id) is True
+    queued = enqueue_scan(db, project.id)
+    assert queued.status == "queued"
+    assert claim_next_task(db) is None
+
+
 @pytest.mark.asyncio
 async def test_due_schedule_waits_for_real_provider_health(monkeypatch):
     db = _reply_test_session()
@@ -302,6 +317,7 @@ async def test_verification_task_is_requeued_after_login_state_recovers(monkeypa
     db.add(project)
     db.commit()
     task = enqueue_scan(db, project.id)
+    db.add(BrowserSession(project_id=project.id, profile_path="profile-verification", status="VERIFICATION_REQUIRED", last_error="需要人工验证"))
     task.status = "verification_required"
     task.error = "抖音页面需要人工完成安全验证"
     task.finished_at = None
@@ -330,6 +346,10 @@ async def test_verification_task_is_requeued_after_login_state_recovers(monkeypa
     assert resumed.status == "queued"
     assert resumed.error == ""
     assert resumed.finished_at is None
+    session = check.scalar(select(BrowserSession).where(BrowserSession.project_id == project.id))
+    assert session.status == "READY"
+    assert session.last_error == ""
+    assert session.last_check_time is not None
     assert published[-1]["event_type"] == "task.verification_resolved"
     assert published[-1]["payload"]["resume"] == "checkpoint"
     check.close()
