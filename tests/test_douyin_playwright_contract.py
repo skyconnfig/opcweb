@@ -228,6 +228,16 @@ async def test_search_surface_returns_empty_only_for_explicit_dom_empty_marker()
 
 
 @pytest.mark.asyncio
+async def test_search_surface_classifies_visible_verification_marker_as_blocked():
+    page = PageDouble({
+        '[data-e2e*="verify" i]': LocatorDouble(text="安全验证"),
+    })
+    provider = DouyinPlaywrightProvider(browser_manager=BrowserDouble(page))
+
+    assert await provider._wait_for_search_surface(page) == "blocked"
+
+
+@pytest.mark.asyncio
 async def test_comment_matches_tooltip_anchor_id_as_stable_dom_identity():
     anchor = LocatorDouble(attrs={"id": "tooltip_comment-42"})
     item = LocatorDouble(text="评论文本", children={"[id^=\"tooltip_\"]": anchor})

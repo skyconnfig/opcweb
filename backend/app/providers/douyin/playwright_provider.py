@@ -242,6 +242,19 @@ class DouyinPlaywrightProvider(BaseContentProvider):
 
             if search_state == "empty":
                 return []
+            if search_state == "blocked":
+                url, title, dom_summary = await _page_info(page)
+                await self.browser.capture_debug(page, action="search_videos", selector="verification.marker", error="visible verification marker")
+                raise DouyinVerificationRequired(
+                    "抖音页面需要人工完成安全验证",
+                    detail={
+                        "keyword": keyword,
+                        "url": url,
+                        "title": title,
+                        "dom_summary": dom_summary,
+                        "verification_source": "visible_dom_marker",
+                    },
+                )
             if search_state != "results":
                 await self.browser.capture_debug(page, action="search_videos", selector="search.video_results", error="search surface timeout")
                 raise DouyinPageParseError(
@@ -1064,6 +1077,11 @@ class DouyinPlaywrightProvider(BaseContentProvider):
                 body = ""
             if _contains_any(body, empty_markers):
                 return "empty"
+            # Only a visible DOM marker can classify a blocked search.  Do
+            # not scan raw HTML or hidden script text for "captcha": Douyin
+            # ships those strings on ordinary logged-in pages as well.
+            if await self._find(page, "verification.marker", page=page, required=False):
+                return "blocked"
             await page.wait_for_timeout(500)
         return "timeout"
 
