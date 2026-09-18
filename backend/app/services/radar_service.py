@@ -17,6 +17,7 @@ from app.core.config import get_settings
 from app.db import SessionLocal
 from app.models import AgentRun, Comment, CommentReply, FollowTask, Keyword, KnowledgeEntry, Lead, LeadComment, LeadEvent, LeadSource, Persona, Project, ReplyPolicy, TaskArtifact, TaskCheckpoint, TaskEvent, TaskReport, TaskStep, ScanTask, Video, now_utc
 from app.providers.base import BaseContentProvider
+from app.providers.douyin.exceptions import DouyinVerificationRequired
 from app.services.event_bus import event_bus
 from app.tasks.queue import enqueue_scan
 
@@ -403,6 +404,36 @@ class RadarService:
             await self.emit(task_id, project.id, "task.completed", f"扫描完成：发现 {metrics['leads']} 个潜客，其中 {metrics['s_leads']} 个 S 级", metrics)
         except TaskPaused:
             await self.emit(task_id, project.id, "task.paused", "任务已暂停，进度已保存到 checkpoint")
+        except DouyinVerificationRequired as exc:
+            # A verification page is an expected operator checkpoint, not a
+            # terminal task failure. Keep the browser/profile alive and leave
+            # the durable cursor untouched so the worker can resume this same
+            # keyword after the operator completes the real challenge.
+            with SessionLocal() as db:
+                task = db.get(ScanTask, task_id)
+                if task is not None:
+                    task.status = "verification_required"
+                    task.error = exc.message
+                    task.finished_at = None
+                    metrics = _task_report_metrics(
+                        db,
+                        task_id,
+                        project.id,
+                        comments_received=comments_seen,
+                        comments_prefiltered=comments_prefiltered,
+                        coverage_statuses=coverage_statuses,
+                    )
+                    metrics.update(_collection_error_context(exc, partial=bool(videos_seen or comments_seen)))
+                    metrics["collection_status"] = "VERIFICATION_REQUIRED"
+                    _upsert_task_report(db, task_id, "等待人工完成抖音验证", metrics)
+                    db.commit()
+            await self.emit(
+                task_id,
+                project.id,
+                "task.verification_required",
+                "抖音需要人工验证；请保持当前 Chrome 不要关闭，完成验证后程序会自动继续",
+                _collection_error_context(exc, partial=bool(videos_seen or comments_seen)),
+            )
         except Exception as exc:
             with SessionLocal() as db:
                 task = db.get(ScanTask, task_id)

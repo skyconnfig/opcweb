@@ -291,6 +291,50 @@ async def test_task_controls_enforce_transitions_and_retry_from_checkpoint():
     assert db.get(TaskCheckpoint, task.id).last_comment_cursor == "cursor-2"
 
 
+@pytest.mark.asyncio
+async def test_verification_task_is_requeued_after_login_state_recovers(monkeypatch):
+    from app import main
+    from app.providers.douyin.playwright_provider import DouyinPlaywrightProvider
+
+    db = _reply_test_session()
+    engine = db.get_bind()
+    project = Project(name="验证恢复项目", industry="装修")
+    db.add(project)
+    db.commit()
+    task = enqueue_scan(db, project.id)
+    task.status = "verification_required"
+    task.error = "抖音页面需要人工完成安全验证"
+    task.finished_at = None
+    db.commit()
+    db.close()
+    sessions = sessionmaker(bind=engine, expire_on_commit=False)
+    published = []
+
+    class RecoveredProvider(DouyinPlaywrightProvider):
+        async def get_login_status(self):
+            return LoginStatus.LOGGED_IN
+
+    provider = RecoveredProvider(browser_manager=object())
+
+    async def publish(event):
+        published.append(event)
+
+    monkeypatch.setattr(main, "SessionLocal", sessions)
+    monkeypatch.setattr(main, "active_provider_for_project", lambda _db, _project_id: provider)
+    monkeypatch.setattr(main.event_bus, "publish", publish)
+
+    await main._resume_verification_tasks()
+
+    check = sessions()
+    resumed = check.get(ScanTask, task.id)
+    assert resumed.status == "queued"
+    assert resumed.error == ""
+    assert resumed.finished_at is None
+    assert published[-1]["event_type"] == "task.verification_resolved"
+    assert published[-1]["payload"]["resume"] == "checkpoint"
+    check.close()
+
+
 def test_douyin_browser_state_is_persisted_without_credentials():
     from app import main
 

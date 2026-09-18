@@ -20,6 +20,7 @@ node_modules/
 .npm-cache/
 dist/
 .next/
+.next-dev/
 web/.next.stale*/
 *.log
 .env

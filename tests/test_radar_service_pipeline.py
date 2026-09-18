@@ -13,6 +13,7 @@ from app.db import Base
 from app.models import AgentRun, Comment, CommentReply, FollowTask, Keyword, KnowledgeEntry, Lead, LeadComment, LeadEvent, Persona, Project, ReplyPolicy, ScanTask, TaskArtifact, TaskCheckpoint, TaskEvent, TaskReport, TaskStep, Video
 from app.providers.base import BaseContentProvider, CommentDTO, CommentScanResult, ProviderHealth, VideoDTO
 from app.providers.douyin.dto import ReplyResult, ReplyStatus
+from app.providers.douyin.exceptions import DouyinVerificationRequired
 from app.services import radar_service
 from app.services.radar_service import RadarService, _collection_error_context, _keywords_after_checkpoint, _upsert_lead
 from app.tasks.queue import enqueue_scan
@@ -62,6 +63,14 @@ class AutoReplyProvider(ScriptedProvider):
     async def reply_comment(self, video_url, comment, text):
         self.reply_calls.append((video_url, comment.comment_id, text))
         return ReplyResult(ReplyStatus.VERIFIED, "douyin", video_url, comment.comment_id, text, True)
+
+
+class VerificationProvider(ScriptedProvider):
+    async def search_videos(self, keyword: str, limit: int):
+        raise DouyinVerificationRequired(
+            "抖音页面需要人工完成安全验证",
+            detail={"url": "https://www.douyin.com/search/长沙装修"},
+        )
 
 
 class RecordingTextLLM(BaseLLMProvider):
@@ -129,6 +138,26 @@ def test_collection_error_context_preserves_actionable_provider_state():
     assert context["error_message"]
     assert context["url"].startswith("https://www.douyin.com/")
     assert context["timestamp"]
+
+
+@pytest.mark.asyncio
+async def test_verification_pauses_task_without_marking_it_failed_or_losing_checkpoint(monkeypatch):
+    sessions = _session(monkeypatch)
+    task_id, project_id = _task(sessions)
+    service = _service(VerificationProvider({}), RecordingTextLLM())
+
+    await service.run_task(task_id, full=True)
+
+    db = sessions()
+    task = db.get(ScanTask, task_id)
+    report = db.scalar(select(TaskReport).where(TaskReport.task_id == task_id))
+    checkpoint = db.get(TaskCheckpoint, task_id)
+    assert task.status == "verification_required"
+    assert task.finished_at is None
+    assert "人工完成安全验证" in task.error
+    assert report.metrics["collection_status"] == "VERIFICATION_REQUIRED"
+    assert checkpoint.last_keyword_id == 0
+    db.close()
 
 
 def _session(monkeypatch):

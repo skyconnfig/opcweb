@@ -417,6 +417,8 @@ def _browser_session_status(provider: DouyinPlaywrightProvider, status: LoginSta
         return "LOGIN_REQUIRED"
     if status is LoginStatus.LOGGED_IN:
         return "READY"
+    if status is LoginStatus.VERIFICATION_REQUIRED:
+        return "VERIFICATION_REQUIRED"
     if status is None:
         return "RUNNING"
     return "LOGIN_REQUIRED"
@@ -435,6 +437,7 @@ async def _task_worker(stop: asyncio.Event):
     while not stop.is_set():
         claimed = None
         try:
+            await _resume_verification_tasks()
             with SessionLocal() as db:
                 claimed = claim_next_task(db)
                 if claimed:
@@ -474,6 +477,68 @@ async def _task_worker(stop: asyncio.Event):
             await asyncio.wait_for(stop.wait(), timeout=1)
         except asyncio.TimeoutError:
             pass
+
+
+async def _resume_verification_tasks() -> None:
+    """Requeue tasks after a real Douyin verification page disappears.
+
+    The browser is intentionally not closed or relaunched here. The operator
+    completes the challenge in the already visible persistent Chromium page;
+    the next login-state probe observes the normal logged-in DOM and the task
+    returns to the queue with its checkpoint intact.
+    """
+
+    with SessionLocal() as db:
+        candidates = [
+            (task.id, task.project_id)
+            for task in db.scalars(
+                select(ScanTask).where(ScanTask.status == "verification_required")
+            ).all()
+        ]
+
+    for task_id, project_id in candidates:
+        try:
+            with SessionLocal() as db:
+                provider = active_provider_for_project(db, project_id)
+            if not isinstance(provider, DouyinPlaywrightProvider):
+                continue
+            if await provider.get_login_status() is not LoginStatus.LOGGED_IN:
+                continue
+        except Exception:
+            # A temporary browser/API probe failure keeps the operator
+            # checkpoint visible; it must not convert it into a fake resume.
+            continue
+
+        resumed = False
+        with SessionLocal() as db:
+            task = db.get(ScanTask, task_id)
+            if task is not None and task.status == "verification_required":
+                task.status = "queued"
+                task.error = ""
+                task.finished_at = None
+                db.commit()
+                resumed = True
+
+        if resumed:
+            with SessionLocal() as db:
+                event = TaskEvent(
+                    task_id=task_id,
+                    project_id=project_id,
+                    event_type="task.verification_resolved",
+                    message="人工验证已完成，任务将从 checkpoint 自动继续",
+                    payload={"status": "queued", "resume": "checkpoint"},
+                )
+                db.add(event)
+                db.commit()
+                event_data = {
+                    "id": event.id,
+                    "project_id": event.project_id,
+                    "event_type": event.event_type,
+                    "message": event.message,
+                    "payload": event.payload,
+                    "created_at": event.created_at.isoformat(),
+                }
+            await event_bus.publish(event_data)
 
 
 def _mark_worker_task_failed(task_id: int, exc: Exception) -> None:

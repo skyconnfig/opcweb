@@ -2,7 +2,7 @@
 
 import { useEffect, useRef, useState } from 'react'
 import type { LucideIcon } from 'lucide-react'
-import { Activity, ArrowDownRight, ArrowUpRight, BarChart3, Bot, Check, ChevronDown, ChevronRight, CircleHelp, Clock3, Database, FileText, Gauge, LayoutDashboard, ListChecks, LoaderCircle, Menu, MessageCircle, Moon, MoreHorizontal, PanelLeftClose, PanelLeftOpen, Pause, Play, Plus, Radar, RefreshCw, Search, Settings, SlidersHorizontal, Sparkles, Sun, Target, UserRound, Video, Wifi, X, Zap } from 'lucide-react'
+import { Activity, ArrowDownRight, ArrowUpRight, BarChart3, Bot, Check, ChevronDown, ChevronRight, CircleHelp, Clock3, Database, FileText, Gauge, LayoutDashboard, ListChecks, LoaderCircle, Menu, MessageCircle, Moon, MoreHorizontal, PanelLeftClose, PanelLeftOpen, Pause, Play, Plus, Radar, RefreshCw, Search, Settings, ShieldAlert, SlidersHorizontal, Sparkles, Sun, Target, UserRound, Video, Wifi, X, Zap } from 'lucide-react'
 
 const API = ''
 const REQUEST_TIMEOUT_MS = 30_000
@@ -382,7 +382,7 @@ function formatDateTime(value?: string | null) { return parseBackendDate(value)?
 function isToday(value?: string | null) { const date = parseBackendDate(value); const now = new Date(); return Boolean(date && date.getFullYear() === now.getFullYear() && date.getMonth() === now.getMonth() && date.getDate() === now.getDate()) }
 function defaultFollowDeadline() { const date = new Date(); date.setDate(date.getDate() + 1); date.setHours(10, 0, 0, 0); const pad = (value: number) => String(value).padStart(2, '0'); return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}` }
 function normalizeLeadAdvice(value: unknown): RecordShape | undefined { if (!value || typeof value !== 'object') return undefined; const advice = value as RecordShape; return advice.reply || advice.recommended_reply || advice.next_action || advice.follow_up_question ? advice : undefined }
-function taskStatusLabel(status?: string) { return ({ completed: '已完成', queued: '排队中', running: '运行中', paused: '已暂停', failed: '失败' } as Record<string, string>)[status || ''] || status || '未知' }
+function taskStatusLabel(status?: string) { return ({ completed: '已完成', queued: '排队中', running: '运行中', paused: '已暂停', verification_required: '需要人工验证', failed: '失败' } as Record<string, string>)[status || ''] || status || '未知' }
 function taskStatusTone(status?: string) { return status === 'completed' ? 'green' : status === 'failed' ? 'red' : 'amber' }
 function followTaskStatusLabel(status?: string) { return ({ PENDING: '待处理', OVERDUE: '已逾期', DONE: '已完成', CANCELLED: '已取消' } as Record<string, string>)[status || ''] || status || '未知' }
 function followTaskStatusTone(status?: string) { return status === 'DONE' ? 'green' : status === 'OVERDUE' ? 'red' : status === 'CANCELLED' ? 'neutral' : 'amber' }
@@ -810,6 +810,7 @@ function TasksView({ project, providerContext }: RecordShape) {
   const overdueFollowTasks = followTasks.filter((task) => task.status === 'OVERDUE')
   const todayFollowTasks = followTasks.filter((task) => ['PENDING', 'OVERDUE'].includes(task.status) && isToday(task.deadline))
   const completedFollowTasks = followTasks.filter((task) => task.status === 'DONE')
+  const verificationTasks = tasks.filter((task) => task.status === 'verification_required')
   const filteredFollowTasks = [...followTasks].filter((task) => followTaskFilter === 'all' || (followTaskFilter === 'pending' && task.status === 'PENDING') || (followTaskFilter === 'today' && ['PENDING', 'OVERDUE'].includes(task.status) && isToday(task.deadline)) || (followTaskFilter === 'overdue' && task.status === 'OVERDUE') || (followTaskFilter === 'done' && task.status === 'DONE')).sort((a, b) => {
     const priority: Record<string, number> = { OVERDUE: 0, PENDING: 1, DONE: 2, CANCELLED: 3 }
     return (priority[a.status] ?? 4) - (priority[b.status] ?? 4) || String(a.deadline || '').localeCompare(String(b.deadline || '')) || Number(a.id) - Number(b.id)
@@ -818,12 +819,21 @@ function TasksView({ project, providerContext }: RecordShape) {
     <div className="page">
       <PageHeader eyebrow="ORCHESTRATION" title="任务中心" description="每次扫描都能暂停、恢复、重试，并从 checkpoint 继续。" actions={<Button variant="accent" icon={Plus} onClick={() => void start()} disabled={busy || !canCollect}>{busy ? '提交中…' : '新建扫描'}</Button>} />
       {error && <div className="error-banner" role="alert"><X size={15} /><span>{error}</span><button onClick={() => setError('')} aria-label="关闭错误">关闭</button></div>}{taskNotice && <div className="success-banner" role="status"><Check size={15} /><span>{taskNotice}</span><button onClick={() => setTaskNotice('')} aria-label="关闭提示">关闭</button></div>}<ProviderCapabilityNotice context={providerContext} requirements={collectionRequirements} />
+      {verificationTasks.length > 0 && <section className="verification-required-banner" role="alert">
+        <span className="verification-required-icon"><ShieldAlert size={19} /></span>
+        <div>
+          <b>抖音需要人工验证</b>
+          <p>请保持当前 Chrome 不要关闭，在抖音页面完成图片拖拽验证。程序会自动检测验证页消失，任务随后从 checkpoint 继续搜索和抓取评论。</p>
+          <small>{verificationTasks.map((task) => ['任务 #', task.id].join('')).join('、')} · 浏览器保持打开 · 自动检测中</small>
+        </div>
+        <Button icon={RefreshCw} onClick={() => void refresh(false)} disabled={loading}>检查状态</Button>
+      </section>}
       <div className="task-grid">
         <section className="panel data-panel task-panel">
           <div className="data-toolbar"><div><SectionLabel>SCAN TASKS</SectionLabel><h2>扫描任务</h2></div><StatusPill tone={eventStatus === 'SSE 已连接' ? 'green' : 'neutral'}>{tasks.length} 个任务 · {eventStatus}</StatusPill></div>
           {loading ? <TableSkeleton rows={4} /> : tasks.length ? tasks.map((task: RecordShape) => (
             <div className={`task-item ${selectedTaskId === task.id ? 'selected-task' : ''}`} key={task.id} role="button" tabIndex={0} onClick={() => setSelectedTaskId(task.id)} onKeyDown={(event) => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); setSelectedTaskId(task.id) } }}>
-              <span className={`task-state ${task.status === 'completed' ? '' : 'pending'}`}>{task.status === 'completed' ? <Check size={14} /> : <Clock3 size={14} />}</span>
+              <span className={`task-state ${task.status === 'completed' ? '' : task.status === 'verification_required' ? 'verification' : 'pending'}`}>{task.status === 'completed' ? <Check size={14} /> : task.status === 'verification_required' ? <ShieldAlert size={14} /> : <Clock3 size={14} />}</span>
               <div className="task-copy"><b>{task.name}</b><small title={task.error || undefined}>10 步 · 当前：{task.current_step || '等待启动'}{task.error ? ` · ${task.error}` : ''}</small></div>
               <StatusPill tone={taskStatusTone(task.status)}>{taskStatusLabel(task.status)}</StatusPill>
               {task.status === 'running' && <button className="icon-button" title="暂停" aria-label={`暂停任务 ${task.id}`} disabled={busy} onClick={(event) => { event.stopPropagation(); void taskAction(task, 'pause') }}><Pause size={16} /></button>}
@@ -857,7 +867,8 @@ function TasksView({ project, providerContext }: RecordShape) {
         <div className="data-toolbar"><div><SectionLabel>TASK DETAIL</SectionLabel><h2>执行详情 #{selectedTaskId}</h2></div><Button onClick={() => setSelectedTaskId(null)}>收起</Button></div>
         {detailError && <div className="error-inline"><span>{detailError}</span><Button onClick={() => { setDetailError(''); setTaskDetail(undefined); void request(`/api/tasks/${selectedTaskId}`).then(setTaskDetail).catch((err) => setDetailError(errorText(err))) }}>重试</Button></div>}
         {taskDetail ? <div className="task-detail-body">
-          <div className="task-detail-summary"><span>状态 <b>{taskDetail.task?.status || '—'}</b></span><span>当前步骤 <b>{taskDetail.task?.current_step || '—'}</b></span><span>错误 <b>{taskDetail.task?.error || '无'}</b></span></div>
+          <div className="task-detail-summary"><span>状态 <b>{taskStatusLabel(taskDetail.task?.status)}</b></span><span>当前步骤 <b>{taskDetail.task?.current_step || '—'}</b></span><span>错误 <b>{taskDetail.task?.error || '无'}</b></span></div>
+          {taskDetail.task?.status === 'verification_required' && <div className="verification-detail-note"><ShieldAlert size={16} /><span>请在保持打开的 Chrome 中完成人工验证。验证页面消失后，程序会自动恢复任务，不会关闭浏览器，也不会清空 checkpoint。</span></div>}
           {taskDetail.report?.metrics && <div className="task-report-metrics"><span>视频 <b>{taskDetail.report.metrics.videos || 0}</b></span><span>评论 <b>{taskDetail.report.metrics.comments || 0}</b></span><span>候选判断 <b>{taskDetail.report.metrics.comments_judged || 0}</b></span><span>潜客 <b>{taskDetail.report.metrics.leads || 0}</b></span><span>预筛比例 <b>{Math.round(Number(taskDetail.report.metrics.prefilter_ratio || 0) * 100)}%</b></span></div>}
           <div className="task-step-list">{(taskDetail.steps || []).map((step: RecordShape) => <span key={step.id} className={step.status}>{step.name} · {stepStatusLabel(step.status)}</span>)}</div>
           {taskDetail.events?.length ? <div className="task-events"><SectionLabel>EVENT LOG</SectionLabel>{taskDetail.events.map((event: RecordShape) => <div className="task-event" key={event.id}><time>{formatDateTime(event.created_at)}</time><span>{event.message}</span></div>)}</div> : <div className="task-events-empty">暂无任务事件</div>}
@@ -986,10 +997,11 @@ function DouyinConnectionView({ project, providerContext }: RecordShape) {
   const needsVerification = state.login === 'VERIFICATION_REQUIRED'
   const statusUnavailable = !checking && !statusLoaded
   const statusLabel = checking && !statusLoaded ? '检查中…' : statusUnavailable ? '无法读取会话' : loggedIn ? '已恢复会话' : needsVerification ? '需要人工验证' : state.login
-  const actionLabel = checking ? '读取持久化会话…' : statusUnavailable ? '重试检查' : loggedIn ? '复用已保存会话' : needsVerification ? '打开抖音完成验证' : '打开抖音登录'
+  const actionLabel = checking ? '读取持久化会话…' : statusUnavailable ? '重试检查' : loggedIn ? '复用已保存会话' : needsVerification ? '保持浏览器并检查' : '打开抖音登录'
   const detailLabel = checking && !statusLoaded ? '正在读取持久化会话' : statusUnavailable ? '状态读取失败' : loggedIn ? '已登录（持久化会话）' : needsVerification ? '已检测到平台验证页' : state.login
-  const helperText = checking && !statusLoaded ? '正在检查本地持久化 Profile；暂时不会要求重新登录。' : statusUnavailable ? '暂时无法读取后端登录状态；系统没有清除 Cookie，请点击“重试检查”。' : loggedIn ? '已检测到本地持久化会话。重启服务或关闭浏览器后，系统会继续使用同一 Profile，不会主动清除登录态。' : needsVerification ? '抖音当前要求人工完成安全验证。请在打开的真实浏览器中操作；系统不会绕过验证码，验证完成后点击“检查状态”。' : '需要登录时请在打开的真实抖音浏览器中扫码或人工完成验证；系统不会保存明文密码，也不会绕过验证码。'
-  return <div className="page"><PageHeader eyebrow="DOUYIN CONNECTION" title="抖音账号" description="通过真实可见浏览器登录；采集只读取 DOM 文本和公开视频元数据。" actions={<Button icon={RefreshCw} onClick={() => void refresh()} disabled={checking || !canLogin}>检查状态</Button>} />{error && <div className="error-banner"><X size={15} />{error}</div>}<ProviderCapabilityNotice context={providerContext} requirements={loginRequirements} /><section className="panel provider-card"><div className="provider-card-head"><span className="provider-mark provider-0"><Database size={18} /></span><StatusPill tone={loggedIn ? 'green' : 'neutral'}>{statusLabel}</StatusPill></div><h2>Douyin Playwright</h2><p>浏览器：{state.browser} · 登录：{detailLabel}</p><div className="drawer-facts"><div><span>当前账号</span><b>{state.account_nickname || state.account_name || '默认抖音账号'}</b></div><div><span>抖音用户 ID</span><b>{state.douyin_user_id || '登录后由页面提供'}</b></div><div><span>浏览器会话</span><b>{state.browser_session_status || '未记录'}</b></div><div><span>最近登录</span><b>{formatDateTime(state.last_login_at)}</b></div><div><span>最近检查</span><b>{formatDateTime(state.last_checked_at)}</b></div></div><code>{state.profile_dir || '本地持久化浏览器 Profile'}</code><div className="provider-actions"><Button variant="accent" icon={Wifi} onClick={() => void start()} disabled={checking || !canLogin}>{actionLabel}</Button><Button icon={X} onClick={() => void close()} disabled={checking || !canLogin}>关闭浏览器</Button></div><div className="compliance-bar"><Check size={15} /><span>{helperText}</span></div></section></div>
+  const helperText = checking && !statusLoaded ? '正在检查本地持久化 Profile；暂时不会要求重新登录。' : statusUnavailable ? '暂时无法读取后端登录状态；系统没有清除 Cookie，请点击“重试检查”。' : loggedIn ? '已检测到本地持久化会话。重启服务或关闭浏览器后，系统会继续使用同一 Profile，不会主动清除登录态。' : needsVerification ? '抖音当前要求人工完成安全验证。请保持打开的真实浏览器并手工完成拖拽；程序会检测验证页消失并自动恢复等待中的任务。' : '需要登录时请在打开的真实抖音浏览器中扫码或人工完成验证；系统不会保存明文密码，也不会绕过验证码。'
+  const primaryAction = needsVerification ? refresh : start
+  return <div className="page"><PageHeader eyebrow="DOUYIN CONNECTION" title="抖音账号" description="通过真实可见浏览器登录；采集只读取 DOM 文本和公开视频元数据。" actions={<Button icon={RefreshCw} onClick={() => void refresh()} disabled={checking || !canLogin}>检查状态</Button>} />{error && <div className="error-banner"><X size={15} />{error}</div>}<ProviderCapabilityNotice context={providerContext} requirements={loginRequirements} /><section className="panel provider-card"><div className="provider-card-head"><span className="provider-mark provider-0"><Database size={18} /></span><StatusPill tone={loggedIn ? 'green' : 'neutral'}>{statusLabel}</StatusPill></div><h2>Douyin Playwright</h2><p>浏览器：{state.browser} · 登录：{detailLabel}</p><div className="drawer-facts"><div><span>当前账号</span><b>{state.account_nickname || state.account_name || '默认抖音账号'}</b></div><div><span>抖音用户 ID</span><b>{state.douyin_user_id || '登录后由页面提供'}</b></div><div><span>浏览器会话</span><b>{state.browser_session_status || '未记录'}</b></div><div><span>最近登录</span><b>{formatDateTime(state.last_login_at)}</b></div><div><span>最近检查</span><b>{formatDateTime(state.last_checked_at)}</b></div></div><code>{state.profile_dir || '本地持久化浏览器 Profile'}</code><div className="provider-actions"><Button variant="accent" icon={Wifi} onClick={() => void primaryAction()} disabled={checking || !canLogin}>{actionLabel}</Button><Button icon={X} onClick={() => void close()} disabled={checking || !canLogin}>关闭浏览器</Button></div><div className="compliance-bar"><Check size={15} /><span>{helperText}</span></div></section></div>
 }
 
 function SettingsViewLive({ project }: RecordShape) {
