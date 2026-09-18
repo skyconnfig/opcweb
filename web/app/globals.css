@@ -98,3 +98,16 @@
 .workspace-create:hover{color:var(--accent-strong)}
 .workspace-menu-empty{min-height:80px;display:flex;align-items:center;justify-content:center;gap:7px;color:var(--faint);font-size:10px}
 @media(max-width:700px){.workspace-menu{position:fixed;top:72px;left:12px;width:min(330px,calc(100vw - 24px))}}
+.intelligence-panel{margin-top:17px;padding:20px}
+.intelligence-heading{display:flex;align-items:flex-start;justify-content:space-between;gap:20px;border-bottom:1px solid var(--line);padding-bottom:15px}
+.intelligence-heading h2{font-size:15px;margin:6px 0 5px}
+.intelligence-heading p{font-size:10px;color:var(--muted);margin:0;line-height:1.6}
+.intelligence-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:0 24px}
+.intelligence-item{min-width:0;padding:16px 0;border-bottom:1px solid var(--line)}
+.intelligence-item b{display:block;font-size:10px;color:var(--ink);margin-bottom:8px}
+.intelligence-item ul{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:5px}
+.intelligence-item li{font-size:10px;color:var(--muted);line-height:1.5;overflow-wrap:anywhere}
+.intelligence-item li::before{content:'•';color:var(--accent);margin-right:6px}
+.intelligence-item .muted{font-size:10px}
+@media(max-width:820px){.intelligence-grid{grid-template-columns:repeat(2,1fr);gap:0 16px}}
+@media(max-width:520px){.intelligence-heading{flex-direction:column;gap:10px}.intelligence-grid{grid-template-columns:1fr}}

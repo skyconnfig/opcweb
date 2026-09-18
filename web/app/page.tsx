@@ -320,6 +320,9 @@ function SmartViewLive({ project, navigate, providerContext, newProject, onProje
   const [provider, setProvider] = useState('加载中…')
   const [stage, setStage] = useState('')
   const [result, setResult] = useState<RecordShape>()
+  const [savedIntelligence, setSavedIntelligence] = useState<RecordShape>({})
+  const [savedIntelligenceLoading, setSavedIntelligenceLoading] = useState(false)
+  const [savedIntelligenceError, setSavedIntelligenceError] = useState('')
   const [error, setError] = useState('')
   const [createdProjectId, setCreatedProjectId] = useState<number | null>(null)
   useEffect(() => { request('/api/settings').then((settings) => setProvider(settings.content_provider || '未配置')).catch(() => setProvider('状态未知')) }, [])
@@ -328,8 +331,24 @@ function SmartViewLive({ project, navigate, providerContext, newProject, onProje
     setCreatedProjectId(null)
     setStage('')
     setResult(undefined)
+    setSavedIntelligence(project.intelligence || {})
+    setSavedIntelligenceError('')
     setError('')
   }, [project.id, newProject])
+  const loadSavedIntelligence = async () => {
+    if (newProject || !project.id) { setSavedIntelligence({}); return }
+    setSavedIntelligenceLoading(true)
+    setSavedIntelligenceError('')
+    try {
+      const current = await request(`/api/projects/${project.id}`)
+      setSavedIntelligence(current.intelligence || {})
+    } catch (err) {
+      setSavedIntelligenceError(errorText(err))
+    } finally {
+      setSavedIntelligenceLoading(false)
+    }
+  }
+  useEffect(() => { void loadSavedIntelligence() }, [project.id, newProject])
   const set = (key: string, value: string) => setForm((current) => ({ ...current, [key]: value }))
   const collectionRequirements = [{ key: 'keyword_search', label: '真实视频搜索' }, { key: 'comments', label: '公开评论采集' }]
   const canCollect = collectionRequirements.every((requirement) => providerSupports(providerContext, requirement.key))
@@ -350,6 +369,7 @@ function SmartViewLive({ project, navigate, providerContext, newProject, onProje
       setStage('analyzing')
       const analysis = await request(`/api/projects/${projectId}/smart-mode`, { method: 'POST' })
       setResult(analysis)
+      setSavedIntelligence(analysis.intelligence || {})
       setStage('scanning')
       await request(`/api/projects/${projectId}/scan`, { method: 'POST' })
       setStage('done')
@@ -358,7 +378,23 @@ function SmartViewLive({ project, navigate, providerContext, newProject, onProje
   }
   const progress = stage === 'done' ? 5 : stage === 'scanning' ? 3 : stage === 'analyzing' ? 1 : 0
   const workflow = ['理解行业与客户语言', '生成高意图关键词', '发现并排序机会视频', '分析公开评论信号', '归档潜客并生成建议']
-  return <div className="page"><PageHeader eyebrow="INDUSTRY INTELLIGENCE" title="智能截流" description="描述你的业务，系统会生成搜索策略并开始监听公开需求。" actions={<div className="provider-chip"><span className="status-dot" />{provider}</div>} />{error && <div className="error-banner"><X size={15} /><span>{error}</span><button onClick={() => setError('')} aria-label="关闭错误">关闭</button></div>}<ProviderCapabilityNotice context={providerContext} requirements={collectionRequirements} /><div className="smart-grid"><section className="panel form-panel"><PanelHeader label="PROJECT BRIEF" title="业务画像" action={<span className="required-note">* 必填信息</span>} /><div className="form-grid"><Field label="项目名称" required value={form.name} onChange={(value: string) => set('name', value)} placeholder="我的行业雷达" /><Field label="行业" required value={form.industry} onChange={(value: string) => set('industry', value)} placeholder="装修、教育、财税" /><Field label="地区" value={form.location} onChange={(value: string) => set('location', value)} placeholder="例如：长沙" /><Field label="业务 / 产品服务" wide value={form.service} onChange={(value: string) => set('service', value)} placeholder="你具体提供什么服务？" /><Field label="客单价" value={form.price_range} onChange={(value: string) => set('price_range', value)} placeholder="例如：5万-30万" /><Field label="目标客户" wide value={form.target_customer} onChange={(value: string) => set('target_customer', value)} placeholder="谁最可能购买？" /><Field label="补充介绍" wide area value={form.description} onChange={(value: string) => set('description', value)} placeholder="优势、客户痛点、服务限制…" /></div><div className="form-actions"><Button variant="accent" icon={Sparkles} onClick={() => void activate()} disabled={(!canCollect) || (Boolean(stage) && stage !== 'failed')}>{stage === 'done' ? '雷达已开启' : stage === 'failed' ? '重试扫描' : stage ? '处理中…' : '分析并开启智能模式'}</Button><span className="form-footnote"><Check size={13} />默认人工审核；自动回复需在设置中显式开启</span></div></section><section className="panel workflow-panel"><PanelHeader label="AUTOMATION PLAN" title="系统将自动完成" /><div className="workflow-list">{workflow.map((label, index) => { const done = index < progress; const current = Boolean(stage) && !done && index === progress; return <div className={`workflow-row ${done ? 'complete' : ''}`} key={label}><span>{done ? <Check size={13} /> : current ? <span className="spinner" /> : String(index + 1).padStart(2, '0')}</span><b>{label}</b>{current && <small className="workflow-current">处理中</small>}</div> })}</div>{result ? <div className="analysis-summary"><div className="summary-number">{result.keyword_count ?? '—'}</div><div><b>个行业关键词已生成</b><span>高机会词将优先进入扫描队列</span></div></div> : <div className="workflow-note"><BrainIcon /><b>准备好后，系统会持续工作</b><span>扫描完成后，你可以在任务中心查看进度和失败重试。</span></div>}</section></div></div>
+  const intelligence = result?.intelligence || savedIntelligence || {}
+  return <div className="page"><PageHeader eyebrow="INDUSTRY INTELLIGENCE" title="智能截流" description="描述你的业务，系统会生成搜索策略并开始监听公开需求。" actions={<div className="provider-chip"><span className="status-dot" />{provider}</div>} />{error && <div className="error-banner"><X size={15} /><span>{error}</span><button onClick={() => setError('')} aria-label="关闭错误">关闭</button></div>}{savedIntelligenceError && <div className="error-inline" role="alert"><X size={15} /><span>行业分析结果读取失败：{savedIntelligenceError}</span><Button icon={RefreshCw} onClick={() => void loadSavedIntelligence()} disabled={savedIntelligenceLoading}>重试</Button></div>}{savedIntelligenceLoading && !Object.keys(intelligence).length && <div className="form-loading" role="status"><LoaderCircle size={16} className="loading-spin" /><span>正在读取已保存的行业分析…</span></div>}<ProviderCapabilityNotice context={providerContext} requirements={collectionRequirements} /><div className="smart-grid"><section className="panel form-panel"><PanelHeader label="PROJECT BRIEF" title="业务画像" action={<span className="required-note">* 必填信息</span>} /><div className="form-grid"><Field label="项目名称" required value={form.name} onChange={(value: string) => set('name', value)} placeholder="我的行业雷达" /><Field label="行业" required value={form.industry} onChange={(value: string) => set('industry', value)} placeholder="装修、教育、财税" /><Field label="地区" value={form.location} onChange={(value: string) => set('location', value)} placeholder="例如：长沙" /><Field label="业务 / 产品服务" wide value={form.service} onChange={(value: string) => set('service', value)} placeholder="你具体提供什么服务？" /><Field label="客单价" value={form.price_range} onChange={(value: string) => set('price_range', value)} placeholder="例如：5万-30万" /><Field label="目标客户" wide value={form.target_customer} onChange={(value: string) => set('target_customer', value)} placeholder="谁最可能购买？" /><Field label="补充介绍" wide area value={form.description} onChange={(value: string) => set('description', value)} placeholder="优势、客户痛点、服务限制…" /></div><div className="form-actions"><Button variant="accent" icon={Sparkles} onClick={() => void activate()} disabled={(!canCollect) || (Boolean(stage) && stage !== 'failed')}>{stage === 'done' ? '雷达已开启' : stage === 'failed' ? '重试扫描' : stage ? '处理中…' : '分析并开启智能模式'}</Button><span className="form-footnote"><Check size={13} />默认人工审核；自动回复需在设置中显式开启</span></div></section><section className="panel workflow-panel"><PanelHeader label="AUTOMATION PLAN" title="系统将自动完成" /><div className="workflow-list">{workflow.map((label, index) => { const done = index < progress; const current = Boolean(stage) && !done && index === progress; return <div className={`workflow-row ${done ? 'complete' : ''}`} key={label}><span>{done ? <Check size={13} /> : current ? <span className="spinner" /> : String(index + 1).padStart(2, '0')}</span><b>{label}</b>{current && <small className="workflow-current">处理中</small>}</div> })}</div>{result ? <div className="analysis-summary"><div className="summary-number">{result.keyword_count ?? '—'}</div><div><b>个行业关键词已生成</b><span>高机会词将优先进入扫描队列</span></div></div> : <div className="workflow-note"><BrainIcon /><b>准备好后，系统会持续工作</b><span>扫描完成后，你可以在任务中心查看进度和失败重试。</span></div>}</section></div>{Object.keys(intelligence).length > 0 && <IntelligenceSummary data={intelligence} />}</div>
+}
+
+function IntelligenceSummary({ data }: RecordShape) {
+  const sections = [
+    ['industry_summary', '行业摘要'],
+    ['target_customer_profiles', '目标客户画像'],
+    ['pain_points', '客户痛点'],
+    ['buying_triggers', '购买触发点'],
+    ['common_questions', '常见问题'],
+    ['customer_language', '客户语言'],
+    ['competitor_types', '竞品类型'],
+    ['search_strategy', '搜索策略'],
+  ]
+  const display = (value: unknown) => Array.isArray(value) ? value.filter(Boolean).map(String) : value ? [String(value)] : []
+  return <section className="panel intelligence-panel" aria-label="行业理解结果"><div className="intelligence-heading"><div><SectionLabel>TEXT INTELLIGENCE</SectionLabel><h2>行业理解结果</h2><p>以下内容来自当前项目的文本模型分析，后续关键词和评论判断会引用这些上下文。</p></div><StatusPill tone="green">已保存</StatusPill></div><div className="intelligence-grid">{sections.map(([key, label]) => { const values = display(data[key]); return <div className="intelligence-item" key={key}><b>{label}</b>{values.length ? <ul>{values.slice(0, 8).map((value, index) => <li key={`${key}-${index}-${value}`}>{value}</li>)}</ul> : <span className="muted">暂无结果</span>}</div>})}</div></section>
 }
 
 function PageHeader({ eyebrow, title, description, actions }: RecordShape) { return <div className="page-header"><div><div className="eyebrow">{eyebrow}</div><h1>{title}</h1>{description && <p>{description}</p>}</div>{actions && <div className="header-actions">{actions}</div>}</div> }
