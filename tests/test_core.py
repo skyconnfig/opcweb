@@ -874,6 +874,32 @@ async def test_llm_rejects_vision_and_multimodal_model_names_without_requesting(
     assert result["code"] == "LLM_TEXT_ONLY_MODEL_REQUIRED"
 
 
+@pytest.mark.asyncio
+async def test_project_scoped_list_endpoints_require_project_id_over_http():
+    from app import main
+
+    paths = [
+        "/api/videos",
+        "/api/comments",
+        "/api/replies",
+        "/api/leads",
+        "/api/follow-tasks",
+        "/api/follow-task-reminders",
+        "/api/tasks",
+        "/api/dashboard",
+        "/api/analytics",
+        "/api/agent-runs",
+        "/api/events/stream",
+    ]
+    transport = httpx.ASGITransport(app=main.app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        responses = [await client.get(path) for path in paths]
+
+    assert all(response.status_code == 422 for response in responses), [
+        (path, response.status_code, response.text) for path, response in zip(paths, responses) if response.status_code != 422
+    ]
+
+
 
 def test_llm_api_key_is_encrypted_at_rest():
     key = Fernet.generate_key().decode()

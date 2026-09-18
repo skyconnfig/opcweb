@@ -1168,10 +1168,9 @@ def update_keyword(keyword_id: int, enabled: bool, db: Session = Depends(get_db)
 
 
 @app.get("/api/videos")
-def list_videos(project_id: int | None = None, limit: int = Query(50, ge=1, le=200), db: Session = Depends(get_db)):
+def list_videos(project_id: int = Query(..., ge=1), limit: int = Query(50, ge=1, le=200), db: Session = Depends(get_db)):
     query = select(Video).order_by(desc(Video.opportunity_score)).limit(limit)
-    if project_id is not None:
-        query = query.where(Video.project_id == project_id)
+    query = query.where(Video.project_id == project_id)
     return db.scalars(query).all()
 
 
@@ -1197,12 +1196,11 @@ async def scan_video(video_id: int, db: Session = Depends(get_db), project_id: i
 
 
 @app.get("/api/comments")
-def list_comments(project_id: int | None = None, limit: int = Query(100, ge=1, le=500), db: Session = Depends(get_db)):
+def list_comments(project_id: int = Query(..., ge=1), limit: int = Query(100, ge=1, le=500), db: Session = Depends(get_db)):
     latest_reply_status = select(CommentReply.status).where(CommentReply.comment_id == Comment.id).order_by(desc(CommentReply.id)).limit(1).scalar_subquery()
     lead_alias = aliased(Lead)
     query = select(Comment, Video, lead_alias, latest_reply_status.label("reply_status")).join(Video, Comment.video_id == Video.id).outerjoin(LeadComment, LeadComment.comment_id == Comment.id).outerjoin(lead_alias, LeadComment.lead_id == lead_alias.id).order_by(desc(Comment.id)).limit(limit)
-    if project_id is not None:
-        query = query.where(Comment.project_id == project_id)
+    query = query.where(Comment.project_id == project_id)
     rows = []
     for comment, video, lead, reply_status in db.execute(query).all():
         item = {column.name: getattr(comment, column.name) for column in Comment.__table__.columns}
@@ -1480,10 +1478,9 @@ async def _send_comment_reply_locked(comment_id: int, payload: ReplyActionIn, db
 
 
 @app.get("/api/replies")
-def list_replies(project_id: int | None = None, status: str | None = None, limit: int = Query(100, ge=1, le=500), db: Session = Depends(get_db)):
+def list_replies(project_id: int = Query(..., ge=1), status: str | None = None, limit: int = Query(100, ge=1, le=500), db: Session = Depends(get_db)):
     query = select(CommentReply).order_by(desc(CommentReply.id)).limit(limit)
-    if project_id is not None:
-        query = query.where(CommentReply.project_id == project_id)
+    query = query.where(CommentReply.project_id == project_id)
     if status:
         query = query.where(CommentReply.status == status)
     return db.scalars(query).all()
@@ -1611,10 +1608,9 @@ def lead_payload(db: Session, lead: Lead):
 
 
 @app.get("/api/leads")
-def list_leads(project_id: int | None = None, level: str | None = None, status: str | None = None, db: Session = Depends(get_db)):
+def list_leads(project_id: int = Query(..., ge=1), level: str | None = None, status: str | None = None, db: Session = Depends(get_db)):
     query = select(Lead).order_by(desc(Lead.lead_score))
-    if project_id:
-        query = query.where(Lead.project_id == project_id)
+    query = query.where(Lead.project_id == project_id)
     if level:
         query = query.where(Lead.lead_level == level)
     if status:
@@ -1651,13 +1647,12 @@ def update_lead(lead_id: int, payload: LeadStatusUpdate, db: Session = Depends(g
 
 @app.get("/api/follow-tasks", response_model=list[FollowTaskOut])
 def list_all_follow_tasks(
-    project_id: int | None = Query(default=None, ge=1),
+    project_id: int = Query(..., ge=1),
     status: FollowTaskStatus | None = None,
     db: Session = Depends(get_db),
 ):
     query = select(FollowTask).order_by(FollowTask.deadline, FollowTask.id)
-    if project_id is not None:
-        query = query.where(FollowTask.project_id == project_id)
+    query = query.where(FollowTask.project_id == project_id)
     if status is not None:
         query = query.where(FollowTask.status == status)
     return db.scalars(query).all()
@@ -1704,14 +1699,13 @@ def update_follow_task(follow_task_id: int, payload: FollowTaskUpdate, db: Sessi
 
 @app.get("/api/follow-task-reminders", response_model=list[NotificationEventOut])
 def list_follow_task_reminders(
-    project_id: int | None = Query(default=None, ge=1),
+    project_id: int = Query(..., ge=1),
     unread_only: bool = False,
     limit: int = Query(100, ge=1, le=500),
     db: Session = Depends(get_db),
 ):
     query = select(NotificationEvent).where(NotificationEvent.event_type == "follow_task.overdue").order_by(desc(NotificationEvent.id)).limit(limit)
-    if project_id is not None:
-        query = query.where(NotificationEvent.project_id == project_id)
+    query = query.where(NotificationEvent.project_id == project_id)
     if unread_only:
         query = query.where(NotificationEvent.read_at.is_(None))
     return db.scalars(query).all()
@@ -1916,10 +1910,9 @@ def get_persona(project_id: int, db: Session = Depends(get_db)):
 
 
 @app.get("/api/tasks")
-def list_tasks(project_id: int | None = None, db: Session = Depends(get_db)):
+def list_tasks(project_id: int = Query(..., ge=1), db: Session = Depends(get_db)):
     query = select(ScanTask).order_by(desc(ScanTask.created_at)).limit(50)
-    if project_id is not None:
-        query = query.where(ScanTask.project_id == project_id)
+    query = query.where(ScanTask.project_id == project_id)
     return db.scalars(query).all()
 
 
@@ -2020,8 +2013,8 @@ def activate_provider(provider_id: int, db: Session = Depends(get_db)):
 
 
 @app.get("/api/dashboard")
-def dashboard(project_id: int | None = None, db: Session = Depends(get_db)):
-    project = db.get(Project, project_id) if project_id else db.scalar(select(Project).order_by(Project.id))
+def dashboard(project_id: int = Query(..., ge=1), db: Session = Depends(get_db)):
+    project = db.get(Project, project_id)
     if not project:
         return {"project": None, "stats": {}, "events": []}
     stats = {"keywords": db.scalar(select(func.count(Keyword.id)).where(Keyword.project_id == project.id)) or 0, "videos": db.scalar(select(func.count(Video.id)).where(Video.project_id == project.id)) or 0, "comments": db.scalar(select(func.count(Comment.id)).where(Comment.project_id == project.id)) or 0, "leads": db.scalar(select(func.count(Lead.id)).where(Lead.project_id == project.id)) or 0, "s_leads": db.scalar(select(func.count(Lead.id)).where(Lead.project_id == project.id, Lead.lead_level == "S")) or 0, "new_leads": db.scalar(select(func.count(Lead.id)).where(Lead.project_id == project.id, Lead.status == "NEW")) or 0}
@@ -2034,8 +2027,8 @@ def dashboard(project_id: int | None = None, db: Session = Depends(get_db)):
 
 
 @app.get("/api/analytics")
-def analytics(project_id: int | None = None, db: Session = Depends(get_db)):
-    project = db.get(Project, project_id) if project_id else db.scalar(select(Project).order_by(Project.id))
+def analytics(project_id: int = Query(..., ge=1), db: Session = Depends(get_db)):
+    project = db.get(Project, project_id)
     if not project:
         return {}
     levels = {level: db.scalar(select(func.count(Lead.id)).where(Lead.project_id == project.id, Lead.lead_level == level)) or 0 for level in ["S", "A", "B", "C"]}
@@ -2117,10 +2110,9 @@ async def test_llm(payload: SettingsInput | None = None, db: Session = Depends(g
 
 
 @app.get("/api/agent-runs")
-def list_agent_runs(project_id: int | None = None, limit: int = Query(100, ge=1, le=500), db: Session = Depends(get_db)):
+def list_agent_runs(project_id: int = Query(..., ge=1), limit: int = Query(100, ge=1, le=500), db: Session = Depends(get_db)):
     query = select(AgentRun).order_by(desc(AgentRun.id)).limit(limit)
-    if project_id is not None:
-        query = query.where(AgentRun.project_id == project_id)
+    query = query.where(AgentRun.project_id == project_id)
     return db.scalars(query).all()
 
 
@@ -2135,7 +2127,7 @@ def _resolve_sse_cursor(request: Request, query_cursor: int) -> int:
 
 
 @app.get("/api/events/stream")
-async def events_stream(request: Request, last_event_id: int = 0, project_id: int | None = None):
+async def events_stream(request: Request, last_event_id: int = 0, project_id: int = Query(..., ge=1)):
     last_event_id = _resolve_sse_cursor(request, last_event_id)
     queue = event_bus.subscribe()
 
