@@ -395,7 +395,9 @@ function DashboardLive({ project, navigate }: RecordShape) {
     void load()
     return () => { stopped = true }
   }, [project.id, refreshToken])
-  useEffect(() => { request('/api/douyin/status').then(setDouyin).catch(() => {}) }, [])
+  useEffect(() => {
+    request(`/api/douyin/status?project_id=${project.id}`).then(setDouyin).catch(() => {})
+  }, [project.id])
   useEffect(() => {
     let source: EventSource | undefined
     let retryTimer: number | undefined
