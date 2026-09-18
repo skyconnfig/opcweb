@@ -993,9 +993,9 @@ def create_knowledge(project_id: int, payload: KnowledgeIn, db: Session = Depend
 
 
 @app.put("/api/knowledge/{knowledge_id}")
-def update_knowledge(knowledge_id: int, payload: KnowledgeIn, db: Session = Depends(get_db)):
+def update_knowledge(knowledge_id: int, payload: KnowledgeIn, project_id: int = Query(...), db: Session = Depends(get_db)):
     entry = db.get(KnowledgeEntry, knowledge_id)
-    if not entry:
+    if not entry or entry.project_id != project_id:
         raise HTTPException(404, "知识库条目不存在")
     for key, value in payload.model_dump().items():
         setattr(entry, key, value)
@@ -1005,9 +1005,9 @@ def update_knowledge(knowledge_id: int, payload: KnowledgeIn, db: Session = Depe
 
 
 @app.delete("/api/knowledge/{knowledge_id}")
-def delete_knowledge(knowledge_id: int, db: Session = Depends(get_db)):
+def delete_knowledge(knowledge_id: int, project_id: int = Query(...), db: Session = Depends(get_db)):
     entry = db.get(KnowledgeEntry, knowledge_id)
-    if not entry:
+    if not entry or entry.project_id != project_id:
         raise HTTPException(404, "知识库条目不存在")
     db.delete(entry)
     db.commit()

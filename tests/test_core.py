@@ -25,7 +25,7 @@ from app.agents.radar_agent import RadarAgent
 from app.core.config import Settings
 from app.db import Base
 from app.main import ReplyActionIn, ReplyBatchIn, ReplyPolicyIn, ScheduleIn, _require_provider_capability, send_comment_reply
-from app.models import AgentRun, BrowserProfile, Comment, CommentReply, DouyinAccount, Lead, Project, ReplyPolicy, ScanSchedule, ScanTask, TaskCheckpoint, Video, now_utc
+from app.models import AgentRun, BrowserProfile, Comment, CommentReply, DouyinAccount, KnowledgeEntry, Lead, Project, ReplyPolicy, ScanSchedule, ScanTask, TaskCheckpoint, Video, now_utc
 from app.providers.external.douyin_comments_crawler import DouyinCommentsCrawlerExternalProvider
 from app.providers.external.social_harvest import SocialHarvestExternalProvider
 from app.providers.douyin.dto import ReplyResult, ReplyStatus
@@ -1176,6 +1176,36 @@ def test_comment_list_includes_video_and_lead_context():
     assert rows[0]["video_url"] == ""
     assert rows[0]["reply_status"] is None
     assert rows[0]["lead_id"] is None
+
+
+def test_knowledge_mutations_require_the_current_project_scope():
+    from app import main
+
+    db = _reply_test_session()
+    project = Project(name="知识项目", industry="装修")
+    other = Project(name="其他项目", industry="教育")
+    db.add_all([project, other])
+    db.flush()
+    entry = KnowledgeEntry(project_id=project.id, title="报价规则", content="先确认面积")
+    db.add(entry)
+    db.commit()
+
+    with pytest.raises(HTTPException) as wrong_update:
+        main.update_knowledge(entry.id, main.KnowledgeIn(title="越权", content="不应修改"), project_id=other.id, db=db)
+    assert wrong_update.value.status_code == 404
+    db.refresh(entry)
+    assert entry.title == "报价规则"
+
+    updated = main.update_knowledge(entry.id, main.KnowledgeIn(title="报价规则（更新）", content="先确认面积和预算"), project_id=project.id, db=db)
+    assert updated.title == "报价规则（更新）"
+
+    with pytest.raises(HTTPException) as wrong_delete:
+        main.delete_knowledge(entry.id, project_id=other.id, db=db)
+    assert wrong_delete.value.status_code == 404
+    assert db.get(KnowledgeEntry, entry.id) is not None
+
+    assert main.delete_knowledge(entry.id, project_id=project.id, db=db) == {"deleted": entry.id}
+    assert db.get(KnowledgeEntry, entry.id) is None
 
 
 @pytest.mark.asyncio
