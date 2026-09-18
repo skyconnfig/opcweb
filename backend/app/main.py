@@ -2095,7 +2095,10 @@ async def test_llm(payload: SettingsInput | None = None, db: Session = Depends(g
     for key, value in (payload.model_dump(exclude_none=True) if payload else {}).items():
         if key in {"llm_base_url", "llm_api_key", "llm_model", "llm_temperature", "llm_timeout"} and value:
             stored[key] = value
-    return await OpenAICompatibleProvider(settings_with_db(get_settings(), stored)).test_connection()
+    resolved = settings_with_db(get_settings(), stored)
+    if not is_text_only_model(resolved.llm_model):
+        raise HTTPException(422, "当前版本只支持文本模型，禁止测试视觉或多模态模型")
+    return await OpenAICompatibleProvider(resolved).test_connection()
 
 
 @app.get("/api/agent-runs")

@@ -874,6 +874,17 @@ def test_settings_input_accepts_frontend_readback_values():
     assert payload.llm_timeout == 45.0
 
 
+@pytest.mark.asyncio
+async def test_test_llm_endpoint_rejects_non_text_model_before_request():
+    from app import main
+
+    db = _reply_test_session()
+    with pytest.raises(HTTPException) as blocked:
+        await main.test_llm(main.SettingsInput(llm_model="DeepSeek-V4-Flash-Vision-Exp"), db)
+    assert blocked.value.status_code == 422
+    assert "文本模型" in str(blocked.value.detail)
+
+
 def test_readiness_probe_is_public_when_api_auth_is_enabled(monkeypatch):
     monkeypatch.setattr("app.security.get_settings", lambda: Settings(api_auth_token="secret"))
     request = Request({"type": "http", "method": "GET", "path": "/ready", "headers": [], "query_string": b""})
