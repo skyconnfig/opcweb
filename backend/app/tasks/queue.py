@@ -64,7 +64,7 @@ def claim_next_task(db: Session) -> tuple[int, bool] | None:
             .where(
                 ScanTask.id == candidate.id,
                 ScanTask.status == "queued",
-                ~exists(select(running_check.id).where(running_check.project_id == candidate.project_id, running_check.status == "running")),
+                ~exists(select(running_check.id).where(running_check.project_id == candidate.project_id, running_check.status.in_(("running", "verification_required")))),
             )
             .values(status="running", current_step=TASK_RUNTIME_INITIALIZING, started_at=now_utc(), error="")
         )

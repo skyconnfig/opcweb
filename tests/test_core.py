@@ -269,6 +269,31 @@ def test_task_claim_is_atomic_and_serializes_same_project():
     assert claim_next_task(db) == (second.id, True)
 
 
+def test_task_claim_rechecks_verification_state_before_commit(monkeypatch):
+    """A verification task created after candidate selection must win the race."""
+    from sqlalchemy.sql.dml import Update
+
+    db = _reply_test_session()
+    project = Project(name="验证竞争项目", industry="装修")
+    db.add(project)
+    db.commit()
+    candidate = enqueue_scan(db, project.id)
+    original_execute = db.execute
+    injected = False
+
+    def execute(statement, *args, **kwargs):
+        nonlocal injected
+        if isinstance(statement, Update) and not injected:
+            db.add(ScanTask(project_id=project.id, name="人工验证中的任务", status="verification_required"))
+            db.flush()
+            injected = True
+        return original_execute(statement, *args, **kwargs)
+
+    monkeypatch.setattr(db, "execute", execute)
+    assert claim_next_task(db) is None
+    assert db.get(ScanTask, candidate.id).status == "queued"
+
+
 @pytest.mark.asyncio
 async def test_task_controls_enforce_transitions_and_retry_from_checkpoint():
     from app import main
