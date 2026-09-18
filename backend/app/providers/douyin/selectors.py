@@ -100,6 +100,10 @@ SELECTORS: dict[str, tuple[SelectorSpec, ...]] = {
         role("textbox", "搜索"),
         label("搜索"),
     ),
+    "search.video_tab": (
+        css('#search-toolbar-container [data-key="video"]'),
+        css('[data-key="video"]'),
+    ),
     "search.video_results": (
         css('a[href*="/video/"]'),
         css('[data-e2e="search-result-card"] a[href]'),

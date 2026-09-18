@@ -238,6 +238,18 @@ async def test_search_surface_classifies_visible_verification_marker_as_blocked(
 
 
 @pytest.mark.asyncio
+async def test_search_activates_visible_video_tab_without_using_non_dom_state():
+    tab = LocatorDouble()
+    page = PageDouble({'#search-toolbar-container [data-key="video"]': tab})
+    provider = DouyinPlaywrightProvider(browser_manager=BrowserDouble(page))
+
+    await provider._activate_video_search_tab(page)
+
+    assert tab.clicks == 1
+    assert provider.last_dom_trace["search.video_tab_action"] == "clicked"
+
+
+@pytest.mark.asyncio
 async def test_comment_matches_tooltip_anchor_id_as_stable_dom_identity():
     anchor = LocatorDouble(attrs={"id": "tooltip_comment-42"})
     item = LocatorDouble(text="评论文本", children={"[id^=\"tooltip_\"]": anchor})
