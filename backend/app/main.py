@@ -1232,20 +1232,42 @@ def _agent_run_from_call(db: Session, project_id: int, agent: str, prompt_versio
     db.add(AgentRun(project_id=project_id, agent=agent, model=call.model if call else llm.model, prompt_version=prompt_version, input_hash=input_hash(input_payload), input_text=input_text, output=output, latency_ms=call.latency_ms if call else 0, token_usage=call.tokens if call else 0, success=recorded_success, error=recorded_error))
 
 
+def _ensure_project_scope(actual_project_id: int, requested_project_id: int | None, resource: str) -> None:
+    """Keep ID-addressed resources inside the workspace selected by the UI.
+
+    The local app is single-user, but projects are still an explicit data
+    boundary.  Querying by a global integer ID without checking the selected
+    project made it too easy for a stale drawer or copied URL to read or
+    mutate another project's record.
+    """
+
+    # Direct unit tests call route functions as ordinary Python functions,
+    # where FastAPI's Query default object is not resolved by dependency
+    # injection.  Treat that object as its declared default while preserving
+    # the integer value supplied by real HTTP requests.
+    if not isinstance(requested_project_id, (int, type(None))):
+        query_default = getattr(requested_project_id, "default", None)
+        requested_project_id = query_default if isinstance(query_default, int) else None
+    if requested_project_id is not None and actual_project_id != requested_project_id:
+        raise HTTPException(404, f"{resource}不存在")
+
+
 @app.get("/api/comments/{comment_id}")
-def get_comment(comment_id: int, db: Session = Depends(get_db)):
+def get_comment(comment_id: int, db: Session = Depends(get_db), project_id: int | None = Query(..., ge=1)):
     comment = db.get(Comment, comment_id)
     if not comment:
         raise HTTPException(404, "评论不存在")
+    _ensure_project_scope(comment.project_id, project_id, "评论")
     _, video, lead, history = _comment_context(db, comment)
     return {"comment": comment, "video": video, "lead": lead, "history_text": history, "replies": db.scalars(select(CommentReply).where(CommentReply.comment_id == comment.id).order_by(desc(CommentReply.id))).all()}
 
 
 @app.post("/api/comments/{comment_id}/analyze")
-async def analyze_comment(comment_id: int, db: Session = Depends(get_db)):
+async def analyze_comment(comment_id: int, db: Session = Depends(get_db), project_id: int | None = Query(..., ge=1)):
     comment = db.get(Comment, comment_id)
     if not comment:
         raise HTTPException(404, "评论不存在")
+    _ensure_project_scope(comment.project_id, project_id, "评论")
     project, video, lead, history = _comment_context(db, comment)
     llm = active_llm(db)
     project_data = {"industry": project.industry, "location": project.location, "service": project.service, "target_customer": project.target_customer, "price_range": project.price_range, "description": project.description, "keyword": video.keyword, "video_title": video.title, "video_description": video.description, "video_creator": video.creator, "video_likes": video.likes, "video_comments": video.comments, "video_shares": video.shares, "video_collects": video.collects, "history_text": "\n".join(f"{index + 1}. {text}" for index, text in enumerate(history))}
@@ -1278,10 +1300,11 @@ def _reply_payload(db: Session, comment: Comment, decision: dict, *, reply_sourc
 
 
 @app.post("/api/comments/{comment_id}/generate-reply")
-async def generate_reply(comment_id: int, payload: GenerateReplyIn | None = None, db: Session = Depends(get_db)):
+async def generate_reply(comment_id: int, payload: GenerateReplyIn | None = None, db: Session = Depends(get_db), project_id: int | None = Query(..., ge=1)):
     comment = db.get(Comment, comment_id)
     if not comment:
         raise HTTPException(404, "评论不存在")
+    _ensure_project_scope(comment.project_id, project_id, "评论")
     project, video, lead, history = _comment_context(db, comment)
     persona = db.scalar(select(Persona).where(Persona.project_id == project.id))
     knowledge = db.scalars(select(KnowledgeEntry).where(KnowledgeEntry.project_id == project.id, KnowledgeEntry.enabled.is_(True))).all()
@@ -1308,16 +1331,16 @@ async def generate_reply(comment_id: int, payload: GenerateReplyIn | None = None
 
 
 @app.post("/api/comments/{comment_id}/reply")
-async def send_comment_reply(comment_id: int, payload: ReplyActionIn, db: Session = Depends(get_db)):
+async def send_comment_reply(comment_id: int, payload: ReplyActionIn, db: Session = Depends(get_db), project_id: int | None = Query(..., ge=1)):
     if not payload.confirm:
         raise HTTPException(400, "REPLY_CONFIRM_REQUIRED: 发送真实抖音回复必须明确 confirm=true")
     lock = _reply_send_locks.setdefault(comment_id, asyncio.Lock())
     async with lock:
-        return await _send_comment_reply_locked(comment_id, payload, db)
+        return await _send_comment_reply_locked(comment_id, payload, db, project_id=project_id)
 
 
 @app.post("/api/comments/reply-batch")
-async def send_comment_reply_batch(payload: ReplyBatchIn, db: Session = Depends(get_db)):
+async def send_comment_reply_batch(payload: ReplyBatchIn, db: Session = Depends(get_db), project_id: int | None = Query(..., ge=1)):
     """Send an explicitly confirmed batch serially through the same guards.
 
     Serial execution is intentional: one browser profile must not perform
@@ -1335,6 +1358,7 @@ async def send_comment_reply_batch(payload: ReplyBatchIn, db: Session = Depends(
                     item.comment_id,
                     ReplyActionIn(reply_text=item.reply_text, confirm=True),
                     db,
+                    project_id=project_id,
                 )
             results.append({"comment_id": item.comment_id, "ok": True, "result": result})
         except HTTPException as exc:
@@ -1348,13 +1372,14 @@ async def send_comment_reply_batch(payload: ReplyBatchIn, db: Session = Depends(
     return {"ok": successful == len(results), "success_count": successful, "failed_count": len(results) - successful, "results": results}
 
 
-async def _send_comment_reply_locked(comment_id: int, payload: ReplyActionIn, db: Session):
+async def _send_comment_reply_locked(comment_id: int, payload: ReplyActionIn, db: Session, *, project_id: int | None = None):
     # PostgreSQL serializes concurrent sends for the same comment. SQLite relies
     # on the process lock above; the conditional update below is still required
     # to prevent a second worker from claiming the same pending row.
     comment = db.scalar(select(Comment).where(Comment.id == comment_id).with_for_update())
     if not comment:
         raise HTTPException(404, "评论不存在")
+    _ensure_project_scope(comment.project_id, project_id, "评论")
     # Release only expired claims. A live SENDING row remains a hard block,
     # including across API workers, so a timeout can never silently become a
     # second real platform send.
@@ -1461,11 +1486,12 @@ def list_replies(project_id: int | None = None, status: str | None = None, limit
 
 
 @app.patch("/api/replies/{reply_id}")
-def review_reply(reply_id: int, payload: ReplyReviewIn, db: Session = Depends(get_db)):
+def review_reply(reply_id: int, payload: ReplyReviewIn, db: Session = Depends(get_db), project_id: int | None = Query(..., ge=1)):
     """Apply an explicit review transition without contacting Douyin."""
     reply = db.get(CommentReply, reply_id)
     if not reply:
         raise HTTPException(404, "回复记录不存在")
+    _ensure_project_scope(reply.project_id, project_id, "回复记录")
 
     if payload.action == "approve":
         if reply.status not in {"DRAFT", "WAITING_REVIEW", "FAILED"}:
@@ -1498,7 +1524,7 @@ def review_reply(reply_id: int, payload: ReplyReviewIn, db: Session = Depends(ge
 
 
 @app.post("/api/replies/{reply_id}/verify")
-async def verify_reply(reply_id: int, db: Session = Depends(get_db)):
+async def verify_reply(reply_id: int, db: Session = Depends(get_db), project_id: int | None = Query(..., ge=1)):
     """Reconcile a sent reply by reading the real Douyin DOM again.
 
     Verification is read-only from the platform perspective: it never retries
@@ -1509,6 +1535,7 @@ async def verify_reply(reply_id: int, db: Session = Depends(get_db)):
     reply = db.get(CommentReply, reply_id)
     if not reply:
         raise HTTPException(404, "回复记录不存在")
+    _ensure_project_scope(reply.project_id, project_id, "回复记录")
     if reply.status not in {"SENT_UNVERIFIED", "SENT"}:
         raise HTTPException(
             409,

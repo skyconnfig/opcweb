@@ -1229,6 +1229,37 @@ def test_knowledge_mutations_require_the_current_project_scope():
 
 
 @pytest.mark.asyncio
+async def test_comment_and_reply_actions_require_the_current_project_scope():
+    from app import main
+
+    db = _reply_test_session()
+    comment = _reply_test_comment(db)
+    other = Project(name="其他项目", industry="教育")
+    db.add(other)
+    db.flush()
+    reply = CommentReply(project_id=comment.project_id, comment_id=comment.id, reply_text="先确认需求", status="WAITING_REVIEW")
+    db.add(reply)
+    db.commit()
+
+    with pytest.raises(HTTPException) as wrong_comment:
+        main.get_comment(comment.id, project_id=other.id, db=db)
+    assert wrong_comment.value.status_code == 404
+
+    with pytest.raises(HTTPException) as wrong_review:
+        main.review_reply(reply.id, main.ReplyReviewIn(action="approve"), project_id=other.id, db=db)
+    assert wrong_review.value.status_code == 404
+
+    with pytest.raises(HTTPException) as wrong_send:
+        await main.send_comment_reply(
+            comment.id,
+            ReplyActionIn(reply_text="不应发送", confirm=True),
+            project_id=other.id,
+            db=db,
+        )
+    assert wrong_send.value.status_code == 404
+
+
+@pytest.mark.asyncio
 async def test_manual_reply_requires_confirm_and_blocks_repeat(monkeypatch):
     from app import main
 

@@ -561,19 +561,19 @@ function CommentsView({ project, providerContext }: RecordShape) {
   useEffect(() => { setSelectedId(null); setDetail(undefined); setError('') }, [project.id])
   const openDetail = async (id: number) => {
     setSelectedId(id); setDetail(undefined); setDetailLoading(true); setDetailError('')
-    try { setDetail(await request(`/api/comments/${id}`)) } catch (err) { setDetailError(errorText(err)) } finally { setDetailLoading(false) }
+    try { setDetail(await request(`/api/comments/${id}?project_id=${project.id}`)) } catch (err) { setDetailError(errorText(err)) } finally { setDetailLoading(false) }
   }
-  const refreshDetail = async (id: number) => { setDetailLoading(true); try { setDetail(await request(`/api/comments/${id}`)); setDetailError('') } catch (err) { setDetailError(errorText(err)) } finally { setDetailLoading(false) } }
+  const refreshDetail = async (id: number) => { setDetailLoading(true); try { setDetail(await request(`/api/comments/${id}?project_id=${project.id}`)); setDetailError('') } catch (err) { setDetailError(errorText(err)) } finally { setDetailLoading(false) } }
   const setActionError = (id: number, error: unknown) => { const message = errorText(error); if (selectedId === id) setDetailError(message); else setError(message) }
-  const analyze = async (id: number) => { setBusy(id); if (selectedId === id) setDetailError(''); else setError(''); try { await request(`/api/comments/${id}/analyze`, { method: 'POST' }); await reload(); if (selectedId === id) await refreshDetail(id) } catch (err) { setActionError(id, err) } finally { setBusy(null) } }
-  const generate = async (id: number) => { setBusy(id); if (selectedId === id) setDetailError(''); else setError(''); try { await request(`/api/comments/${id}/generate-reply`, { method: 'POST' }); await reload(); if (selectedId === id) await refreshDetail(id) } catch (err) { setActionError(id, err) } finally { setBusy(null) } }
+  const analyze = async (id: number) => { setBusy(id); if (selectedId === id) setDetailError(''); else setError(''); try { await request(`/api/comments/${id}/analyze?project_id=${project.id}`, { method: 'POST' }); await reload(); if (selectedId === id) await refreshDetail(id) } catch (err) { setActionError(id, err) } finally { setBusy(null) } }
+  const generate = async (id: number) => { setBusy(id); if (selectedId === id) setDetailError(''); else setError(''); try { await request(`/api/comments/${id}/generate-reply?project_id=${project.id}`, { method: 'POST' }); await reload(); if (selectedId === id) await refreshDetail(id) } catch (err) { setActionError(id, err) } finally { setBusy(null) } }
   const approve = async (id: number, text: string) => {
     const replyText = text.trim()
     const latestReply = detail?.replies?.[0]
     if (!latestReply?.id) { setDetailError('请先生成回复草稿'); return }
     if (!replyText) { setDetailError('通过前必须填写回复文本'); return }
     setBusy(id); setDetailError('')
-    try { await request(`/api/replies/${latestReply.id}`, { method: 'PATCH', body: JSON.stringify({ action: 'approve', reply_text: replyText }) }); await reload(); await refreshDetail(id) } catch (err) { setDetailError(errorText(err)) } finally { setBusy(null) }
+    try { await request(`/api/replies/${latestReply.id}?project_id=${project.id}`, { method: 'PATCH', body: JSON.stringify({ action: 'approve', reply_text: replyText }) }); await reload(); await refreshDetail(id) } catch (err) { setDetailError(errorText(err)) } finally { setBusy(null) }
   }
   const send = async (id: number, text: string) => {
     const replyText = text.trim()
@@ -584,7 +584,7 @@ function CommentsView({ project, providerContext }: RecordShape) {
     if (!window.confirm('确认在真实抖音页面发送这条回复？')) return
     setBusy(id); setDetailError('')
     try {
-      await request(`/api/comments/${id}/reply`, { method: 'POST', body: JSON.stringify({ reply_text: replyText, confirm: true }) }); await reload(); await refreshDetail(id)
+      await request(`/api/comments/${id}/reply?project_id=${project.id}`, { method: 'POST', body: JSON.stringify({ reply_text: replyText, confirm: true }) }); await reload(); await refreshDetail(id)
     } catch (err) { setDetailError(errorText(err)) } finally { setBusy(null) }
   }
   const rows = items.filter((item) => {
@@ -631,7 +631,7 @@ function RepliesView({ project, providerContext }: RecordShape) {
     const replyText = String(drafts[item.id] ?? item.reply_text ?? '').trim()
     if (!replyText) { setError('通过前必须填写回复文本'); return }
     setBusy(item.id); setError(''); setNotice('')
-    try { await request(`/api/replies/${item.id}`, { method: 'PATCH', body: JSON.stringify({ action: 'approve', reply_text: replyText }) }); setEditingId(null); setDrafts((current) => { const next = { ...current }; delete next[item.id]; return next }); setNotice('回复已通过人工审核，尚未发送'); await reload() } catch (err: any) { setError(errorText(err)) } finally { setBusy(null) }
+    try { await request(`/api/replies/${item.id}?project_id=${project.id}`, { method: 'PATCH', body: JSON.stringify({ action: 'approve', reply_text: replyText }) }); setEditingId(null); setDrafts((current) => { const next = { ...current }; delete next[item.id]; return next }); setNotice('回复已通过人工审核，尚未发送'); await reload() } catch (err: any) { setError(errorText(err)) } finally { setBusy(null) }
   }
   const send = async (item: RecordShape) => {
     if (!canReply) { setError(replyCapabilityMessage); return }
@@ -641,7 +641,7 @@ function RepliesView({ project, providerContext }: RecordShape) {
     if (!window.confirm('确认在真实抖音页面发送这条回复？')) return
     setBusy(item.id); setError(''); setNotice('')
     try {
-      const result = await request(`/api/comments/${item.comment_id}/reply`, { method: 'POST', body: JSON.stringify({ reply_text: replyText, confirm: true }) })
+      const result = await request(`/api/comments/${item.comment_id}/reply?project_id=${project.id}`, { method: 'POST', body: JSON.stringify({ reply_text: replyText, confirm: true }) })
       setEditingId(null)
       setNotice(result.reply?.status === 'VERIFIED' ? '回复已发送并完成页面验证' : '回复已发送，但尚未完成页面验证')
       await reload()
@@ -655,7 +655,7 @@ function RepliesView({ project, providerContext }: RecordShape) {
     if (!window.confirm(`确认在真实抖音页面依次发送 ${selected.length} 条回复？`)) return
     setBusy(-1); setError(''); setNotice('')
     try {
-      const result = await request('/api/comments/reply-batch', { method: 'POST', body: JSON.stringify({ items: selected.map((item) => ({ comment_id: item.comment_id, reply_text: String(item.reply_text ?? '').trim() })), confirm: true }) })
+      const result = await request(`/api/comments/reply-batch?project_id=${project.id}`, { method: 'POST', body: JSON.stringify({ items: selected.map((item) => ({ comment_id: item.comment_id, reply_text: String(item.reply_text ?? '').trim() })), confirm: true }) })
       setSelectedIds([])
       setNotice(`批量发送完成：成功 ${result.success_count || 0} 条，失败 ${result.failed_count || 0} 条`)
       await reload()
@@ -664,14 +664,14 @@ function RepliesView({ project, providerContext }: RecordShape) {
   const skip = async (item: RecordShape) => {
     if (!window.confirm('确认跳过这条回复？')) return
     setBusy(item.id); setError(''); setNotice('')
-    try { await request(`/api/replies/${item.id}`, { method: 'PATCH', body: JSON.stringify({ action: 'skip' }) }); setNotice('已跳过这条回复'); await reload() } catch (err: any) { setError(err.message) } finally { setBusy(null) }
+    try { await request(`/api/replies/${item.id}?project_id=${project.id}`, { method: 'PATCH', body: JSON.stringify({ action: 'skip' }) }); setNotice('已跳过这条回复'); await reload() } catch (err: any) { setError(err.message) } finally { setBusy(null) }
   }
   const verify = async (item: RecordShape) => {
     if (!canReply) { setError(replyCapabilityMessage); return }
     if (!window.confirm('重新读取真实抖音页面，核验这条回复是否已经出现？不会再次发送。')) return
     setBusy(item.id); setError(''); setNotice('')
     try {
-      const result = await request(`/api/replies/${item.id}/verify`, { method: 'POST' })
+      const result = await request(`/api/replies/${item.id}/verify?project_id=${project.id}`, { method: 'POST' })
       setNotice(result.reply?.status === 'VERIFIED' ? '已从真实页面核验回复' : '页面暂未观察到精确回复文本')
       await reload()
     } catch (err: any) { setError(err.message); await reload() } finally { setBusy(null) }
