@@ -1299,6 +1299,37 @@ def test_lead_and_follow_task_actions_require_the_current_project_scope():
 
 
 @pytest.mark.asyncio
+async def test_collection_and_task_actions_require_the_current_project_scope():
+    from app import main
+    from app.models import Keyword
+
+    db = _reply_test_session()
+    comment = _reply_test_comment(db)
+    keyword = Keyword(project_id=comment.project_id, keyword="装修报价", category="购买意向")
+    video = db.get(Video, comment.video_id)
+    task = ScanTask(project_id=comment.project_id, name="扫描", status="paused")
+    other = Project(name="其他项目", industry="教育")
+    db.add_all([keyword, task, other])
+    db.commit()
+
+    with pytest.raises(HTTPException) as wrong_keyword:
+        main.get_keyword(keyword.id, db=db, project_id=other.id)
+    assert wrong_keyword.value.status_code == 404
+
+    with pytest.raises(HTTPException) as wrong_video:
+        main.get_video(video.id, db=db, project_id=other.id)
+    assert wrong_video.value.status_code == 404
+
+    with pytest.raises(HTTPException) as wrong_task:
+        main.get_task(task.id, db=db, project_id=other.id)
+    assert wrong_task.value.status_code == 404
+
+    with pytest.raises(HTTPException) as wrong_transition:
+        main.pause_task(task.id, db=db, project_id=other.id)
+    assert wrong_transition.value.status_code == 404
+
+
+@pytest.mark.asyncio
 async def test_manual_reply_requires_confirm_and_blocks_repeat(monkeypatch):
     from app import main
 

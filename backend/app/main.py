@@ -1148,18 +1148,20 @@ def project_keywords(project_id: int, db: Session = Depends(get_db)):
 
 
 @app.get("/api/keywords/{keyword_id}")
-def get_keyword(keyword_id: int, db: Session = Depends(get_db)):
+def get_keyword(keyword_id: int, db: Session = Depends(get_db), project_id: int | None = Query(..., ge=1)):
     item = db.get(Keyword, keyword_id)
     if not item:
         raise HTTPException(404, "关键词不存在")
+    _ensure_project_scope(item.project_id, project_id, "关键词")
     return item
 
 
 @app.patch("/api/keywords/{keyword_id}")
-def update_keyword(keyword_id: int, enabled: bool, db: Session = Depends(get_db)):
+def update_keyword(keyword_id: int, enabled: bool, db: Session = Depends(get_db), project_id: int | None = Query(..., ge=1)):
     item = db.get(Keyword, keyword_id)
     if not item:
         raise HTTPException(404, "关键词不存在")
+    _ensure_project_scope(item.project_id, project_id, "关键词")
     item.enabled = enabled
     db.commit()
     return item
@@ -1174,18 +1176,20 @@ def list_videos(project_id: int | None = None, limit: int = Query(50, ge=1, le=2
 
 
 @app.get("/api/videos/{video_id}")
-def get_video(video_id: int, db: Session = Depends(get_db)):
+def get_video(video_id: int, db: Session = Depends(get_db), project_id: int | None = Query(..., ge=1)):
     item = db.get(Video, video_id)
     if not item:
         raise HTTPException(404, "视频不存在")
+    _ensure_project_scope(item.project_id, project_id, "视频")
     return item
 
 
 @app.post("/api/videos/{video_id}/scan")
-async def scan_video(video_id: int, db: Session = Depends(get_db)):
+async def scan_video(video_id: int, db: Session = Depends(get_db), project_id: int | None = Query(..., ge=1)):
     video = db.get(Video, video_id)
     if not video:
         raise HTTPException(404, "视频不存在")
+    _ensure_project_scope(video.project_id, project_id, "视频")
     # This endpoint is intentionally video-scoped. Project-wide resumable
     # scans belong to /api/projects/{project_id}/scan; do not silently start
     # unrelated keyword work when a caller asks for one video.
@@ -1920,17 +1924,19 @@ def list_tasks(project_id: int | None = None, db: Session = Depends(get_db)):
 
 
 @app.get("/api/tasks/{task_id}")
-def get_task(task_id: int, db: Session = Depends(get_db)):
+def get_task(task_id: int, db: Session = Depends(get_db), project_id: int | None = Query(..., ge=1)):
     task = db.get(ScanTask, task_id)
     if not task:
         raise HTTPException(404, "任务不存在")
+    _ensure_project_scope(task.project_id, project_id, "任务")
     return {"task": task, "steps": db.scalars(select(TaskStep).where(TaskStep.task_id == task_id).order_by(TaskStep.id)).all(), "events": db.scalars(select(TaskEvent).where(TaskEvent.task_id == task_id).order_by(TaskEvent.id)).all(), "checkpoint": db.get(TaskCheckpoint, task_id), "report": db.scalar(select(TaskReport).where(TaskReport.task_id == task_id))}
 
 
-def mutate_task(task_id: int, status: str, db: Session):
+def mutate_task(task_id: int, status: str, db: Session, *, project_id: int | None = None):
     task = db.get(ScanTask, task_id)
     if not task:
         raise HTTPException(404, "任务不存在")
+    _ensure_project_scope(task.project_id, project_id, "任务")
     transitions = {
         "pause": {"queued": "paused", "running": "paused"},
         "resume": {"paused": "queued"},
@@ -1953,19 +1959,19 @@ def mutate_task(task_id: int, status: str, db: Session):
 
 
 @app.post("/api/tasks/{task_id}/pause")
-def pause_task(task_id: int, db: Session = Depends(get_db)):
-    return mutate_task(task_id, "pause", db)
+def pause_task(task_id: int, db: Session = Depends(get_db), project_id: int | None = Query(..., ge=1)):
+    return mutate_task(task_id, "pause", db, project_id=project_id)
 
 
 @app.post("/api/tasks/{task_id}/resume")
-async def resume_task(task_id: int, db: Session = Depends(get_db)):
-    task = mutate_task(task_id, "resume", db)
+async def resume_task(task_id: int, db: Session = Depends(get_db), project_id: int | None = Query(..., ge=1)):
+    task = mutate_task(task_id, "resume", db, project_id=project_id)
     return task
 
 
 @app.post("/api/tasks/{task_id}/retry")
-async def retry_task(task_id: int, db: Session = Depends(get_db)):
-    task = mutate_task(task_id, "retry", db)
+async def retry_task(task_id: int, db: Session = Depends(get_db), project_id: int | None = Query(..., ge=1)):
+    task = mutate_task(task_id, "retry", db, project_id=project_id)
     task.error = ""
     # Retry resumes from the last durable checkpoint.  Clearing it would
     # re-scan already judged comments and could create duplicate work.
