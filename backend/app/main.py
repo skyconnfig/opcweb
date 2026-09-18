@@ -11,7 +11,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
-from sqlalchemy import desc, func, or_, select, text, update
+from sqlalchemy import delete, desc, func, or_, select, text, update
 from sqlalchemy.orm import Session, aliased
 
 from app.agents.llm import OpenAICompatibleProvider, input_hash, is_text_only_model, settings_with_db
@@ -23,7 +23,7 @@ from app.agents.reply_agent import ReplyAgent
 from app.agents.radar_agent import RadarAgent
 from app.core.config import get_settings
 from app.db import SessionLocal, get_db
-from app.models import AgentRun, BrowserProfile, BrowserSession, Comment, CommentReply, DouyinAccount, FollowTask, Keyword, KnowledgeEntry, Lead, LeadComment, LeadEvent, LeadSource, NotificationEvent, Persona, Project, ProviderRecord, ReplyPolicy, ScanSchedule, ScanTask, Setting, TaskCheckpoint, TaskEvent, TaskReport, TaskStep, Video, now_utc
+from app.models import AgentRun, BrowserProfile, BrowserSession, Comment, CommentReply, DouyinAccount, FollowTask, Keyword, KnowledgeEntry, Lead, LeadComment, LeadEvent, LeadSource, NotificationEvent, Persona, Project, ProviderRecord, ReplyPolicy, ScanSchedule, ScanTask, Setting, TaskArtifact, TaskCheckpoint, TaskEvent, TaskReport, TaskStep, Video, now_utc
 from app.providers.douyin.dto import DouyinCommentDTO, LoginStatus, ReplyStatus
 from app.providers.douyin.exceptions import DouyinError
 from app.providers.douyin.playwright_provider import DouyinPlaywrightProvider
@@ -54,6 +54,18 @@ class ProjectOut(ProjectCreate):
     status: str
     intelligence: dict = Field(default_factory=dict)
     model_config = ConfigDict(from_attributes=True)
+
+
+class ProjectUpdate(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+
+    @field_validator("name")
+    @classmethod
+    def name_must_not_be_blank(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("项目名称不能为空")
+        return value
 
 
 class ScheduleIn(BaseModel):
@@ -844,6 +856,71 @@ def get_project(project_id: int, db: Session = Depends(get_db)):
     if not project:
         raise HTTPException(404, "项目不存在")
     return project
+
+
+@app.patch("/api/projects/{project_id}", response_model=ProjectOut)
+def update_project(project_id: int, payload: ProjectUpdate, db: Session = Depends(get_db)):
+    project = db.get(Project, project_id)
+    if not project:
+        raise HTTPException(404, "项目不存在")
+    project.name = payload.name
+    db.commit()
+    db.refresh(project)
+    return project
+
+
+@app.delete("/api/projects/{project_id}")
+def delete_project(project_id: int, db: Session = Depends(get_db)):
+    project = db.get(Project, project_id)
+    if not project:
+        raise HTTPException(404, "项目不存在")
+
+    # Project data spans several tables and the local SQLite database does
+    # not consistently have database-level ON DELETE CASCADE constraints.
+    # Delete in dependency order so this endpoint behaves the same on
+    # SQLite and PostgreSQL, without leaving orphaned CRM or task records.
+    video_ids = db.scalars(select(Video.id).where(Video.project_id == project_id)).all()
+    comment_ids = db.scalars(select(Comment.id).where(Comment.project_id == project_id)).all()
+    lead_ids = db.scalars(select(Lead.id).where(Lead.project_id == project_id)).all()
+    task_ids = db.scalars(select(ScanTask.id).where(ScanTask.project_id == project_id)).all()
+
+    db.execute(delete(NotificationEvent).where(NotificationEvent.project_id == project_id))
+    db.execute(delete(FollowTask).where(FollowTask.project_id == project_id))
+    if lead_ids:
+        db.execute(delete(LeadComment).where(LeadComment.lead_id.in_(lead_ids)))
+        db.execute(delete(LeadSource).where(LeadSource.lead_id.in_(lead_ids)))
+        db.execute(delete(LeadEvent).where(LeadEvent.lead_id.in_(lead_ids)))
+        db.execute(delete(Lead).where(Lead.id.in_(lead_ids)))
+
+    if comment_ids:
+        db.execute(delete(CommentReply).where(CommentReply.comment_id.in_(comment_ids)))
+        db.execute(delete(LeadComment).where(LeadComment.comment_id.in_(comment_ids)))
+        db.execute(delete(Comment).where(Comment.id.in_(comment_ids)))
+    db.execute(delete(CommentReply).where(CommentReply.project_id == project_id))
+    if video_ids:
+        db.execute(delete(LeadSource).where(LeadSource.video_id.in_(video_ids)))
+        db.execute(delete(Video).where(Video.id.in_(video_ids)))
+
+    if task_ids:
+        db.execute(delete(TaskStep).where(TaskStep.task_id.in_(task_ids)))
+        db.execute(delete(TaskEvent).where(TaskEvent.task_id.in_(task_ids)))
+        db.execute(delete(TaskCheckpoint).where(TaskCheckpoint.task_id.in_(task_ids)))
+        db.execute(delete(TaskReport).where(TaskReport.task_id.in_(task_ids)))
+        db.execute(delete(TaskArtifact).where(TaskArtifact.task_id.in_(task_ids)))
+        db.execute(delete(AgentRun).where(AgentRun.task_id.in_(task_ids)))
+        db.execute(delete(ScanTask).where(ScanTask.id.in_(task_ids)))
+
+    db.execute(delete(AgentRun).where(AgentRun.project_id == project_id))
+    db.execute(delete(TaskEvent).where(TaskEvent.project_id == project_id))
+    db.execute(delete(ScanSchedule).where(ScanSchedule.project_id == project_id))
+    db.execute(delete(Persona).where(Persona.project_id == project_id))
+    db.execute(delete(Keyword).where(Keyword.project_id == project_id))
+    db.execute(delete(KnowledgeEntry).where(KnowledgeEntry.project_id == project_id))
+    db.execute(delete(ReplyPolicy).where(ReplyPolicy.project_id == project_id))
+    db.execute(delete(BrowserSession).where(BrowserSession.project_id == project_id))
+    db.execute(delete(Project).where(Project.id == project_id))
+    db.commit()
+    return {"id": project_id, "deleted": True}
 
 
 @app.post("/api/projects/{project_id}/smart-mode")

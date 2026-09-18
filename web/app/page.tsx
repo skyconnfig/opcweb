@@ -129,6 +129,7 @@ export default function Page() {
   const [view, setView] = useState<ViewKey>('overview')
   const [project, setProject] = useState<RecordShape>({})
   const [projects, setProjects] = useState<RecordShape[]>([])
+  const [newProjectMode, setNewProjectMode] = useState(false)
   const [collapsed, setCollapsed] = useState(false)
   const [dark, setDark] = useState(false)
   const [mobileNav, setMobileNav] = useState(false)
@@ -191,13 +192,98 @@ export default function Page() {
     document.documentElement.dataset.theme = dark ? 'dark' : 'light'
     window.localStorage.setItem('radar:theme', dark ? 'dark' : 'light')
   }, [dark])
-  function navigate(next: ViewKey) { setView(next); window.history.replaceState(null, '', `#${next}`); setMobileNav(false) }
+  function navigate(next: ViewKey) { if (next !== 'smart') setNewProjectMode(false); setView(next); window.history.replaceState(null, '', `#${next}`); setMobileNav(false) }
   const providerContext = { ...providerState, retry: loadProviderState }
-  return <div className="product-shell"><Sidebar view={view} navigate={navigate} collapsed={collapsed} setCollapsed={setCollapsed} mobileNav={mobileNav} setMobileNav={setMobileNav} project={project} projects={projects} setProject={setProject} /><main className="workspace"><Topbar view={view} dark={dark} setDark={setDark} setMobileNav={setMobileNav} navigate={navigate} project={project} /><div className="workspace-scroll">{projectsLoading ? <LoadingPage text="正在读取本地工作区…" /> : projectsError ? <ErrorPage message={projectsError} onRetry={() => void loadProjects()} /> : <ViewRouter view={view} project={project} navigate={navigate} providerContext={providerContext} onProjectCreated={(created: RecordShape) => { setProject(created); setProjects((current) => [created, ...current.filter((item) => item.id !== created.id)]) }} />}</div></main></div>
+  const handleProjectUpdated = (updated: RecordShape) => {
+    setProjects((current) => current.map((item) => item.id === updated.id ? updated : item))
+    if (project?.id === updated.id) setProject(updated)
+  }
+  const handleProjectDeleted = (deletedId: number, fallback?: RecordShape) => {
+    setProjects((current) => current.filter((item) => item.id !== deletedId))
+    if (project?.id === deletedId) setProject(fallback || {})
+  }
+  return <div className="product-shell"><Sidebar view={view} navigate={navigate} collapsed={collapsed} setCollapsed={setCollapsed} mobileNav={mobileNav} setMobileNav={setMobileNav} project={project} projects={projects} setProject={setProject} onProjectUpdated={handleProjectUpdated} onProjectDeleted={handleProjectDeleted} onCreateProject={() => { setNewProjectMode(true); navigate('smart') }} onProjectSelected={() => setNewProjectMode(false)} /><main className="workspace"><Topbar view={view} dark={dark} setDark={setDark} setMobileNav={setMobileNav} navigate={navigate} project={project} /><div className="workspace-scroll">{projectsLoading ? <LoadingPage text="正在读取本地工作区…" /> : projectsError ? <ErrorPage message={projectsError} onRetry={() => void loadProjects()} /> : <ViewRouter view={view} project={project} navigate={navigate} providerContext={providerContext} newProject={newProjectMode} onProjectCreated={(created: RecordShape) => { setNewProjectMode(false); setProject(created); setProjects((current) => [created, ...current.filter((item) => item.id !== created.id)]) }} />}</div></main></div>
 }
 
-function Sidebar({ view, navigate, collapsed, setCollapsed, mobileNav, setMobileNav, project, projects, setProject }: RecordShape) {
-  return <><div className={`mobile-overlay ${mobileNav ? 'show' : ''}`} onClick={() => setMobileNav(false)} /><aside className={`sidebar ${collapsed ? 'collapsed' : ''} ${mobileNav ? 'mobile-open' : ''}`} aria-label="主导航"><div className="sidebar-top"><div className="wordmark"><span className="wordmark-mark"><Radar size={16} /></span><span className="wordmark-text">AI 截流雷达<small>LEAD RADAR</small></span></div><button className="rail-button close-mobile" onClick={() => setMobileNav(false)} aria-label="关闭导航"><X size={17} /></button><button className="rail-button collapse-button" onClick={() => setCollapsed(!collapsed)} aria-label={collapsed ? '展开导航' : '收起导航'}>{collapsed ? <PanelLeftOpen size={16} /> : <PanelLeftClose size={16} />}</button></div><div className="workspace-switcher"><div className="switcher-label">工作区</div><button className="switcher-button" type="button"><span className="project-seal">{(project?.name || '未')[0]}</span><span className="switcher-name">{project?.name || '未选择项目'}<small>本地工作区</small></span><ChevronDown size={14} /></button>{projects.length > 1 && <select className="project-select-hidden" aria-label="切换项目" value={project?.id ?? ''} onChange={(event) => setProject(projects.find((item: RecordShape) => item.id === Number(event.target.value)))}>{projects.map((item: RecordShape) => <option key={item.id} value={item.id}>{item.name}</option>)}</select>}</div><nav className="side-nav">{navigation.map((item) => <div key={item.key}>{item.section && <div className="nav-section">{item.section}</div>}<button className={`nav-link ${view === item.key ? 'active' : ''}`} onClick={() => navigate(item.key)}>{<item.icon size={17} strokeWidth={1.8} />}<span>{item.label}</span></button></div>)}</nav><div className="sidebar-bottom"><div className="provider-state"><span className="status-dot" /><span>状态以真实连接为准</span><MoreHorizontal size={15} /></div><div className="account-row"><div className="account-avatar">L</div><div><b>本地工作区</b><small>Windows · 本地运行</small></div><CircleHelp size={15} /></div></div></aside></>
+
+function Sidebar({ view, navigate, collapsed, setCollapsed, mobileNav, setMobileNav, project, projects, setProject, onProjectUpdated, onProjectDeleted, onCreateProject, onProjectSelected }: RecordShape) {
+  const [menuOpen, setMenuOpen] = useState(false)
+  const [query, setQuery] = useState('')
+  const [editingId, setEditingId] = useState<number | null>(null)
+  const [editingName, setEditingName] = useState('')
+  const [confirmDeleteId, setConfirmDeleteId] = useState<number | null>(null)
+  const [busy, setBusy] = useState(false)
+  const [menuError, setMenuError] = useState('')
+  const filteredProjects = projects.filter((item: RecordShape) => String(item.name || '').toLowerCase().includes(query.trim().toLowerCase()))
+
+  useEffect(() => {
+    if (!menuOpen) return
+    const closeOnEscape = (event: KeyboardEvent) => { if (event.key === 'Escape') setMenuOpen(false) }
+    window.addEventListener('keydown', closeOnEscape)
+    return () => window.removeEventListener('keydown', closeOnEscape)
+  }, [menuOpen])
+
+  const closeMenu = () => {
+    if (busy) return
+    setMenuOpen(false)
+    setQuery('')
+    setEditingId(null)
+    setConfirmDeleteId(null)
+    setMenuError('')
+  }
+  const selectProject = (item: RecordShape) => { setProject(item); onProjectSelected?.(); closeMenu() }
+  const startCreate = () => { closeMenu(); onCreateProject?.() }
+  const startRename = (item: RecordShape) => { setEditingId(item.id); setEditingName(item.name || ''); setConfirmDeleteId(null); setMenuError('') }
+  const saveRename = async (item: RecordShape) => {
+    const name = editingName.trim()
+    if (!name) { setMenuError('项目名称不能为空'); return }
+    setBusy(true)
+    setMenuError('')
+    try {
+      const updated = await request(`/api/projects/${item.id}`, { method: 'PATCH', body: JSON.stringify({ name }) })
+      onProjectUpdated(updated)
+      setEditingId(null)
+    } catch (error) { setMenuError(errorText(error)) } finally { setBusy(false) }
+  }
+  const deleteProject = async (item: RecordShape) => {
+    setBusy(true)
+    setMenuError('')
+    try {
+      await request(`/api/projects/${item.id}`, { method: 'DELETE' })
+      const fallback = projects.find((candidate: RecordShape) => candidate.id !== item.id)
+      onProjectDeleted(item.id, fallback)
+      if (item.id === project?.id) setProject(fallback || {})
+      setConfirmDeleteId(null)
+    } catch (error) { setMenuError(errorText(error)) } finally { setBusy(false) }
+  }
+
+  return <>
+    <div className={`mobile-overlay ${mobileNav ? 'show' : ''}`} onClick={() => setMobileNav(false)} />
+    <aside className={`sidebar ${collapsed ? 'collapsed' : ''} ${mobileNav ? 'mobile-open' : ''}`} aria-label="主导航">
+      <div className="sidebar-top"><div className="wordmark"><span className="wordmark-mark"><Radar size={16} /></span><span className="wordmark-text">AI 截流雷达<small>LEAD RADAR</small></span></div><button className="rail-button close-mobile" onClick={() => setMobileNav(false)} aria-label="关闭导航"><X size={17} /></button><button className="rail-button collapse-button" onClick={() => setCollapsed(!collapsed)} aria-label={collapsed ? '展开导航' : '收起导航'}>{collapsed ? <PanelLeftOpen size={16} /> : <PanelLeftClose size={16} />}</button></div>
+      <div className="workspace-switcher">
+        <div className="switcher-label">工作区</div>
+        <button className="switcher-button" type="button" aria-expanded={menuOpen} onClick={() => { setMenuOpen(!menuOpen); setMenuError('') }}><span className="project-seal">{(project?.name || '未')[0]}</span><span className="switcher-name">{project?.name || '未选择项目'}<small>本地工作区</small></span><ChevronDown size={14} /></button>
+        {menuOpen && <div className="workspace-menu" role="dialog" aria-label="工作区管理" onClick={(event) => event.stopPropagation()}>
+          <div className="workspace-menu-head"><b>我的行业雷达</b><button className="icon-button" onClick={closeMenu} aria-label="关闭工作区菜单"><X size={14} /></button></div>
+          <label className="workspace-search"><Search size={13} /><input autoFocus value={query} onChange={(event) => setQuery(event.target.value)} placeholder="查找项目" aria-label="查找项目" /></label>
+          {menuError && <div className="workspace-menu-error" role="alert"><X size={13} />{menuError}</div>}
+          <div className="workspace-menu-list">
+            {filteredProjects.length ? filteredProjects.map((item: RecordShape) => <div className={`workspace-menu-item ${item.id === project?.id ? 'selected' : ''}`} key={item.id}>
+              {editingId === item.id ? <div className="workspace-rename"><input value={editingName} onChange={(event) => setEditingName(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter') void saveRename(item); if (event.key === 'Escape') setEditingId(null) }} aria-label={`重命名 ${item.name}`} autoFocus /><div><button className="text-button" onClick={() => void saveRename(item)} disabled={busy}>保存</button><button className="text-button" onClick={() => setEditingId(null)} disabled={busy}>取消</button></div></div> : <>
+                <button className="workspace-project-choice" onClick={() => selectProject(item)}><span className="project-seal">{(item.name || '未')[0]}</span><span><b>{item.name}</b><small>{item.industry || '未设置行业'} · 本地数据</small></span>{item.id === project?.id && <Check size={14} />}</button>
+                <div className="workspace-item-actions"><button className="row-more" onClick={() => startRename(item)} aria-label={`重命名 ${item.name}`} title="重命名"><Settings size={13} /></button><button className="row-more danger-action" onClick={() => { setConfirmDeleteId(item.id); setEditingId(null); setMenuError('') }} aria-label={`删除 ${item.name}`} title="删除"><X size={13} /></button></div>
+                {confirmDeleteId === item.id && <div className="workspace-delete-confirm"><p>删除后该项目的关键词、评论、潜客和任务记录将无法恢复。</p><div><button className="text-button" onClick={() => setConfirmDeleteId(null)} disabled={busy}>取消</button><button className="button button-danger" onClick={() => void deleteProject(item)} disabled={busy}>{busy ? '删除中…' : '确认删除'}</button></div></div>}
+              </>}
+            </div>) : <div className="workspace-menu-empty"><Search size={15} /><span>{query.trim() ? '没有匹配的项目' : '还没有项目'}</span></div>}
+          </div>
+          <button className="workspace-create" onClick={startCreate}><Plus size={14} />新建项目</button>
+        </div>}
+      </div>
+      <nav className="side-nav">{navigation.map((item) => <div key={item.key}>{item.section && <div className="nav-section">{item.section}</div>}<button className={`nav-link ${view === item.key ? 'active' : ''}`} onClick={() => { onProjectSelected?.(); navigate(item.key) }}>{<item.icon size={17} strokeWidth={1.8} />}<span>{item.label}</span></button></div>)}</nav>
+      <div className="sidebar-bottom"><div className="provider-state"><span className="status-dot" /><span>状态以真实连接为准</span><MoreHorizontal size={15} /></div><div className="account-row"><div className="account-avatar">L</div><div><b>本地工作区</b><small>Windows · 本地运行</small></div><CircleHelp size={15} /></div></div>
+    </aside>
+  </>
 }
 
 function Topbar({ view, dark, setDark, setMobileNav, navigate }: RecordShape) {
@@ -205,9 +291,9 @@ function Topbar({ view, dark, setDark, setMobileNav, navigate }: RecordShape) {
   return <header className="topbar"><div className="topbar-left"><button className="mobile-menu" onClick={() => setMobileNav(true)} aria-label="打开导航"><Menu size={18} /></button><span className="top-context">工作区</span><ChevronRight size={14} className="top-chevron" /><span className="top-current">{label}</span></div><div className="topbar-right"><div className="runtime-chip"><span className="status-dot" />本地 API</div><button className="top-icon-button" onClick={() => navigate('comments')} aria-label="搜索评论" title="搜索评论"><Search size={17} /></button><button className="top-icon-button" onClick={() => setDark(!dark)} aria-label="切换主题">{dark ? <Sun size={17} /> : <Moon size={17} />}</button><div className="top-profile">L</div></div></header>
 }
 
-function ViewRouter({ view, project, navigate, providerContext, onProjectCreated }: RecordShape) {
+function ViewRouter({ view, project, navigate, providerContext, newProject, onProjectCreated }: RecordShape) {
   if (!project?.id && !['smart', 'providers', 'douyin', 'settings'].includes(view)) return <EmptyWorkspaceView navigate={navigate} />
-  if (view === 'smart') return <SmartViewLive project={project} navigate={navigate} providerContext={providerContext} onProjectCreated={onProjectCreated} />
+  if (view === 'smart') return <SmartViewLive project={project} navigate={navigate} providerContext={providerContext} newProject={newProject} onProjectCreated={onProjectCreated} />
   if (view === 'keywords') return <KeywordsViewLive project={project} />
   if (view === 'videos') return <VideosViewLive project={project} providerContext={providerContext} />
   if (view === 'comments') return <CommentsView project={project} providerContext={providerContext} />
@@ -229,8 +315,8 @@ function EmptyWorkspaceView({ navigate }: RecordShape) { return <div className="
 function LoadingPage({ text = '加载中…' }: { text?: string }) { return <div className="page"><section className="panel page-loading"><LoaderCircle size={20} className="loading-spin" /><span>{text}</span></section></div> }
 function ErrorPage({ message, onRetry }: { message: string; onRetry: () => void }) { return <div className="page"><section className="panel page-error"><X size={20} /><h2>无法读取工作区</h2><p>{message}</p><Button variant="accent" icon={RefreshCw} onClick={onRetry}>重试</Button></section></div> }
 
-function SmartViewLive({ project, navigate, providerContext, onProjectCreated }: RecordShape) {
-  const [form, setForm] = useState({ name: '我的行业雷达', industry: project.industry || '', location: project.location || '', service: '', price_range: '', target_customer: '', description: '' })
+function SmartViewLive({ project, navigate, providerContext, newProject, onProjectCreated }: RecordShape) {
+  const [form, setForm] = useState({ name: '我的行业雷达', industry: newProject ? '' : project.industry || '', location: newProject ? '' : project.location || '', service: newProject ? '' : project.service || '', price_range: newProject ? '' : project.price_range || '', target_customer: newProject ? '' : project.target_customer || '', description: newProject ? '' : project.description || '' })
   const [provider, setProvider] = useState('加载中…')
   const [stage, setStage] = useState('')
   const [result, setResult] = useState<RecordShape>()
@@ -238,12 +324,12 @@ function SmartViewLive({ project, navigate, providerContext, onProjectCreated }:
   const [createdProjectId, setCreatedProjectId] = useState<number | null>(null)
   useEffect(() => { request('/api/settings').then((settings) => setProvider(settings.content_provider || '未配置')).catch(() => setProvider('状态未知')) }, [])
   useEffect(() => {
-    setForm((current) => ({ ...current, name: project.name || '我的行业雷达', industry: project.industry || '', location: project.location || '', service: project.service || '', price_range: project.price_range || '', target_customer: project.target_customer || '', description: project.description || '' }))
+    setForm((current) => ({ ...current, name: newProject ? '我的行业雷达' : project.name || '我的行业雷达', industry: newProject ? '' : project.industry || '', location: newProject ? '' : project.location || '', service: newProject ? '' : project.service || '', price_range: newProject ? '' : project.price_range || '', target_customer: newProject ? '' : project.target_customer || '', description: newProject ? '' : project.description || '' }))
     setCreatedProjectId(null)
     setStage('')
     setResult(undefined)
     setError('')
-  }, [project.id])
+  }, [project.id, newProject])
   const set = (key: string, value: string) => setForm((current) => ({ ...current, [key]: value }))
   const collectionRequirements = [{ key: 'keyword_search', label: '真实视频搜索' }, { key: 'comments', label: '公开评论采集' }]
   const canCollect = collectionRequirements.every((requirement) => providerSupports(providerContext, requirement.key))
