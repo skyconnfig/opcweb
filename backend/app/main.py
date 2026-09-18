@@ -1619,18 +1619,20 @@ def list_leads(project_id: int | None = None, level: str | None = None, status: 
 
 
 @app.get("/api/leads/{lead_id}")
-def get_lead(lead_id: int, db: Session = Depends(get_db)):
+def get_lead(lead_id: int, db: Session = Depends(get_db), project_id: int | None = Query(..., ge=1)):
     lead = db.get(Lead, lead_id)
     if not lead:
         raise HTTPException(404, "潜客不存在")
+    _ensure_project_scope(lead.project_id, project_id, "潜客")
     return lead_payload(db, lead)
 
 
 @app.patch("/api/leads/{lead_id}")
-def update_lead(lead_id: int, payload: LeadStatusUpdate, db: Session = Depends(get_db)):
+def update_lead(lead_id: int, payload: LeadStatusUpdate, db: Session = Depends(get_db), project_id: int | None = Query(..., ge=1)):
     lead = db.get(Lead, lead_id)
     if not lead:
         raise HTTPException(404, "潜客不存在")
+    _ensure_project_scope(lead.project_id, project_id, "潜客")
     if payload.status is not None:
         previous = lead.status
         lead.status = payload.status
@@ -1658,17 +1660,20 @@ def list_all_follow_tasks(
 
 
 @app.get("/api/leads/{lead_id}/follow-tasks", response_model=list[FollowTaskOut])
-def list_follow_tasks(lead_id: int, db: Session = Depends(get_db)):
-    if not db.get(Lead, lead_id):
+def list_follow_tasks(lead_id: int, db: Session = Depends(get_db), project_id: int | None = Query(..., ge=1)):
+    lead = db.get(Lead, lead_id)
+    if not lead:
         raise HTTPException(404, "潜客不存在")
+    _ensure_project_scope(lead.project_id, project_id, "潜客")
     return db.scalars(select(FollowTask).where(FollowTask.lead_id == lead_id).order_by(FollowTask.deadline, FollowTask.id)).all()
 
 
 @app.post("/api/leads/{lead_id}/follow-tasks", response_model=FollowTaskOut)
-def create_follow_task(lead_id: int, payload: FollowTaskCreate, db: Session = Depends(get_db)):
+def create_follow_task(lead_id: int, payload: FollowTaskCreate, db: Session = Depends(get_db), project_id: int | None = Query(..., ge=1)):
     lead = db.get(Lead, lead_id)
     if not lead:
         raise HTTPException(404, "潜客不存在")
+    _ensure_project_scope(lead.project_id, project_id, "潜客")
     deadline = payload.deadline
     if deadline.tzinfo is not None:
         deadline = deadline.astimezone(timezone.utc).replace(tzinfo=None)
@@ -1681,10 +1686,11 @@ def create_follow_task(lead_id: int, payload: FollowTaskCreate, db: Session = De
 
 
 @app.patch("/api/follow-tasks/{follow_task_id}", response_model=FollowTaskOut)
-def update_follow_task(follow_task_id: int, payload: FollowTaskUpdate, db: Session = Depends(get_db)):
+def update_follow_task(follow_task_id: int, payload: FollowTaskUpdate, db: Session = Depends(get_db), project_id: int | None = Query(..., ge=1)):
     follow_task = db.get(FollowTask, follow_task_id)
     if not follow_task:
         raise HTTPException(404, "跟进任务不存在")
+    _ensure_project_scope(follow_task.project_id, project_id, "跟进任务")
     follow_task.status = payload.status
     follow_task.completed_at = now_utc() if payload.status == "DONE" else None
     db.commit()
@@ -1708,10 +1714,11 @@ def list_follow_task_reminders(
 
 
 @app.patch("/api/follow-task-reminders/{reminder_id}/read", response_model=NotificationEventOut)
-def mark_follow_task_reminder_read(reminder_id: int, db: Session = Depends(get_db)):
+def mark_follow_task_reminder_read(reminder_id: int, db: Session = Depends(get_db), project_id: int | None = Query(..., ge=1)):
     reminder = db.get(NotificationEvent, reminder_id)
     if not reminder or reminder.event_type != "follow_task.overdue":
         raise HTTPException(404, "跟进提醒不存在")
+    _ensure_project_scope(reminder.project_id, project_id, "跟进提醒")
     reminder.read_at = reminder.read_at or now_utc()
     db.commit()
     db.refresh(reminder)
@@ -1719,10 +1726,11 @@ def mark_follow_task_reminder_read(reminder_id: int, db: Session = Depends(get_d
 
 
 @app.post("/api/leads/{lead_id}/persona")
-async def lead_persona(lead_id: int, db: Session = Depends(get_db)):
+async def lead_persona(lead_id: int, db: Session = Depends(get_db), project_id: int | None = Query(..., ge=1)):
     lead = db.get(Lead, lead_id)
     if not lead:
         raise HTTPException(404, "潜客不存在")
+    _ensure_project_scope(lead.project_id, project_id, "潜客")
     project = db.get(Project, lead.project_id)
     persona = db.scalar(select(Persona).where(Persona.project_id == project.id))
     if not persona:
@@ -1761,12 +1769,13 @@ async def lead_persona(lead_id: int, db: Session = Depends(get_db)):
 
 
 @app.post("/api/leads/{lead_id}/assistant")
-async def lead_assistant(lead_id: int, db: Session = Depends(get_db)):
+async def lead_assistant(lead_id: int, db: Session = Depends(get_db), project_id: int | None = Query(..., ge=1)):
     """Generate text-only sales advice for a lead; never sends to Douyin."""
 
     lead = db.get(Lead, lead_id)
     if not lead:
         raise HTTPException(404, "潜客不存在")
+    _ensure_project_scope(lead.project_id, project_id, "潜客")
     project = db.get(Project, lead.project_id)
     if not project:
         raise HTTPException(409, "潜客关联的项目不存在")

@@ -1270,6 +1270,34 @@ async def test_comment_and_reply_actions_require_the_current_project_scope():
     assert wrong_send.value.status_code == 404
 
 
+def test_lead_and_follow_task_actions_require_the_current_project_scope():
+    from app import main
+
+    db = _reply_test_session()
+    comment = _reply_test_comment(db)
+    lead = Lead(project_id=comment.project_id, nickname="客户", lead_score=80, lead_level="A")
+    other = Project(name="其他项目", industry="教育")
+    db.add_all([lead, other])
+    db.commit()
+
+    with pytest.raises(HTTPException) as wrong_detail:
+        main.get_lead(lead.id, db=db, project_id=other.id)
+    assert wrong_detail.value.status_code == 404
+
+    with pytest.raises(HTTPException) as wrong_update:
+        main.update_lead(lead.id, main.LeadStatusUpdate(status="CONTACTED"), db=db, project_id=other.id)
+    assert wrong_update.value.status_code == 404
+
+    with pytest.raises(HTTPException) as wrong_follow_task:
+        main.create_follow_task(
+            lead.id,
+            main.FollowTaskCreate(content="不应创建", deadline=now_utc() + timedelta(hours=1)),
+            db=db,
+            project_id=other.id,
+        )
+    assert wrong_follow_task.value.status_code == 404
+
+
 @pytest.mark.asyncio
 async def test_manual_reply_requires_confirm_and_blocks_repeat(monkeypatch):
     from app import main
