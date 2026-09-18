@@ -1467,7 +1467,7 @@ async def test_manual_comment_sync_reconciles_existing_dom_record(monkeypatch):
 
     monkeypatch.setattr(main, "active_provider", lambda _db: Provider())
     video = db.get(Video, comment.video_id)
-    result = await main.sync_douyin_comments(video.id, limit=None, db=db)
+    result = await main.sync_douyin_comments(video.id, project_id=video.project_id, limit=None, db=db)
 
     db.refresh(comment)
     assert result["created"] == 0
@@ -1519,7 +1519,7 @@ async def test_manual_comment_sync_can_consume_all_comment_pages(monkeypatch):
         return {"status": "SUCCESS", "analyzed": len(comments)}
 
     monkeypatch.setattr(main.RadarService, "analyze_video_comments", analyze)
-    result = await main.sync_douyin_comments(comment.video_id, all_pages=True, db=db)
+    result = await main.sync_douyin_comments(comment.video_id, project_id=comment.project_id, all_pages=True, db=db)
 
     assert provider.cursors == [None, "page-2"]
     assert result["pages"] == 2
@@ -1575,7 +1575,7 @@ async def test_manual_comment_sync_runs_text_lead_pipeline(monkeypatch):
 
     monkeypatch.setattr(main, "active_provider", lambda _db: Provider())
     monkeypatch.setattr(main, "active_llm", lambda _db: TextLLM())
-    result = await main.sync_douyin_comments(comment.video_id, limit=None, db=db)
+    result = await main.sync_douyin_comments(comment.video_id, project_id=comment.project_id, limit=None, db=db)
 
     assert result["analysis"]["status"] == "SUCCESS"
     assert result["analysis"]["analyzed"] == 1
@@ -1591,16 +1591,23 @@ async def test_video_scan_route_is_scoped_to_one_video(monkeypatch):
     comment = _reply_test_comment(db)
     called = {}
 
-    async def sync(video_id, limit, cursor, all_pages, db):
-        called.update(video_id=video_id, limit=limit, cursor=cursor, session=db)
+    async def sync(video_id, project_id, limit, cursor, all_pages, db):
+        called.update(video_id=video_id, project_id=project_id, limit=limit, cursor=cursor, session=db)
         called["all_pages"] = all_pages
         return {"video_id": video_id, "analysis": {"status": "SUCCESS"}}
 
     monkeypatch.setattr(main, "sync_douyin_comments", sync)
-    result = await main.scan_video(comment.video_id, db)
+    result = await main.scan_video(comment.video_id, db, project_id=comment.project_id)
 
     assert result["video_id"] == comment.video_id
-    assert called == {"video_id": comment.video_id, "limit": None, "cursor": None, "session": db, "all_pages": True}
+    assert called == {
+        "video_id": comment.video_id,
+        "project_id": comment.project_id,
+        "limit": None,
+        "cursor": None,
+        "session": db,
+        "all_pages": True,
+    }
 
 
 def test_lead_follow_task_and_note_are_durable():

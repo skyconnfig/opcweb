@@ -1285,7 +1285,7 @@ function VideosViewLive({ project, providerContext }: RecordShape) {
       let created = 0
       let updated = 0
       while (true) {
-        const params = new URLSearchParams({ all_pages: 'false' })
+        const params = new URLSearchParams({ all_pages: 'false', project_id: String(project.id) })
         if (cursor) params.set('cursor', cursor)
         const result = await request(`/api/douyin/videos/${selected.id}/comments/sync?${params.toString()}`, { method: 'POST' })
         pages += Number(result.pages || 1)

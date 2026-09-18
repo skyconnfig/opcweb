@@ -794,6 +794,7 @@ async def douyin_search(payload: DouyinSearchIn, db: Session = Depends(get_db)):
 @app.post("/api/douyin/videos/{video_id}/comments/sync")
 async def sync_douyin_comments(
     video_id: int,
+    project_id: int = Query(..., ge=1),
     limit: int | None = Query(None, ge=1, le=500),
     cursor: str | None = None,
     all_pages: bool = Query(False),
@@ -802,6 +803,7 @@ async def sync_douyin_comments(
     video = db.get(Video, video_id)
     if not video:
         raise HTTPException(404, "视频不存在")
+    _ensure_project_scope(video.project_id, project_id, "视频")
     provider = _require_provider_capability(active_provider_for_project(db, video.project_id), "comments", "公开评论采集")
     page_cursor = cursor
     page_limit = limit if isinstance(limit, int) else get_settings().douyin_default_comment_limit
@@ -1192,7 +1194,7 @@ async def scan_video(video_id: int, db: Session = Depends(get_db), project_id: i
     # This endpoint is intentionally video-scoped. Project-wide resumable
     # scans belong to /api/projects/{project_id}/scan; do not silently start
     # unrelated keyword work when a caller asks for one video.
-    return await sync_douyin_comments(video_id, limit=None, cursor=None, all_pages=True, db=db)
+    return await sync_douyin_comments(video_id, project_id=project_id, limit=None, cursor=None, all_pages=True, db=db)
 
 
 @app.get("/api/comments")
