@@ -211,7 +211,6 @@ class DouyinPlaywrightProvider(BaseContentProvider):
             try:
                 await search_input.fill(keyword)
                 await search_input.press("Enter")
-                await self._activate_video_search_tab(page)
                 search_state = await self._wait_for_search_surface(page)
             except Exception as exc:
                 await self.browser.capture_debug(page, action="search_videos", selector="search.input", error=str(exc))
@@ -232,7 +231,6 @@ class DouyinPlaywrightProvider(BaseContentProvider):
                     search_input = await self._find(page, "search.input", page=page)
                     await search_input.fill(keyword)
                     await search_input.press("Enter")
-                    await self._activate_video_search_tab(page)
                     search_state = await self._wait_for_search_surface(page)
                     self.last_dom_trace["search_surface_retry"] = search_state
                 except Exception as exc:
@@ -1086,21 +1084,6 @@ class DouyinPlaywrightProvider(BaseContentProvider):
                 return "blocked"
             await page.wait_for_timeout(500)
         return "timeout"
-
-    async def _activate_video_search_tab(self, page: Any) -> None:
-        """Activate the visible text-only 视频 tab when the shell exposes it."""
-
-        tab = await self._find(page, "search.video_tab", page=page, required=False)
-        if tab is None:
-            return
-        try:
-            await tab.click()
-            self.last_dom_trace["search.video_tab_action"] = "clicked"
-            await page.wait_for_timeout(400)
-        except Exception as exc:
-            # The URL may already be on the video tab.  A failed optional
-            # click must not hide a potentially usable result surface.
-            self.last_dom_trace["search.video_tab_action"] = f"optional_click_failed:{type(exc).__name__}"
 
     async def _scroll_comments(self, page: Any, container: Any, items: Any) -> None:
         previous = -1
